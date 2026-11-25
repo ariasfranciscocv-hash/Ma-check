@@ -1,0 +1,177 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user account and assigned system role (ADMIN or EMPLOYEE).",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "displayName": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "photoUrl": { "type": "string" },
+        "branchName": {
+          "type": "string",
+          "enum": ["Sucursal 107", "Sucursal 109", "Sucursal 110", "Sucursal 112", "Sucursal 148"]
+        },
+        "role": { "type": "string", "enum": ["ADMIN", "EMPLOYEE"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "displayName", "email", "role", "createdAt", "updatedAt"]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Authoritative RBAC lookup document granting administrator privileges.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "grantedBy": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "email", "grantedBy", "createdAt"]
+    },
+    "AssignedTask": {
+      "title": "AssignedTask",
+      "description": "Checklist task (daily or extraordinary) assigned to a specific employee.",
+      "type": "object",
+      "properties": {
+        "assigneeId": { "type": "string" },
+        "assigneeName": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "taskType": { "type": "string", "enum": ["DAILY", "EXTRAORDINARY"] },
+        "priority": { "type": "string", "enum": ["NORMAL", "URGENT"] },
+        "dueDate": { "type": "string" },
+        "dueTime": { "type": "string" },
+        "deadlineLabel": { "type": "string" },
+        "status": { "type": "string", "enum": ["PENDING", "COMPLETED"] },
+        "hasPhotoEvidence": { "type": "boolean" },
+        "evidenceId": { "type": "string" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "assigneeId", "assigneeName", "createdBy", "title", "description",
+        "taskType", "priority", "dueDate", "status", "hasPhotoEvidence",
+        "createdAt", "updatedAt"
+      ]
+    },
+    "TaskEvidence": {
+      "title": "TaskEvidence",
+      "description": "Restricted photo documentation readable exclusively by system administrators.",
+      "type": "object",
+      "properties": {
+        "taskId": { "type": "string" },
+        "uploaderId": { "type": "string" },
+        "uploaderName": { "type": "string" },
+        "taskTitle": { "type": "string" },
+        "imageBase64": { "type": "string" },
+        "capturedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["taskId", "uploaderId", "uploaderName", "taskTitle", "imageBase64", "capturedAt"]
+    },
+    "TaskNotification": {
+      "title": "TaskNotification",
+      "description": "Notification sent to users when an administrator assigns an extraordinary task.",
+      "type": "object",
+      "properties": {
+        "recipientId": { "type": "string" },
+        "taskId": { "type": "string" },
+        "title": { "type": "string" },
+        "message": { "type": "string" },
+        "acknowledged": { "type": "boolean" },
+        "createdBy": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["recipientId", "taskId", "title", "message", "acknowledged", "createdBy", "createdAt", "updatedAt"]
+    },
+    "BiweeklyQuota": {
+      "title": "BiweeklyQuota",
+      "description": "Biweekly (14-day) sales quota across all 5 Muebles América KPIs.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "startDate": { "type": "string" },
+        "endDate": { "type": "string" },
+        "totalDays": { "type": "integer" },
+        "targetGlobalSales": { "type": "number" },
+        "targetCreditSales": { "type": "number" },
+        "targetNewCustomers": { "type": "integer" },
+        "targetAppMaOperations": { "type": "integer" },
+        "targetNewCustomerRequests": { "type": "integer" },
+        "active": { "type": "boolean" },
+        "createdBy": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "title", "startDate", "endDate", "totalDays",
+        "targetGlobalSales", "targetCreditSales", "targetNewCustomers",
+        "targetAppMaOperations", "targetNewCustomerRequests",
+        "active", "createdBy", "createdAt", "updatedAt"
+      ]
+    },
+    "DailySalesEntry": {
+      "title": "DailySalesEntry",
+      "description": "Daily close-of-operations report across the 5 Muebles América sales metrics.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "quotaId": { "type": "string" },
+        "dateString": { "type": "string" },
+        "globalSales": { "type": "number" },
+        "creditSales": { "type": "number" },
+        "newCustomers": { "type": "integer" },
+        "appMaOperations": { "type": "integer" },
+        "newCustomerRequests": { "type": "integer" },
+        "notes": { "type": "string" },
+        "attachmentName": { "type": "string" },
+        "attachmentMimeType": { "type": "string" },
+        "attachmentBase64": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "userId", "userName", "quotaId", "dateString",
+        "globalSales", "creditSales", "newCustomers",
+        "appMaOperations", "newCustomerRequests",
+        "notes", "createdAt", "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profiles and assigned roles."
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Authoritative administrator privilege records."
+    },
+    "/tasks/{taskId}": {
+      "schema": { "$ref": "#/entities/AssignedTask" },
+      "description": "Assigned daily and extraordinary checklist tasks."
+    },
+    "/task_evidences/{evidenceId}": {
+      "schema": { "$ref": "#/entities/TaskEvidence" },
+      "description": "Restricted photo evidences readable only by administrators."
+    },
+    "/notifications/{notificationId}": {
+      "schema": { "$ref": "#/entities/TaskNotification" },
+      "description": "Extraordinary task notifications sent to employees."
+    },
+    "/biweekly_quotas/{quotaId}": {
+      "schema": { "$ref": "#/entities/BiweeklyQuota" },
+      "description": "Biweekly (14-day) sales quotas."
+    },
+    "/sales_entries/{entryId}": {
+      "schema": { "$ref": "#/entities/DailySalesEntry" },
+      "description": "Daily close-of-operations sales reports."
+    }
+  }
+}

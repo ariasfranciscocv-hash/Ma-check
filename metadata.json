@@ -1,0 +1,6 @@
+{
+  "name": "MetaCheck",
+  "description": "Control diario de tareas con evidencia fotográfica restringida a administradores y proyección de metas quincenales de ventas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -12,7 +12,12 @@
           "package_name": "com.aistudio.metacheck.qrvktp"
         }
       },
-      "oauth_client": [],
+      "oauth_client": [
+        {
+          "client_id": "703633415033-bk354ou1blsl9nc6nca5r9f7cp9rk1mp.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
       "api_key": [
         {
           "current_key": "AIzaSyBwoIhl9BASE1_vckiaXr7fsLBT_f13Vuc"
@@ -20,7 +25,12 @@
       ],
       "services": {
         "appinvite_service": {
-          "other_platform_oauth_client": []
+          "other_platform_oauth_client": [
+            {
+              "client_id": "703633415033-bk354ou1blsl9nc6nca5r9f7cp9rk1mp.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
         }
       }
     }

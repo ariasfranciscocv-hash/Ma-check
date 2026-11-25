@@ -12,6 +12,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,8 +32,6 @@ import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Assessment
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Checklist
-import androidx.compose.material.icons.filled.CloudOff
-import androidx.compose.material.icons.filled.CloudSync
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -44,11 +43,13 @@ import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -57,8 +58,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -71,10 +72,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.view.WindowCompat
 import androidx.credentials.CredentialManager
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -95,14 +98,12 @@ import com.example.ui.screens.HomeSalesScreen
 import com.example.ui.screens.NotificationsSheet
 import com.example.ui.screens.TasksChecklistScreen
 import com.example.ui.screens.TeamAdminScreen
+import com.example.ui.theme.BorderSubtle
 import com.example.ui.theme.BrandNavy
 import com.example.ui.theme.BrandRed
 import com.example.ui.theme.BrandRedSoft
 import com.example.ui.theme.MetaCheckTheme
-import com.example.ui.theme.WarningAmber
-import com.example.ui.theme.WarningAmberSoft
 import com.example.ui.viewmodel.MainViewModel
-import com.example.utils.NetworkMonitor
 import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
@@ -169,6 +170,7 @@ private fun AppRoot(auth: FirebaseAuth = Firebase.auth) {
     Box(modifier = Modifier.fillMaxSize()) {
         val user = currentUser
         if (user == null) {
+            SetStatusBarAppearance(lightBackground = true)
             AuthScreen(onAuthSuccess = {})
         } else {
             key(user.uid) {
@@ -198,12 +200,6 @@ private fun AuthenticatedApp(
     onSignOut: () -> Unit
 ) {
     val context = LocalContext.current
-    val networkMonitor = remember(context.applicationContext) {
-        NetworkMonitor(context.applicationContext)
-    }
-    DisposableEffect(networkMonitor) {
-        onDispose { networkMonitor.unregister() }
-    }
 
     val viewModel: MainViewModel = viewModel(
         key = user.uid,
@@ -211,9 +207,8 @@ private fun AuthenticatedApp(
             initializer {
                 val app = checkNotNull(this[APPLICATION_KEY])
                 MainViewModel(
-                    repository = AppRepository(app, networkMonitor),
+                    repository = AppRepository(app),
                     preferences = AppPreferences(app),
-                    connectivityChecker = networkMonitor,
                     currentUserId = user.uid,
                     currentUserName = user.displayName ?: user.email?.substringBefore("@") ?: "Usuario MA",
                     currentUserEmail = user.email,
@@ -223,10 +218,6 @@ private fun AuthenticatedApp(
         }
     )
 
-    val isOnline by viewModel.isOnline.collectAsStateWithLifecycle()
-    val pendingTaskIds by viewModel.pendingTaskIds.collectAsStateWithLifecycle()
-    val pendingSalesEntryIds by viewModel.pendingSalesEntryIds.collectAsStateWithLifecycle()
-    val pendingSyncCount by viewModel.pendingSyncCount.collectAsStateWithLifecycle()
     val lastCachedBranch by viewModel.lastCachedBranch.collectAsStateWithLifecycle()
     val isAdmin by viewModel.isAdminState.collectAsStateWithLifecycle()
     val userProfile by viewModel.currentUserProfile.collectAsStateWithLifecycle()
@@ -242,6 +233,7 @@ private fun AuthenticatedApp(
     val tasksState by viewModel.tasksState.collectAsStateWithLifecycle()
     val evidencesState by viewModel.evidencesState.collectAsStateWithLifecycle()
     val teamUsers by viewModel.teamUsers.collectAsStateWithLifecycle()
+    val closingAttachmentDraft by viewModel.closingAttachmentDraft.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     var currentTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
@@ -285,6 +277,7 @@ private fun AuthenticatedApp(
     }
 
     if (!branchConfirmed) {
+        SetStatusBarAppearance(lightBackground = true)
         BranchSelectionScreen(
             initialBranch = userProfile?.branchName ?: lastCachedBranch,
             isAdmin = isAdmin,
@@ -308,132 +301,159 @@ private fun AuthenticatedApp(
         else listOf(AppTab.HOME, AppTab.TASKS)
     }
 
+    SetStatusBarAppearance(lightBackground = false)
+
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         snackbarHost = { SnackbarHost(snackbarHostState) },
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
-            TopAppBar(
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface
-                ),
-                title = {
-                    Column {
-                        MueblesAmericaLogo(
-                            globeSize = 22.dp,
-                            fontSize = 15.sp,
-                            showTrademark = false
-                        )
-                        Text(
-                            text = stringResource(R.string.brand_subtitle),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = BrandNavy
-                        )
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.padding(top = 2.dp)
+            Column(modifier = Modifier.fillMaxWidth()) {
+                TopAppBar(
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = BrandNavy,
+                        titleContentColor = Color.White,
+                        actionIconContentColor = Color.White
+                    ),
+                    title = {
+                        Column {
+                            MueblesAmericaLogo(
+                                globeSize = 23.dp,
+                                fontSize = 16.sp,
+                                showTrademark = false
+                            )
+                            Text(
+                                text = stringResource(R.string.brand_subtitle),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.White.copy(alpha = 0.92f)
+                            )
+                        }
+                    },
+                    actions = {
+                        IconButton(
+                            onClick = { showNotificationsSheet = true },
+                            modifier = Modifier.testTag("notifications_button")
                         ) {
-                            Surface(
-                                color = MaterialTheme.colorScheme.primaryContainer,
-                                shape = RoundedCornerShape(50),
-                                modifier = Modifier
-                                    .clickable { viewModel.reopenBranchSelection() }
-                                    .testTag("switch_branch_pill")
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Storefront,
-                                        contentDescription = "Cambiar sucursal",
-                                        tint = BrandNavy,
-                                        modifier = Modifier.size(12.dp)
-                                    )
-                                    Text(
-                                        text = branchLabel,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = BrandNavy
-                                    )
-                                }
-                            }
-
-                            Surface(
-                                color = if (isAdmin) BrandRedSoft else MaterialTheme.colorScheme.surfaceVariant,
-                                shape = RoundedCornerShape(50)
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(3.dp)
-                                ) {
-                                    if (isAdmin) {
-                                        Icon(
-                                            imageVector = Icons.Filled.AdminPanelSettings,
-                                            contentDescription = null,
-                                            tint = BrandRed,
-                                            modifier = Modifier.size(12.dp)
-                                        )
+                            BadgedBox(
+                                badge = {
+                                    if (unreadCount > 0) {
+                                        Badge(containerColor = BrandRed, contentColor = Color.White) {
+                                            Text(unreadCount.toString())
+                                        }
                                     }
-                                    Text(
-                                        text = if (isAdmin) "Admin" else "Empleado",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (isAdmin) BrandRed else MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
                                 }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Notifications,
+                                    contentDescription = "Notificaciones"
+                                )
                             }
                         }
-                    }
-                },
-                actions = {
-                    IconButton(
-                        onClick = { showNotificationsSheet = true },
-                        modifier = Modifier.testTag("notifications_button")
-                    ) {
-                        BadgedBox(
-                            badge = {
-                                if (unreadCount > 0) {
-                                    Badge(containerColor = BrandRed, contentColor = Color.White) {
-                                        Text(unreadCount.toString())
-                                    }
-                                }
-                            }
+                        IconButton(
+                            onClick = onSignOut,
+                            modifier = Modifier.testTag("sign_out_button")
                         ) {
                             Icon(
-                                imageVector = Icons.Filled.Notifications,
-                                contentDescription = "Notificaciones"
+                                imageVector = Icons.AutoMirrored.Filled.Logout,
+                                contentDescription = "Cerrar sesión"
                             )
                         }
                     }
-                    IconButton(
-                        onClick = onSignOut,
-                        modifier = Modifier.testTag("sign_out_button")
+                )
+
+                // Sub-header strip inspired by Muebles América SEV palette (Red role tag + White branch strip)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.White),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .background(BrandRed)
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
                     ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Logout,
-                            contentDescription = "Cerrar sesión"
+                        if (isAdmin) {
+                            Icon(
+                                imageVector = Icons.Filled.AdminPanelSettings,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                        Text(
+                            text = if (isAdmin) "Admin" else "Sesión",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Color.White
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { viewModel.reopenBranchSelection() }
+                            .padding(horizontal = 14.dp, vertical = 7.dp)
+                            .testTag("switch_branch_pill"),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Storefront,
+                                contentDescription = "Cambiar sucursal",
+                                tint = BrandNavy,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Text(
+                                text = branchLabel,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = BrandNavy
+                            )
+                        }
+                        Text(
+                            text = "Cambiar",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = BrandNavy.copy(alpha = 0.72f)
                         )
                     }
                 }
-            )
+                HorizontalDivider(thickness = 1.dp, color = BorderSubtle)
+            }
         },
         bottomBar = {
-            NavigationBar {
-                visibleTabs.forEach { tab ->
-                    val selected = tab == currentTab
-                    NavigationBarItem(
-                        selected = selected,
-                        onClick = { currentTab = tab },
-                        icon = {
-                            Icon(
-                                imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
-                                contentDescription = tab.label
-                            )
-                        },
-                        label = { Text(tab.label) },
-                        modifier = Modifier.testTag("nav_tab_${tab.name.lowercase()}")
-                    )
+            Column(modifier = Modifier.fillMaxWidth()) {
+                HorizontalDivider(thickness = 1.dp, color = BorderSubtle)
+                NavigationBar(
+                    containerColor = Color.White,
+                    contentColor = BrandNavy
+                ) {
+                    visibleTabs.forEach { tab ->
+                        val selected = tab == currentTab
+                        NavigationBarItem(
+                            selected = selected,
+                            onClick = { currentTab = tab },
+                            icon = {
+                                Icon(
+                                    imageVector = if (selected) tab.selectedIcon else tab.unselectedIcon,
+                                    contentDescription = tab.label
+                                )
+                            },
+                            label = { Text(tab.label) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = BrandNavy,
+                                selectedTextColor = BrandNavy,
+                                indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+                                unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                            ),
+                            modifier = Modifier.testTag("nav_tab_${tab.name.lowercase()}")
+                        )
+                    }
                 }
             }
         }
@@ -443,42 +463,6 @@ private fun AuthenticatedApp(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            if (!isOnline || pendingSyncCount > 0) {
-                Surface(
-                    color = if (!isOnline) WarningAmberSoft else MaterialTheme.colorScheme.primaryContainer,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("offline_sync_banner")
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (!isOnline) Icons.Filled.CloudOff else Icons.Filled.CloudSync,
-                            contentDescription = null,
-                            tint = if (!isOnline) WarningAmber else BrandNavy,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Text(
-                            text = when {
-                                !isOnline && pendingSyncCount > 0 ->
-                                    "Sin conexión · $pendingSyncCount cambio(s) en caché listos para sincronizar"
-                                !isOnline ->
-                                    "Sin conexión · Modo local activo (puedes marcar tareas y tomar fotos)"
-                                else ->
-                                    "Sincronizando $pendingSyncCount cambio(s) con el servidor..."
-                            },
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (!isOnline) WarningAmber else BrandNavy
-                        )
-                    }
-                }
-            }
-
             if (unreadCount > 0) {
                 Surface(
                     onClick = { showNotificationsSheet = true },
@@ -525,24 +509,24 @@ private fun AuthenticatedApp(
                         isAdmin = isAdmin,
                         isBusy = isBusy,
                         projectionState = projectionState,
-                        pendingSalesEntryIds = pendingSalesEntryIds,
                         selectedMetric = selectedMetric,
                         chartSeries = chartSeries,
                         showDailyBriefing = showDailyBriefing,
+                        closingAttachmentDraft = closingAttachmentDraft,
+                        onUpdateAttachmentDraft = { viewModel.updateClosingAttachmentDraft(it) },
+                        onLoadEntryAttachmentChunks = { entry -> viewModel.loadClosingAttachmentChunks(entry) },
                         onDismissBriefing = { viewModel.dismissDailyBriefingForToday() },
                         onSelectMetric = { viewModel.selectMetric(it) },
-                        onSaveDailyClosing = { qId, g, c, nc, ma, req, notes, attName, attMime, attBase64 ->
+                        onSaveDailyClosing = { qId, g, c, nc, ma, req, notes, draft ->
                             viewModel.saveDailyClosingSales(
-                                qId,
-                                g,
-                                c,
-                                nc,
-                                ma,
-                                req,
-                                notes,
-                                attName,
-                                attMime,
-                                attBase64
+                                quotaId = qId,
+                                globalSales = g,
+                                creditSales = c,
+                                newCustomers = nc,
+                                appMaOperations = ma,
+                                newCustomerRequests = req,
+                                notes = notes,
+                                attachmentDraft = draft
                             )
                         },
                         onSaveBiweeklyQuota = { t, s, e, d, g, c, nc, ma, req, onDone ->
@@ -554,7 +538,6 @@ private fun AuthenticatedApp(
                         isAdmin = isAdmin,
                         isBusy = isBusy,
                         tasksState = tasksState,
-                        pendingTaskIds = pendingTaskIds,
                         evidencesState = evidencesState,
                         teamUsers = teamUsers,
                         currentUserProfile = userProfile,
@@ -591,5 +574,18 @@ private fun AuthenticatedApp(
             onOpenTasks = { currentTab = AppTab.TASKS },
             onDismiss = { showNotificationsSheet = false }
         )
+    }
+}
+
+@Composable
+private fun SetStatusBarAppearance(lightBackground: Boolean) {
+    val view = LocalView.current
+    if (!view.isInEditMode) {
+        SideEffect {
+            val window = (view.context as? ComponentActivity)?.window ?: return@SideEffect
+            val controller = WindowCompat.getInsetsController(window, view)
+            controller.isAppearanceLightStatusBars = lightBackground
+            controller.isAppearanceLightNavigationBars = true
+        }
     }
 }

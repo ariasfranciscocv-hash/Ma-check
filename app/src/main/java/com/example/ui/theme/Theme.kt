@@ -1,6 +1,5 @@
 package com.example.ui.theme
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
@@ -13,15 +12,15 @@ import androidx.compose.ui.unit.dp
 private val LightColorScheme = lightColorScheme(
     primary = BrandNavy,
     onPrimary = Color.White,
-    primaryContainer = Color(0xFFDCE6FA),
+    primaryContainer = Color(0xFFEBF2FC),
     onPrimaryContainer = BrandNavyDark,
     secondary = BrandRed,
     onSecondary = Color.White,
-    secondaryContainer = BrandRedSoft,
-    onSecondaryContainer = Color(0xFF7F0B13),
+    secondaryContainer = Color(0xFFFFF0F1),
+    onSecondaryContainer = Color(0xFF8C0811),
     tertiary = BrandGoldDark,
     onTertiary = Color.White,
-    tertiaryContainer = Color(0xFFFFF4C7),
+    tertiaryContainer = Color(0xFFFFF8DF),
     onTertiaryContainer = Color(0xFF4D3800),
     background = SurfaceIvory,
     onBackground = TextPrimary,
@@ -29,8 +28,13 @@ private val LightColorScheme = lightColorScheme(
     onSurface = TextPrimary,
     surfaceVariant = SurfaceMuted,
     onSurfaceVariant = TextSecondary,
+    surfaceContainerLowest = Color.White,
+    surfaceContainerLow = Color(0xFFFAFBFD),
+    surfaceContainer = Color(0xFFF6F9FD),
+    surfaceContainerHigh = Color(0xFFF1F5FB),
+    surfaceContainerHighest = Color(0xFFEAF0F8),
     outline = BorderSubtle,
-    outlineVariant = Color(0xFFE3EAF4),
+    outlineVariant = Color(0xFFE7EDF6),
     error = BrandRed,
     onError = Color.White
 )
@@ -66,7 +70,7 @@ val AppShapes = Shapes(
 
 @Composable
 fun MetaCheckTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
+    darkTheme: Boolean = false,
     content: @Composable () -> Unit
 ) {
     val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme

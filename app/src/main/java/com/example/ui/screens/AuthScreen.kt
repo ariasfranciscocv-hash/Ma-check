@@ -69,7 +69,7 @@ fun AuthScreen(
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    colors = listOf(Color(0xFFFFFFFF), Color(0xFFEEF3FB), Color(0xFFE0E9F8))
+                    colors = listOf(Color(0xFFFFFFFF), Color(0xFFFAFBFD), Color(0xFFF3F7FD))
                 )
             )
             .safeDrawingPadding(),
@@ -110,14 +110,15 @@ fun AuthScreen(
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
-                        text = "Acceso por Roles",
-                        style = MaterialTheme.typography.headlineSmall,
-                        color = MaterialTheme.colorScheme.onSurface
+                        text = stringResource(R.string.sign_in_title),
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        textAlign = TextAlign.Center
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
                     Text(
                         text = stringResource(R.string.sign_in_tagline),
-                        style = MaterialTheme.typography.bodyMedium,
+                        style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         textAlign = TextAlign.Center
                     )
@@ -139,7 +140,7 @@ fun AuthScreen(
                     FeatureBulletRow(
                         icon = Icons.Filled.AdminPanelSettings,
                         title = "Gestión por Sucursal",
-                        subtitle = "Selecciona tu sucursal (107, 109, 110, 112 o 148) al entrar."
+                        subtitle = "Selecciona tu sucursal (87, 107, 109, 110, 112 o 148) al entrar."
                     )
 
                     if (errorMessage != null) {

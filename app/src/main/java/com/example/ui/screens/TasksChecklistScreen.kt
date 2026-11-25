@@ -32,7 +32,6 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
@@ -66,6 +65,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -116,7 +116,6 @@ fun TasksChecklistScreen(
     isAdmin: Boolean,
     isBusy: Boolean,
     tasksState: UiState<List<AssignedTask>>,
-    pendingTaskIds: Set<String> = emptySet(),
     evidencesState: UiState<List<TaskEvidence>>,
     teamUsers: List<UserProfile>,
     currentUserProfile: UserProfile?,
@@ -139,9 +138,14 @@ fun TasksChecklistScreen(
 ) {
     var adminViewMode by remember { mutableStateOf(AdminTaskViewMode.BY_BRANCH) }
     var selectedFilter by remember { mutableStateOf(TaskFilter.ALL) }
-    var taskToDocument by remember { mutableStateOf<AssignedTask?>(null) }
+    var taskToDocumentId by rememberSaveable { mutableStateOf<String?>(null) }
     var showCreateTaskDialog by remember { mutableStateOf(false) }
     var evidencePreviewForAdmin by remember { mutableStateOf<TaskEvidence?>(null) }
+
+    val taskToDocument = remember(taskToDocumentId, tasksState) {
+        val targetId = taskToDocumentId ?: return@remember null
+        (tasksState as? UiState.Success)?.data?.firstOrNull { it.id == targetId }
+    }
 
     val evidencesMap = remember(evidencesState, isAdmin) {
         if (!isAdmin) emptyMap()
@@ -149,6 +153,7 @@ fun TasksChecklistScreen(
     }
 
     Scaffold(
+        containerColor = MaterialTheme.colorScheme.background,
         floatingActionButton = {
             if (isAdmin) {
                 FloatingActionButton(
@@ -180,8 +185,8 @@ fun TasksChecklistScreen(
                             onClick = { adminViewMode = mode },
                             label = { Text(mode.label, style = MaterialTheme.typography.labelMedium) },
                             colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = BrandNavy,
-                                selectedLabelColor = Color.White
+                                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                selectedLabelColor = BrandNavy
                             ),
                             modifier = Modifier.testTag("admin_task_mode_${mode.name.lowercase()}")
                         )
@@ -203,8 +208,8 @@ fun TasksChecklistScreen(
                             onClick = { selectedFilter = filter },
                             label = { Text(filter.label, style = MaterialTheme.typography.labelSmall) },
                             colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = BrandNavy,
-                                selectedLabelColor = Color.White
+                                selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                                selectedLabelColor = BrandNavy
                             )
                         )
                     }
@@ -240,7 +245,6 @@ fun TasksChecklistScreen(
                         }
                         AdminBranchesChecklistView(
                             summaries = summaries,
-                            pendingTaskIds = pendingTaskIds,
                             evidencesMap = evidencesMap,
                             onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev }
                         )
@@ -266,9 +270,8 @@ fun TasksChecklistScreen(
                                     TaskCardItem(
                                         task = task,
                                         isAdmin = isAdmin,
-                                        isPendingSync = task.id in pendingTaskIds,
                                         linkedEvidence = if (isAdmin) evidencesMap[task.id] else null,
-                                        onDocumentClick = { taskToDocument = task },
+                                        onDocumentClick = { taskToDocumentId = task.id },
                                         onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev }
                                     )
                                 }
@@ -284,10 +287,10 @@ fun TasksChecklistScreen(
         PhotoDocumentationDialog(
             task = task,
             isBusy = isBusy,
-            onDismiss = { taskToDocument = null },
+            onDismiss = { taskToDocumentId = null },
             onSubmitBase64 = { base64 ->
                 onCompleteTaskWithEvidence(task, base64) {
-                    taskToDocument = null
+                    taskToDocumentId = null
                 }
             }
         )
@@ -323,7 +326,6 @@ fun TasksChecklistScreen(
 @Composable
 private fun AdminBranchesChecklistView(
     summaries: List<BranchTaskSummary>,
-    pendingTaskIds: Set<String>,
     evidencesMap: Map<String, TaskEvidence>,
     onViewAdminEvidence: (TaskEvidence) -> Unit
 ) {
@@ -380,7 +382,6 @@ private fun AdminBranchesChecklistView(
             BranchChecklistCard(
                 summary = summary,
                 isExpanded = isExpanded,
-                pendingTaskIds = pendingTaskIds,
                 evidencesMap = evidencesMap,
                 onToggleExpand = {
                     expandedState[summary.branchName] = !isExpanded
@@ -395,7 +396,6 @@ private fun AdminBranchesChecklistView(
 private fun BranchChecklistCard(
     summary: BranchTaskSummary,
     isExpanded: Boolean,
-    pendingTaskIds: Set<String>,
     evidencesMap: Map<String, TaskEvidence>,
     onToggleExpand: () -> Unit,
     onViewAdminEvidence: (TaskEvidence) -> Unit
@@ -504,7 +504,6 @@ private fun BranchChecklistCard(
                         summary.tasks.forEach { task ->
                             BranchTaskStatusRow(
                                 task = task,
-                                isPendingSync = task.id in pendingTaskIds,
                                 linkedEvidence = evidencesMap[task.id],
                                 onViewAdminEvidence = onViewAdminEvidence
                             )
@@ -519,7 +518,6 @@ private fun BranchChecklistCard(
 @Composable
 private fun BranchTaskStatusRow(
     task: AssignedTask,
-    isPendingSync: Boolean,
     linkedEvidence: TaskEvidence?,
     onViewAdminEvidence: (TaskEvidence) -> Unit
 ) {
@@ -528,7 +526,6 @@ private fun BranchTaskStatusRow(
     val dotColor = if (isDone) SuccessGreen else BrandRed
     val badgeBg = if (isDone) SuccessGreenSoft else BrandRedSoft
     val statusText = when {
-        isDone && isPendingSync -> "Realizada (Local)"
         isDone -> "Realizada"
         isPastDeadline -> "Vencida"
         else -> "No realizada"
@@ -625,9 +622,9 @@ private fun EmptyTasksState(
         Spacer(modifier = Modifier.height(6.dp))
         Text(
             text = if (isAdmin) {
-                "Crea una tarea diaria o extraordinaria con el botón + para asignarla y notificar a las sucursales."
+                "Solo se muestran las tareas dentro de su horario establecido. Crea una nueva tarea con el botón + cuando la necesites."
             } else {
-                "Cuando el administrador te asigne tareas diarias o extraordinarias aparecerán aquí."
+                "No hay tareas activas en este horario. Las tareas aparecen únicamente durante el tiempo establecido para cumplirlas."
             },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -650,7 +647,6 @@ private fun EmptyTasksState(
 private fun TaskCardItem(
     task: AssignedTask,
     isAdmin: Boolean,
-    isPendingSync: Boolean,
     linkedEvidence: TaskEvidence?,
     onDocumentClick: () -> Unit,
     onViewAdminEvidence: (TaskEvidence) -> Unit
@@ -786,32 +782,6 @@ private fun TaskCardItem(
                 )
             }
 
-            if (isPendingSync) {
-                Surface(
-                    color = WarningAmberSoft,
-                    shape = RoundedCornerShape(50),
-                    modifier = Modifier.testTag("task_pending_sync_badge_${task.id}")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.CloudUpload,
-                            contentDescription = null,
-                            tint = WarningAmber,
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Text(
-                            text = "Guardado localmente · Pendiente de sincronizar",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = WarningAmber
-                        )
-                    }
-                }
-            }
-
             if (!isCompleted) {
                 Button(
                     onClick = onDocumentClick,
@@ -897,7 +867,7 @@ private fun PhotoDocumentationDialog(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingCameraUriString by rememberSaveable { mutableStateOf<String?>(null) }
     var compressedBase64 by remember { mutableStateOf<String?>(null) }
     var isCompressing by remember { mutableStateOf(false) }
     var photoError by remember { mutableStateOf<String?>(null) }
@@ -920,7 +890,7 @@ private fun PhotoDocumentationDialog(
     val takePictureLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.TakePicture()
     ) { success ->
-        val uri = pendingCameraUri
+        val uri = pendingCameraUriString?.let { Uri.parse(it) }
         if (success && uri != null) {
             handleUri(uri)
         }
@@ -974,9 +944,13 @@ private fun PhotoDocumentationDialog(
                 ) {
                     OutlinedButton(
                         onClick = {
-                            val uri = ImageCompressor.createTempCameraUri(context)
-                            pendingCameraUri = uri
-                            takePictureLauncher.launch(uri)
+                            runCatching {
+                                val uri = ImageCompressor.createTempCameraUri(context)
+                                pendingCameraUriString = uri.toString()
+                                takePictureLauncher.launch(uri)
+                            }.onFailure {
+                                photoError = "No se pudo abrir la cámara en este dispositivo."
+                            }
                         },
                         enabled = !isBusy && !isCompressing,
                         modifier = Modifier
@@ -990,9 +964,13 @@ private fun PhotoDocumentationDialog(
 
                     OutlinedButton(
                         onClick = {
-                            photoPickerLauncher.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
+                            runCatching {
+                                photoPickerLauncher.launch(
+                                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                )
+                            }.onFailure {
+                                photoError = "No se pudo abrir la galería en este dispositivo."
+                            }
                         },
                         enabled = !isBusy && !isCompressing,
                         modifier = Modifier

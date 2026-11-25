@@ -3,11 +3,11 @@ package com.example.ui.viewmodel
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.data.firestore.SnapshotSyncResult
 import com.example.data.local.AppPreferences
 import com.example.data.model.AssignedTask
 import com.example.data.model.BiweeklyQuota
 import com.example.data.model.ChartSeries
+import com.example.data.model.ClosingAttachmentDraft
 import com.example.data.model.DailySalesEntry
 import com.example.data.model.MetricProgress
 import com.example.data.model.ProjectionPace
@@ -20,11 +20,11 @@ import com.example.data.model.TaskType
 import com.example.data.model.UiState
 import com.example.data.model.UserProfile
 import com.example.data.repository.AppRepository
-import com.example.utils.ConnectivityChecker
 import com.example.utils.DateAndFormatters
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -40,14 +41,11 @@ import kotlinx.coroutines.launch
 class MainViewModel(
     private val repository: AppRepository,
     private val preferences: AppPreferences,
-    private val connectivityChecker: ConnectivityChecker,
     val currentUserId: String,
     val currentUserName: String,
     val currentUserEmail: String?,
     val isEmailVerified: Boolean
 ) : ViewModel() {
-
-    val isOnline: StateFlow<Boolean> = connectivityChecker.isOnline
 
     private val _selectedMetric = MutableStateFlow(SalesMetricType.GLOBAL_SALES)
     val selectedMetric: StateFlow<SalesMetricType> = _selectedMetric.asStateFlow()
@@ -57,6 +55,9 @@ class MainViewModel(
 
     private val _isBusy = MutableStateFlow(false)
     val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
+
+    private val _closingAttachmentDraft = MutableStateFlow<ClosingAttachmentDraft>(ClosingAttachmentDraft.Unchanged)
+    val closingAttachmentDraft: StateFlow<ClosingAttachmentDraft> = _closingAttachmentDraft.asStateFlow()
 
     private val _profileSynced = MutableStateFlow(false)
     val profileSynced: StateFlow<Boolean> = _profileSynced.asStateFlow()
@@ -108,13 +109,18 @@ class MainViewModel(
             initialValue = emptyList()
         )
 
-    private val tasksSyncState: StateFlow<UiState<SnapshotSyncResult<AssignedTask>>> = isAdminState
-        .flatMapLatest { isAdmin -> repository.observeTasksWithSync(currentUserId, isAdmin) }
-        .map<SnapshotSyncResult<AssignedTask>, UiState<SnapshotSyncResult<AssignedTask>>> {
-            UiState.Success(it)
+    private val activeWindowTicker = flow {
+        while (true) {
+            emit(System.currentTimeMillis())
+            delay(30_000L)
         }
+    }
+
+    private val rawTasksState: StateFlow<UiState<List<AssignedTask>>> = isAdminState
+        .flatMapLatest { isAdmin -> repository.observeTasks(currentUserId, isAdmin) }
+        .map<List<AssignedTask>, UiState<List<AssignedTask>>> { UiState.Success(it) }
         .catch { error ->
-            val root = unwrapFirestoreOrThrow(error, "observeTasksWithSync")
+            val root = unwrapFirestoreOrThrow(error, "observeTasks")
             emit(UiState.Error(root.message ?: "No se pudieron cargar las tareas."))
         }
         .stateIn(
@@ -123,29 +129,24 @@ class MainViewModel(
             initialValue = UiState.Loading
         )
 
-    val tasksState: StateFlow<UiState<List<AssignedTask>>> = tasksSyncState
-        .map { state ->
-            when (state) {
-                is UiState.Loading -> UiState.Loading
-                is UiState.Error -> UiState.Error(state.message)
-                is UiState.Success -> UiState.Success(state.data.items)
-            }
+    val tasksState: StateFlow<UiState<List<AssignedTask>>> = combine(
+        rawTasksState,
+        activeWindowTicker
+    ) { state, nowMillis ->
+        when (state) {
+            is UiState.Loading -> UiState.Loading
+            is UiState.Error -> UiState.Error(state.message)
+            is UiState.Success -> UiState.Success(
+                state.data.filter { task ->
+                    DateAndFormatters.isTaskWithinActiveWindow(task, nowMillis)
+                }
+            )
         }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = UiState.Loading
-        )
-
-    val pendingTaskIds: StateFlow<Set<String>> = tasksSyncState
-        .map { state ->
-            (state as? UiState.Success)?.data?.pendingWriteIds ?: emptySet()
-        }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = emptySet()
-        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+        initialValue = UiState.Loading
+    )
 
     val evidencesState: StateFlow<UiState<List<TaskEvidence>>> = isAdminState
         .flatMapLatest { isAdmin -> repository.observeEvidences(currentUserId, isAdmin) }
@@ -193,13 +194,11 @@ class MainViewModel(
             initialValue = UiState.Loading
         )
 
-    private val salesEntriesSyncState: StateFlow<UiState<SnapshotSyncResult<DailySalesEntry>>> = isAdminState
-        .flatMapLatest { isAdmin -> repository.observeSalesEntriesWithSync(currentUserId, isAdmin) }
-        .map<SnapshotSyncResult<DailySalesEntry>, UiState<SnapshotSyncResult<DailySalesEntry>>> {
-            UiState.Success(it)
-        }
+    val salesEntriesState: StateFlow<UiState<List<DailySalesEntry>>> = isAdminState
+        .flatMapLatest { isAdmin -> repository.observeSalesEntries(currentUserId, isAdmin) }
+        .map<List<DailySalesEntry>, UiState<List<DailySalesEntry>>> { UiState.Success(it) }
         .catch { error ->
-            val root = unwrapFirestoreOrThrow(error, "observeSalesEntriesWithSync")
+            val root = unwrapFirestoreOrThrow(error, "observeSalesEntries")
             emit(UiState.Error(root.message ?: "No se pudieron cargar los cierres de ventas."))
         }
         .stateIn(
@@ -207,41 +206,6 @@ class MainViewModel(
             started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
             initialValue = UiState.Loading
         )
-
-    val salesEntriesState: StateFlow<UiState<List<DailySalesEntry>>> = salesEntriesSyncState
-        .map { state ->
-            when (state) {
-                is UiState.Loading -> UiState.Loading
-                is UiState.Error -> UiState.Error(state.message)
-                is UiState.Success -> UiState.Success(state.data.items)
-            }
-        }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = UiState.Loading
-        )
-
-    val pendingSalesEntryIds: StateFlow<Set<String>> = salesEntriesSyncState
-        .map { state ->
-            (state as? UiState.Success)?.data?.pendingWriteIds ?: emptySet()
-        }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = emptySet()
-        )
-
-    val pendingSyncCount: StateFlow<Int> = combine(
-        pendingTaskIds,
-        pendingSalesEntryIds
-    ) { taskIds, salesIds ->
-        taskIds.size + salesIds.size
-    }.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-        initialValue = 0
-    )
 
     val projectionSummaryState: StateFlow<UiState<SalesProjectionSummary?>> = combine(
         activeQuotaState,
@@ -344,12 +308,9 @@ class MainViewModel(
             val result = repository.updateCurrentUserBranch(branchName)
             _isBusy.value = false
             result.fold(
-                onSuccess = { outcome ->
+                onSuccess = {
                     _branchConfirmedThisSession.value = true
                     syncScheduledChecklistIfNeeded(branchName)
-                    if (!outcome.syncedWithServer) {
-                        _actionMessage.value = "Sucursal guardada en caché local; se sincronizará al recuperar internet."
-                    }
                 },
                 onFailure = { err ->
                     _actionMessage.value = err.localizedMessage ?: "No se pudo guardar la sucursal."
@@ -384,6 +345,14 @@ class MainViewModel(
         }
     }
 
+    fun updateClosingAttachmentDraft(draft: ClosingAttachmentDraft) {
+        _closingAttachmentDraft.value = draft
+    }
+
+    suspend fun loadClosingAttachmentChunks(entry: DailySalesEntry): Result<List<String>> {
+        return repository.loadSalesEntryAttachmentChunks(entry)
+    }
+
     fun saveDailyClosingSales(
         quotaId: String,
         globalSales: Double,
@@ -392,9 +361,7 @@ class MainViewModel(
         appMaOperations: Long,
         newCustomerRequests: Long,
         notes: String,
-        attachmentName: String? = null,
-        attachmentMimeType: String? = null,
-        attachmentBase64: String? = null,
+        attachmentDraft: ClosingAttachmentDraft = _closingAttachmentDraft.value,
         onSaved: () -> Unit = {}
     ) {
         viewModelScope.launch {
@@ -409,19 +376,14 @@ class MainViewModel(
                 appMaOperations = appMaOperations,
                 newCustomerRequests = newCustomerRequests,
                 notes = notes,
-                attachmentName = attachmentName,
-                attachmentMimeType = attachmentMimeType,
-                attachmentBase64 = attachmentBase64
+                attachmentDraft = attachmentDraft
             )
             _isBusy.value = false
             result.fold(
-                onSuccess = { outcome ->
+                onSuccess = {
+                    _closingAttachmentDraft.value = ClosingAttachmentDraft.Unchanged
                     preferences.markBriefingSeenToday(currentUserId, DateAndFormatters.todayIso())
-                    _actionMessage.value = if (outcome.syncedWithServer) {
-                        "Cierre de operaciones guardado correctamente."
-                    } else {
-                        "Cierre guardado sin conexión. Se sincronizará automáticamente al volver a internet."
-                    }
+                    _actionMessage.value = "Cierre de operaciones guardado correctamente."
                     onSaved()
                 },
                 onFailure = { err ->
@@ -458,12 +420,8 @@ class MainViewModel(
             )
             _isBusy.value = false
             result.fold(
-                onSuccess = { outcome ->
-                    _actionMessage.value = if (outcome.syncedWithServer) {
-                        "Meta quincenal actualizada."
-                    } else {
-                        "Meta quincenal guardada localmente; se sincronizará al volver a internet."
-                    }
+                onSuccess = {
+                    _actionMessage.value = "Meta quincenal actualizada."
                     onSuccess()
                 },
                 onFailure = { err ->
@@ -498,15 +456,11 @@ class MainViewModel(
             )
             _isBusy.value = false
             result.fold(
-                onSuccess = { outcome ->
-                    val count = outcome.value
-                    _actionMessage.value = when {
-                        !outcome.syncedWithServer ->
-                            "Tarea guardada localmente ($count). Se sincronizará y notificará al recuperar internet."
-                        taskType == TaskType.EXTRAORDINARY ->
-                            "Tarea extraordinaria asignada y notificación enviada ($count)."
-                        else ->
-                            "Tarea asignada correctamente ($count)."
+                onSuccess = { count ->
+                    _actionMessage.value = if (taskType == TaskType.EXTRAORDINARY) {
+                        "Tarea extraordinaria asignada y notificación enviada ($count)."
+                    } else {
+                        "Tarea asignada correctamente ($count)."
                     }
                     onSuccess()
                 },
@@ -532,12 +486,8 @@ class MainViewModel(
             )
             _isBusy.value = false
             result.fold(
-                onSuccess = { outcome ->
-                    _actionMessage.value = if (outcome.syncedWithServer) {
-                        "Tarea completada. Evidencia enviada al administrador."
-                    } else {
-                        "Tarea completada sin conexión. La foto se sincronizará automáticamente al volver a internet."
-                    }
+                onSuccess = {
+                    _actionMessage.value = "Tarea completada. Evidencia enviada al administrador."
                     onSuccess()
                 },
                 onFailure = { err ->
@@ -553,16 +503,11 @@ class MainViewModel(
             val result = repository.setUserRole(targetUser, makeAdmin)
             _isBusy.value = false
             result.fold(
-                onSuccess = { outcome ->
-                    val roleText = if (makeAdmin) {
+                onSuccess = {
+                    _actionMessage.value = if (makeAdmin) {
                         "${targetUser.displayName} ahora es Administrador."
                     } else {
                         "${targetUser.displayName} ahora es Empleado."
-                    }
-                    _actionMessage.value = if (outcome.syncedWithServer) {
-                        roleText
-                    } else {
-                        "$roleText (Pendiente de sincronizar al recuperar internet)"
                     }
                 },
                 onFailure = { err ->
@@ -578,11 +523,9 @@ class MainViewModel(
             val result = repository.seedDailyChecklistForUser(targetUser)
             _isBusy.value = false
             result.fold(
-                onSuccess = { outcome ->
-                    val added = outcome.value
+                onSuccess = { added ->
                     _actionMessage.value = if (added > 0) {
-                        val suffix = if (outcome.syncedWithServer) "" else " (se sincronizará al volver a internet)"
-                        "Check list programado asignado a ${targetUser.effectiveBranchLabel} ($added nuevas)$suffix."
+                        "Check list programado asignado a ${targetUser.effectiveBranchLabel} ($added nuevas)."
                     } else {
                         "${targetUser.effectiveBranchLabel} ya tiene todas las tareas programadas de hoy."
                     }

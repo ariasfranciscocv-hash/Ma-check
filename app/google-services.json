@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "703633415033",
+    "project_id": "mach-2e119",
+    "storage_bucket": "mach-2e119.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:703633415033:android:377c7979f60fb2a5ed6da8",
+        "android_client_info": {
+          "package_name": "com.aistudio.metacheck.qrvktp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBwoIhl9BASE1_vckiaXr7fsLBT_f13Vuc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

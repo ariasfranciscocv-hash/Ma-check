@@ -33,5 +33,4 @@
     <string name="notifications_title">Notificaciones</string>
     <string name="sign_out">Cerrar sesión</string>
     <string name="retry">Reintentar</string>
-    <string name="default_web_client_id" translatable="false">://googleusercontent.com</string>
     </resources>

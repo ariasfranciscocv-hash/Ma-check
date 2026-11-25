@@ -16,11 +16,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
       - name: Configure API Key
-        run: 
+        run: |
           echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
           echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> local.properties
       - name: Generate debug keystore
-        run: keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+        run: keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -startdate "2024/01/01 00:00:00" -dname "CN=Android Debug,O=Android,C=US"
+      - name: Print SHA-1
+        run: keytool -list -v -keystore debug.keystore -storepass android -alias androiddebugkey | grep SHA1
       - name: Build with Gradle
         run: gradle assembleDebug
       - name: Upload APK

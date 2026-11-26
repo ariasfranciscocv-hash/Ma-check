@@ -1,4 +1,5 @@
 <resources>
+    <string name="default_web_client_id" translatable="false">PEGA_AQUI_TU_CLIENT_ID_TIPO_3</string>
     <string name="app_name">MetaCheck</string>
     <string name="brand_name">Muebles América</string>
     <string name="brand_subtitle">División Andrea Enriquez</string>

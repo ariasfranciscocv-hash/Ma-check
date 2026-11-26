@@ -32,31 +32,45 @@ object DateAndFormatters {
         return isoFormat.format(cal.time)
     }
 
-    fun defaultBiweeklyRange(): Pair<String, String> {
-        val cal = Calendar.getInstance()
+    fun biweeklyRangeForDate(cal: Calendar = Calendar.getInstance()): Pair<String, String> {
         val day = cal.get(Calendar.DAY_OF_MONTH)
-        val startCal = Calendar.getInstance().apply {
-            time = cal.time
-            if (day <= 15) {
-                set(Calendar.DAY_OF_MONTH, 1)
-            } else {
-                set(Calendar.DAY_OF_MONTH, 16)
-            }
+        val startCal = (cal.clone() as Calendar).apply {
+            set(Calendar.DAY_OF_MONTH, if (day <= 15) 1 else 16)
         }
-        val endCal = Calendar.getInstance().apply {
-            time = startCal.time
-            add(Calendar.DAY_OF_MONTH, 13)
+        val endCal = (cal.clone() as Calendar).apply {
+            val endDay = if (day <= 15) 15 else getActualMaximum(Calendar.DAY_OF_MONTH)
+            set(Calendar.DAY_OF_MONTH, endDay)
         }
-        return isoFormat.format(startCal.time) to isoFormat.format(endCal.time)
+        synchronized(isoFormat) {
+            return isoFormat.format(startCal.time) to isoFormat.format(endCal.time)
+        }
     }
 
-    fun defaultBiweeklyTitle(): String {
-        val cal = Calendar.getInstance()
+    fun nextBiweeklyRange(cal: Calendar = Calendar.getInstance()): Pair<String, String> {
+        val day = cal.get(Calendar.DAY_OF_MONTH)
+        val nextCal = (cal.clone() as Calendar).apply {
+            if (day <= 15) {
+                set(Calendar.DAY_OF_MONTH, 16)
+            } else {
+                set(Calendar.DAY_OF_MONTH, 1)
+                add(Calendar.MONTH, 1)
+            }
+        }
+        return biweeklyRangeForDate(nextCal)
+    }
+
+    fun defaultBiweeklyRange(): Pair<String, String> = biweeklyRangeForDate(Calendar.getInstance())
+
+    fun biweeklyTitleForRange(startIso: String): String {
+        val parsed = runCatching { synchronized(isoFormat) { isoFormat.parse(startIso) } }.getOrNull() ?: Date()
+        val cal = Calendar.getInstance().apply { time = parsed }
         val quincenaNum = if (cal.get(Calendar.DAY_OF_MONTH) <= 15) "1ª Quincena" else "2ª Quincena"
         val monthFormat = SimpleDateFormat("MMMM yyyy", esMx)
         val monthName = monthFormat.format(cal.time).replaceFirstChar { it.uppercase() }
         return "$quincenaNum · $monthName"
     }
+
+    fun defaultBiweeklyTitle(): String = biweeklyTitleForRange(defaultBiweeklyRange().first)
 
     fun daysBetweenInclusive(startIso: String, endIso: String): Int {
         val start = runCatching { isoFormat.parse(startIso) }.getOrNull() ?: return 1
@@ -196,6 +210,65 @@ object DateAndFormatters {
             "Límite: $shortDate · $dueTime"
         } else {
             "Límite: $shortDate"
+        }
+    }
+
+    enum class TaskScheduleStatus {
+        COMPLETED,
+        IN_WINDOW,
+        BEFORE_WINDOW,
+        AFTER_WINDOW
+    }
+
+    fun resolveTaskScheduleStatus(
+        task: AssignedTask,
+        nowMillis: Long = System.currentTimeMillis()
+    ): TaskScheduleStatus {
+        if (task.status == com.example.data.model.TaskStatus.COMPLETED.name) {
+            return TaskScheduleStatus.COMPLETED
+        }
+        val (startMillis, endMillis) = resolveTaskWindowMillis(task) ?: return TaskScheduleStatus.IN_WINDOW
+        return when {
+            nowMillis < startMillis -> TaskScheduleStatus.BEFORE_WINDOW
+            nowMillis > endMillis -> TaskScheduleStatus.AFTER_WINDOW
+            else -> TaskScheduleStatus.IN_WINDOW
+        }
+    }
+
+    fun formatScheduleStartHint(task: AssignedTask): String = when {
+        task.id.endsWith("_avance_ventas_1400") || task.title.contains("2:00 p.m.", ignoreCase = true) ->
+            "Programada · 2:00 p.m."
+        task.id.endsWith("_avance_ventas_1800") || task.title.contains("6:00 p.m.", ignoreCase = true) ->
+            "Programada · 6:00 p.m."
+        else -> {
+            val assigned = extractScheduledAssignedDate(task.id) ?: task.dueDate
+            "Programada · ${formatIsoToShort(assigned)}"
+        }
+    }
+
+    fun extractTaskDayIso(task: AssignedTask): String {
+        extractScheduledAssignedDate(task.id)?.let { return it }
+        val createdIso = task.createdAt?.toDate()?.let { date ->
+            synchronized(isoFormat) { isoFormat.format(date) }
+        }
+        if (!createdIso.isNullOrBlank()) return createdIso
+        return task.dueDate.ifBlank { todayIso() }
+    }
+
+    fun formatDayGroupHeader(dateIso: String, todayIso: String = todayIso()): String {
+        val yesterdayIso = addDaysIso(todayIso, -1)
+        val parsed = runCatching { synchronized(isoFormat) { isoFormat.parse(dateIso) } }.getOrNull()
+        val readableDate = if (parsed != null) {
+            SimpleDateFormat("EEE dd MMM", esMx).format(parsed)
+                .replace(".", "")
+                .replaceFirstChar { it.uppercase() }
+        } else {
+            dateIso
+        }
+        return when (dateIso) {
+            todayIso -> "Hoy · $readableDate"
+            yesterdayIso -> "Ayer · $readableDate"
+            else -> readableDate
         }
     }
 }

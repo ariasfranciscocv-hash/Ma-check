@@ -43,8 +43,10 @@ service cloud.firestore {
              data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80 &&
              data.email is string && data.email.size() >= 3 && data.email.size() <= 120 &&
              (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 500)) &&
-             (!('branchName' in data) || data.branchName in ['Sucursal 107', 'Sucursal 109', 'Sucursal 110', 'Sucursal 112', 'Sucursal 148']) &&
+             (!('branchName' in data) || data.branchName in ['Sucursal 87', 'Sucursal 107', 'Sucursal 109', 'Sucursal 110', 'Sucursal 112', 'Sucursal 148']) &&
              data.role in ['ADMIN', 'EMPLOYEE'] &&
+             (!('confirmedQuotaId' in data) || (data.confirmedQuotaId is string && isValidId(data.confirmedQuotaId))) &&
+             (!('lastChecklistResetAt' in data) || (data.lastChecklistResetAt is timestamp && data.lastChecklistResetAt <= request.time)) &&
              data.createdAt is timestamp && data.createdAt <= request.time &&
              data.updatedAt is timestamp && data.updatedAt <= request.time;
     }
@@ -80,7 +82,24 @@ service cloud.firestore {
              data.uploaderId is string && isValidId(data.uploaderId) &&
              data.uploaderName is string && data.uploaderName.size() >= 1 && data.uploaderName.size() <= 80 &&
              data.taskTitle is string && data.taskTitle.size() >= 1 && data.taskTitle.size() <= 120 &&
-             data.imageBase64 is string && data.imageBase64.size() >= 50 && data.imageBase64.size() <= 700000 &&
+             (!('imageBase64' in data) || (data.imageBase64 is string && data.imageBase64.size() >= 1 && data.imageBase64.size() <= 700000)) &&
+             (!('fileCount' in data) || (data.fileCount is int && data.fileCount >= 1 && data.fileCount <= 5)) &&
+             (!('primaryFileName' in data) || (data.primaryFileName is string && data.primaryFileName.size() >= 1 && data.primaryFileName.size() <= 120)) &&
+             (('imageBase64' in data) || ('fileCount' in data)) &&
+             data.capturedAt is timestamp && data.capturedAt <= request.time;
+    }
+
+    function isValidTaskEvidenceFilePart(data) {
+      return data.evidenceId is string && isValidId(data.evidenceId) &&
+             data.taskId is string && isValidId(data.taskId) &&
+             data.uploaderId is string && isValidId(data.uploaderId) &&
+             data.fileIndex is int && data.fileIndex >= 0 && data.fileIndex <= 4 &&
+             data.chunkIndex is int && data.chunkIndex >= 0 && data.chunkIndex <= 3 &&
+             data.chunkCount is int && data.chunkCount >= 1 && data.chunkCount <= 4 &&
+             data.fileName is string && data.fileName.size() >= 1 && data.fileName.size() <= 120 &&
+             data.mimeType is string && data.mimeType.size() >= 1 && data.mimeType.size() <= 100 &&
+             data.sizeBytes is int && data.sizeBytes >= 1 && data.sizeBytes <= 1500000 &&
+             data.dataBase64 is string && data.dataBase64.size() >= 1 && data.dataBase64.size() <= 700000 &&
              data.capturedAt is timestamp && data.capturedAt <= request.time;
     }
 
@@ -124,9 +143,19 @@ service cloud.firestore {
              data.notes is string && data.notes.size() <= 300 &&
              (!('attachmentName' in data) || (data.attachmentName is string && data.attachmentName.size() >= 1 && data.attachmentName.size() <= 120)) &&
              (!('attachmentMimeType' in data) || (data.attachmentMimeType is string && data.attachmentMimeType.size() >= 1 && data.attachmentMimeType.size() <= 100)) &&
-             (!('attachmentBase64' in data) || (data.attachmentBase64 is string && data.attachmentBase64.size() >= 50 && data.attachmentBase64.size() <= 700000)) &&
+             (!('attachmentBase64' in data) || (data.attachmentBase64 is string && data.attachmentBase64.size() >= 1 && data.attachmentBase64.size() <= 700000)) &&
+             (!('attachmentChunkCount' in data) || (data.attachmentChunkCount is int && data.attachmentChunkCount >= 0 && data.attachmentChunkCount <= 8)) &&
+             (!('attachmentSizeBytes' in data) || (data.attachmentSizeBytes is int && data.attachmentSizeBytes >= 0 && data.attachmentSizeBytes <= 3500000)) &&
              data.createdAt is timestamp && data.createdAt <= request.time &&
              data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidSalesAttachmentChunk(data) {
+      return data.userId is string && isValidId(data.userId) &&
+             data.entryId is string && isValidId(data.entryId) &&
+             data.chunkIndex is int && data.chunkIndex >= 0 && data.chunkIndex <= 7 &&
+             data.dataBase64 is string && data.dataBase64.size() >= 1 && data.dataBase64.size() <= 700000 &&
+             data.createdAt is timestamp && data.createdAt <= request.time;
     }
 
     // --- Collection Rules ---
@@ -154,7 +183,10 @@ service cloud.firestore {
                          (request.auth.uid == userId &&
                           incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoUrl', 'branchName', 'updatedAt'])) ||
                          (isAdmin() &&
-                          incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoUrl', 'branchName', 'role', 'updatedAt']))
+                          incoming().diff(existing()).affectedKeys().hasOnly([
+                            'displayName', 'photoUrl', 'branchName', 'role',
+                            'confirmedQuotaId', 'lastChecklistResetAt', 'updatedAt'
+                          ]))
                        );
 
       allow delete: if isAdmin() && isValidId(userId);
@@ -226,6 +258,8 @@ service cloud.firestore {
                        incoming().createdAt == existing().createdAt &&
                        (
                          (isAdmin() &&
+                          (existing().status == 'PENDING' ||
+                           !incoming().diff(existing()).affectedKeys().hasAny(['evidenceId', 'hasPhotoEvidence', 'completedAt'])) &&
                           incoming().diff(existing()).affectedKeys().hasOnly([
                             'assigneeName', 'title', 'description', 'taskType', 'priority',
                             'dueDate', 'dueTime', 'deadlineLabel',
@@ -248,7 +282,7 @@ service cloud.firestore {
       allow delete: if isValidId(taskId) && isAdmin();
     }
 
-    // 4. Private Task Photo Evidences (STRICTLY ADMIN-ONLY READS)
+    // 4. Private Task Evidences (STRICTLY ADMIN-ONLY READS, up to 5 files, locked once COMPLETED)
     match /task_evidences/{evidenceId} {
       allow get: if isValidId(evidenceId) && isAdmin();
       allow list: if isAdmin();
@@ -258,16 +292,46 @@ service cloud.firestore {
                        isValidTaskEvidence(incoming()) &&
                        incoming().uploaderId == request.auth.uid &&
                        incoming().keys().hasAll([
-                         'taskId', 'uploaderId', 'uploaderName', 'taskTitle', 'imageBase64', 'capturedAt'
+                         'taskId', 'uploaderId', 'uploaderName', 'taskTitle', 'capturedAt'
                        ]) &&
                        incoming().keys().hasOnly([
-                         'taskId', 'uploaderId', 'uploaderName', 'taskTitle', 'imageBase64', 'capturedAt'
+                         'taskId', 'uploaderId', 'uploaderName', 'taskTitle',
+                         'imageBase64', 'fileCount', 'primaryFileName', 'capturedAt'
                        ]) &&
                        exists(/databases/$(database)/documents/tasks/$(incoming().taskId)) &&
+                       get(/databases/$(database)/documents/tasks/$(incoming().taskId)).data.status == 'PENDING' &&
                        (isAdmin() || get(/databases/$(database)/documents/tasks/$(incoming().taskId)).data.assigneeId == request.auth.uid);
 
       allow update: if false;
       allow delete: if isValidId(evidenceId) && isAdmin();
+
+      match /files/{partId} {
+        allow get, list: if isAdmin();
+
+        allow create: if isValidId(evidenceId) &&
+                         isValidId(partId) &&
+                         isSignedIn() &&
+                         isValidTaskEvidenceFilePart(incoming()) &&
+                         incoming().uploaderId == request.auth.uid &&
+                         incoming().evidenceId == evidenceId &&
+                         incoming().keys().hasAll([
+                           'evidenceId', 'taskId', 'uploaderId', 'fileIndex', 'chunkIndex', 'chunkCount',
+                           'fileName', 'mimeType', 'sizeBytes', 'dataBase64', 'capturedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'evidenceId', 'taskId', 'uploaderId', 'fileIndex', 'chunkIndex', 'chunkCount',
+                           'fileName', 'mimeType', 'sizeBytes', 'dataBase64', 'capturedAt'
+                         ]) &&
+                         existsAfter(/databases/$(database)/documents/task_evidences/$(evidenceId)) &&
+                         getAfter(/databases/$(database)/documents/task_evidences/$(evidenceId)).data.uploaderId == request.auth.uid &&
+                         getAfter(/databases/$(database)/documents/task_evidences/$(evidenceId)).data.taskId == incoming().taskId &&
+                         exists(/databases/$(database)/documents/tasks/$(incoming().taskId)) &&
+                         get(/databases/$(database)/documents/tasks/$(incoming().taskId)).data.status == 'PENDING' &&
+                         (isAdmin() || get(/databases/$(database)/documents/tasks/$(incoming().taskId)).data.assigneeId == request.auth.uid);
+
+        allow update: if false;
+        allow delete: if isValidId(evidenceId) && isValidId(partId) && isAdmin();
+      }
     }
 
     // 5. Extraordinary Task Notifications
@@ -363,6 +427,7 @@ service cloud.firestore {
                          'globalSales', 'creditSales', 'newCustomers',
                          'appMaOperations', 'newCustomerRequests',
                          'notes', 'attachmentName', 'attachmentMimeType', 'attachmentBase64',
+                         'attachmentChunkCount', 'attachmentSizeBytes',
                          'createdAt', 'updatedAt'
                        ]);
 
@@ -378,10 +443,50 @@ service cloud.firestore {
                          'globalSales', 'creditSales', 'newCustomers',
                          'appMaOperations', 'newCustomerRequests',
                          'notes', 'attachmentName', 'attachmentMimeType', 'attachmentBase64',
+                         'attachmentChunkCount', 'attachmentSizeBytes',
                          'updatedAt'
                        ]);
 
       allow delete: if isValidId(entryId) && isAdmin();
+
+      match /attachment_chunks/{chunkId} {
+        allow get: if isValidId(entryId) &&
+                      isValidId(chunkId) &&
+                      (isAdmin() || (isSignedIn() && existing().userId == request.auth.uid));
+
+        allow list: if isAdmin() || (isSignedIn() && resource.data.userId == request.auth.uid);
+
+        allow create: if isValidId(entryId) &&
+                         isValidId(chunkId) &&
+                         isSignedIn() &&
+                         isValidSalesAttachmentChunk(incoming()) &&
+                         incoming().userId == request.auth.uid &&
+                         incoming().entryId == entryId &&
+                         incoming().keys().hasAll([
+                           'userId', 'entryId', 'chunkIndex', 'dataBase64', 'createdAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'userId', 'entryId', 'chunkIndex', 'dataBase64', 'createdAt'
+                         ]) &&
+                         existsAfter(/databases/$(database)/documents/sales_entries/$(entryId)) &&
+                         getAfter(/databases/$(database)/documents/sales_entries/$(entryId)).data.userId == request.auth.uid;
+
+        allow update: if isValidId(entryId) &&
+                         isValidId(chunkId) &&
+                         isSignedIn() &&
+                         isValidSalesAttachmentChunk(incoming()) &&
+                         incoming().userId == existing().userId &&
+                         incoming().entryId == existing().entryId &&
+                         incoming().chunkIndex == existing().chunkIndex &&
+                         (isAdmin() || existing().userId == request.auth.uid) &&
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'dataBase64', 'createdAt'
+                         ]);
+
+        allow delete: if isValidId(entryId) &&
+                         isValidId(chunkId) &&
+                         (isAdmin() || (isSignedIn() && existing().userId == request.auth.uid));
+      }
     }
   }
 }

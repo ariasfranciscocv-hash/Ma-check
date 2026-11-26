@@ -29,15 +29,23 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.CalendarToday
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Storefront
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -51,6 +59,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -78,14 +87,18 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.model.AssignedTask
+import com.example.data.model.BiweeklyQuota
 import com.example.data.model.BranchTaskSummary
+import com.example.data.model.DayTaskGroup
 import com.example.data.model.TaskEvidence
+import com.example.data.model.TaskEvidenceAttachmentFile
 import com.example.data.model.TaskPriority
 import com.example.data.model.TaskStatus
 import com.example.data.model.TaskType
 import com.example.data.model.UiState
 import com.example.data.model.UserProfile
 import com.example.data.model.buildBranchTaskSummaries
+import com.example.data.model.buildDayTaskGroups
 import com.example.ui.theme.BrandNavy
 import com.example.ui.theme.BrandRed
 import com.example.ui.theme.BrandRedSoft
@@ -94,6 +107,8 @@ import com.example.ui.theme.SuccessGreenSoft
 import com.example.ui.theme.WarningAmber
 import com.example.ui.theme.WarningAmberSoft
 import com.example.utils.DateAndFormatters
+import com.example.utils.DateAndFormatters.TaskScheduleStatus
+import com.example.utils.EncodedAttachment
 import com.example.utils.ImageCompressor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -115,10 +130,12 @@ private enum class AdminTaskViewMode(val label: String) {
 fun TasksChecklistScreen(
     isAdmin: Boolean,
     isBusy: Boolean,
+    nowMillis: Long,
     tasksState: UiState<List<AssignedTask>>,
     evidencesState: UiState<List<TaskEvidence>>,
     teamUsers: List<UserProfile>,
     currentUserProfile: UserProfile?,
+    activeQuota: BiweeklyQuota?,
     onCreateTask: (
         assignees: List<UserProfile>,
         title: String,
@@ -130,21 +147,53 @@ fun TasksChecklistScreen(
         deadlineLabel: String?,
         onSuccess: () -> Unit
     ) -> Unit,
-    onCompleteTaskWithEvidence: (
-        task: AssignedTask,
-        imageBase64: String,
+    onUpdateTasks: (
+        tasks: List<AssignedTask>,
+        title: String,
+        description: String,
+        taskType: TaskType,
+        priority: TaskPriority,
+        dueDate: String,
+        dueTime: String?,
+        deadlineLabel: String?,
         onSuccess: () -> Unit
-    ) -> Unit
+    ) -> Unit,
+    onDeleteTasks: (
+        tasks: List<AssignedTask>,
+        onSuccess: () -> Unit
+    ) -> Unit,
+    onCompleteTaskWithEvidenceFiles: (
+        task: AssignedTask,
+        files: List<EncodedAttachment>,
+        onSuccess: () -> Unit
+    ) -> Unit,
+    onConfirmBranchResetForQuota: (branchName: String, branchUsers: List<UserProfile>) -> Unit,
+    onLoadEvidenceFiles: suspend (TaskEvidence) -> Result<List<TaskEvidenceAttachmentFile>>
 ) {
     var adminViewMode by remember { mutableStateOf(AdminTaskViewMode.BY_BRANCH) }
     var selectedFilter by remember { mutableStateOf(TaskFilter.ALL) }
     var taskToDocumentId by rememberSaveable { mutableStateOf<String?>(null) }
     var showCreateTaskDialog by remember { mutableStateOf(false) }
+    var taskToEditId by rememberSaveable { mutableStateOf<String?>(null) }
+    var taskToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     var evidencePreviewForAdmin by remember { mutableStateOf<TaskEvidence?>(null) }
+    val expandedDayState = remember { mutableStateMapOf<String, Boolean>() }
 
-    val taskToDocument = remember(taskToDocumentId, tasksState) {
+    val allTasksList = (tasksState as? UiState.Success)?.data.orEmpty()
+
+    val taskToDocument = remember(taskToDocumentId, allTasksList) {
         val targetId = taskToDocumentId ?: return@remember null
-        (tasksState as? UiState.Success)?.data?.firstOrNull { it.id == targetId }
+        allTasksList.firstOrNull { it.id == targetId && it.parsedStatus == TaskStatus.PENDING }
+    }
+
+    val taskToEdit = remember(taskToEditId, allTasksList) {
+        val targetId = taskToEditId ?: return@remember null
+        allTasksList.firstOrNull { it.id == targetId }
+    }
+
+    val taskToDelete = remember(taskToDeleteId, allTasksList) {
+        val targetId = taskToDeleteId ?: return@remember null
+        allTasksList.firstOrNull { it.id == targetId }
     }
 
     val evidencesMap = remember(evidencesState, isAdmin) {
@@ -245,8 +294,15 @@ fun TasksChecklistScreen(
                         }
                         AdminBranchesChecklistView(
                             summaries = summaries,
+                            teamUsers = teamUsers,
+                            activeQuota = activeQuota,
+                            isBusy = isBusy,
+                            nowMillis = nowMillis,
                             evidencesMap = evidencesMap,
-                            onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev }
+                            onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev },
+                            onEditTask = { task -> taskToEditId = task.id },
+                            onDeleteTask = { task -> taskToDeleteId = task.id },
+                            onConfirmBranchResetForQuota = onConfirmBranchResetForQuota
                         )
                     } else {
                         val filtered = remember(tasksState.data, selectedFilter) {
@@ -261,19 +317,39 @@ fun TasksChecklistScreen(
                         if (filtered.isEmpty()) {
                             EmptyTasksState(isAdmin = isAdmin, onCreateTask = { showCreateTaskDialog = true })
                         } else {
+                            val dayGroups = remember(filtered) { buildDayTaskGroups(filtered) }
+
                             LazyColumn(
                                 modifier = Modifier.fillMaxSize(),
-                                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 88.dp),
+                                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 88.dp),
                                 verticalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                items(filtered, key = { it.id }) { task ->
-                                    TaskCardItem(
-                                        task = task,
-                                        isAdmin = isAdmin,
-                                        linkedEvidence = if (isAdmin) evidencesMap[task.id] else null,
-                                        onDocumentClick = { taskToDocumentId = task.id },
-                                        onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev }
-                                    )
+                                items(dayGroups, key = { it.dateIso }) { group ->
+                                    val isExpanded = expandedDayState[group.dateIso] ?: group.isToday
+                                    DayTaskGroupCard(
+                                        group = group,
+                                        isExpanded = isExpanded,
+                                        onToggleExpand = {
+                                            expandedDayState[group.dateIso] = !isExpanded
+                                        }
+                                    ) {
+                                        group.tasks.forEach { task ->
+                                            TaskCardItem(
+                                                task = task,
+                                                nowMillis = nowMillis,
+                                                isAdmin = isAdmin,
+                                                linkedEvidence = if (isAdmin) evidencesMap[task.id] else null,
+                                                onDocumentClick = {
+                                                    if (task.parsedStatus == TaskStatus.PENDING) {
+                                                        taskToDocumentId = task.id
+                                                    }
+                                                },
+                                                onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev },
+                                                onEditTask = { taskToEditId = task.id },
+                                                onDeleteTask = { taskToDeleteId = task.id }
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -284,12 +360,12 @@ fun TasksChecklistScreen(
     }
 
     taskToDocument?.let { task ->
-        PhotoDocumentationDialog(
+        TaskDocumentationDialog(
             task = task,
             isBusy = isBusy,
             onDismiss = { taskToDocumentId = null },
-            onSubmitBase64 = { base64 ->
-                onCompleteTaskWithEvidence(task, base64) {
+            onSubmitFiles = { files ->
+                onCompleteTaskWithEvidenceFiles(task, files) {
                     taskToDocumentId = null
                 }
             }
@@ -317,8 +393,163 @@ fun TasksChecklistScreen(
         if (isAdmin) {
             EvidencePreviewDialog(
                 evidence = evidence,
+                onLoadEvidenceFiles = onLoadEvidenceFiles,
                 onDismiss = { evidencePreviewForAdmin = null }
             )
+        }
+    }
+
+    taskToEdit?.let { targetTask ->
+        if (isAdmin) {
+            val matchingTasks = remember(targetTask, allTasksList) {
+                val targetDay = DateAndFormatters.extractTaskDayIso(targetTask)
+                allTasksList.filter { candidate ->
+                    candidate.title == targetTask.title &&
+                        candidate.taskType == targetTask.taskType &&
+                        DateAndFormatters.extractTaskDayIso(candidate) == targetDay
+                }
+            }
+            EditTaskDialog(
+                task = targetTask,
+                matchingTasksCount = matchingTasks.size,
+                isBusy = isBusy,
+                onDismiss = { taskToEditId = null },
+                onSave = { title, desc, type, priority, dueDate, dueTime, deadlineLabel, applyToAll ->
+                    val scopeTasks = if (applyToAll && matchingTasks.size > 1) matchingTasks else listOf(targetTask)
+                    onUpdateTasks(
+                        scopeTasks,
+                        title,
+                        desc,
+                        type,
+                        priority,
+                        dueDate,
+                        dueTime,
+                        deadlineLabel
+                    ) {
+                        taskToEditId = null
+                    }
+                }
+            )
+        }
+    }
+
+    taskToDelete?.let { targetTask ->
+        if (isAdmin) {
+            val matchingTasks = remember(targetTask, allTasksList) {
+                val targetDay = DateAndFormatters.extractTaskDayIso(targetTask)
+                allTasksList.filter { candidate ->
+                    candidate.title == targetTask.title &&
+                        candidate.taskType == targetTask.taskType &&
+                        DateAndFormatters.extractTaskDayIso(candidate) == targetDay
+                }
+            }
+            DeleteTaskConfirmDialog(
+                task = targetTask,
+                matchingTasksCount = matchingTasks.size,
+                isBusy = isBusy,
+                onDismiss = { taskToDeleteId = null },
+                onConfirmDelete = { deleteAllBranches ->
+                    val scopeTasks = if (deleteAllBranches && matchingTasks.size > 1) matchingTasks else listOf(targetTask)
+                    onDeleteTasks(scopeTasks) {
+                        taskToDeleteId = null
+                    }
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun DayTaskGroupCard(
+    group: DayTaskGroup,
+    isExpanded: Boolean,
+    onToggleExpand: () -> Unit,
+    content: @Composable () -> Unit
+) {
+    val badgeBg = when {
+        group.allCompleted -> SuccessGreenSoft
+        group.isToday -> MaterialTheme.colorScheme.primaryContainer
+        else -> MaterialTheme.colorScheme.surfaceVariant
+    }
+    val badgeFg = when {
+        group.allCompleted -> SuccessGreen
+        group.isToday -> BrandNavy
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("day_group_card_${group.dateIso}")
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggleExpand)
+                    .padding(horizontal = 16.dp, vertical = 14.dp)
+                    .testTag("day_group_header_${group.dateIso}"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Surface(
+                    color = badgeBg,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.size(34.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Filled.CalendarToday,
+                            contentDescription = null,
+                            tint = badgeFg,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = group.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "${group.completedCount} de ${group.totalCount} tareas completadas",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                Surface(color = badgeBg, shape = RoundedCornerShape(50)) {
+                    Text(
+                        text = "${group.completedCount}/${group.totalCount}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = badgeFg,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+
+                Icon(
+                    imageVector = if (isExpanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                    contentDescription = if (isExpanded) "Ocultar día ${group.title}" else "Desplegar día ${group.title}",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            AnimatedVisibility(visible = isExpanded) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 12.dp, end = 12.dp, bottom = 14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+                    content()
+                }
+            }
         }
     }
 }
@@ -326,11 +557,19 @@ fun TasksChecklistScreen(
 @Composable
 private fun AdminBranchesChecklistView(
     summaries: List<BranchTaskSummary>,
+    teamUsers: List<UserProfile>,
+    activeQuota: BiweeklyQuota?,
+    isBusy: Boolean,
+    nowMillis: Long,
     evidencesMap: Map<String, TaskEvidence>,
-    onViewAdminEvidence: (TaskEvidence) -> Unit
+    onViewAdminEvidence: (TaskEvidence) -> Unit,
+    onEditTask: (AssignedTask) -> Unit,
+    onDeleteTask: (AssignedTask) -> Unit,
+    onConfirmBranchResetForQuota: (branchName: String, branchUsers: List<UserProfile>) -> Unit
 ) {
     val expandedState = remember { mutableStateMapOf<String, Boolean>() }
     val completedBranches = summaries.count { it.allTasksCompleted }
+    var pendingResetBranch by remember { mutableStateOf<Pair<String, List<UserProfile>>?>(null) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -357,7 +596,7 @@ private fun AdminBranchesChecklistView(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = "Toca una sucursal para desplegar el detalle de sus tareas",
+                            text = "Toca una sucursal para ver sus días desplegables y confirmar reinicios por cuota.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -379,26 +618,77 @@ private fun AdminBranchesChecklistView(
 
         items(summaries, key = { it.branchName }) { summary ->
             val isExpanded = expandedState[summary.branchName] == true
+            val branchUsers = remember(teamUsers, summary.branchName) {
+                teamUsers.filter { it.effectiveBranchLabel == summary.branchName || it.branchName == summary.branchName }
+            }
             BranchChecklistCard(
                 summary = summary,
+                branchUsers = branchUsers,
+                activeQuota = activeQuota,
+                isBusy = isBusy,
+                nowMillis = nowMillis,
                 isExpanded = isExpanded,
                 evidencesMap = evidencesMap,
                 onToggleExpand = {
                     expandedState[summary.branchName] = !isExpanded
                 },
-                onViewAdminEvidence = onViewAdminEvidence
+                onRequestBranchReset = {
+                    pendingResetBranch = summary.branchName to branchUsers
+                },
+                onViewAdminEvidence = onViewAdminEvidence,
+                onEditTask = onEditTask,
+                onDeleteTask = onDeleteTask
             )
         }
+    }
+
+    val resetRequest = pendingResetBranch
+    if (resetRequest != null && activeQuota != null) {
+        val (branchName, users) = resetRequest
+        AlertDialog(
+            onDismissRequest = { if (!isBusy) pendingResetBranch = null },
+            title = { Text("Confirmar reinicio · $branchName") },
+            text = {
+                Text(
+                    "Se actualizará la lista de tareas de $branchName para la cuota \"${activeQuota.title}\". " +
+                        "Se borrarán las tareas del ciclo anterior de esta sucursal y se generará su nuevo check list base."
+                )
+            },
+            confirmButton = {
+                Button(
+                    enabled = !isBusy,
+                    onClick = {
+                        onConfirmBranchResetForQuota(branchName, users)
+                        pendingResetBranch = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = BrandRed)
+                ) {
+                    Text("Confirmar reinicio")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingResetBranch = null }, enabled = !isBusy) {
+                    Text("Cancelar")
+                }
+            }
+        )
     }
 }
 
 @Composable
 private fun BranchChecklistCard(
     summary: BranchTaskSummary,
+    branchUsers: List<UserProfile>,
+    activeQuota: BiweeklyQuota?,
+    isBusy: Boolean,
+    nowMillis: Long,
     isExpanded: Boolean,
     evidencesMap: Map<String, TaskEvidence>,
     onToggleExpand: () -> Unit,
-    onViewAdminEvidence: (TaskEvidence) -> Unit
+    onRequestBranchReset: () -> Unit,
+    onViewAdminEvidence: (TaskEvidence) -> Unit,
+    onEditTask: (AssignedTask) -> Unit,
+    onDeleteTask: (AssignedTask) -> Unit
 ) {
     val indicatorColor = if (summary.allTasksCompleted) SuccessGreen else BrandRed
     val indicatorBg = if (summary.allTasksCompleted) SuccessGreenSoft else BrandRedSoft
@@ -407,6 +697,15 @@ private fun BranchChecklistCard(
         summary.allTasksCompleted -> "Todas cumplidas"
         else -> "Pendientes (${summary.totalCount - summary.completedCount})"
     }
+
+    val needsQuotaReset = activeQuota != null &&
+        branchUsers.isNotEmpty() &&
+        branchUsers.any { it.confirmedQuotaId != activeQuota.id }
+    val quotaConfirmed = activeQuota != null &&
+        branchUsers.isNotEmpty() &&
+        branchUsers.all { it.confirmedQuotaId == activeQuota.id }
+
+    val expandedDaysInBranch = remember(summary.branchName) { mutableStateMapOf<String, Boolean>() }
 
     Card(
         modifier = Modifier
@@ -466,6 +765,13 @@ private fun BranchChecklistCard(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (needsQuotaReset) {
+                        Text(
+                            text = "Cuota actualizada · Requiere confirmar reinicio",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = WarningAmber
+                        )
+                    }
                 }
 
                 Surface(color = indicatorBg, shape = RoundedCornerShape(50)) {
@@ -493,6 +799,72 @@ private fun BranchChecklistCard(
                 ) {
                     HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
 
+                    if (activeQuota != null) {
+                        val resetBannerBg = when {
+                            quotaConfirmed -> SuccessGreenSoft
+                            needsQuotaReset -> WarningAmberSoft
+                            else -> MaterialTheme.colorScheme.surfaceVariant
+                        }
+                        val resetBannerFg = when {
+                            quotaConfirmed -> SuccessGreen
+                            needsQuotaReset -> WarningAmber
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                        Surface(
+                            color = resetBannerBg,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = when {
+                                            quotaConfirmed -> "Lista confirmada para ${activeQuota.title}"
+                                            needsQuotaReset -> "Nueva cuota: ${activeQuota.title}"
+                                            else -> "Sin usuario registrado en esta sucursal"
+                                        },
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = resetBannerFg
+                                    )
+                                    if (needsQuotaReset) {
+                                        Text(
+                                            text = "Confirma para reiniciar las tareas de esta sucursal.",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                                if (needsQuotaReset) {
+                                    Button(
+                                        onClick = onRequestBranchReset,
+                                        enabled = !isBusy,
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = BrandRed,
+                                            contentColor = Color.White
+                                        ),
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier.testTag("confirm_branch_reset_${summary.branchName}")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.RestartAlt,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Confirmar", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if (summary.tasks.isEmpty()) {
                         Text(
                             text = "Esta sucursal todavía no tiene tareas asignadas.",
@@ -501,12 +873,68 @@ private fun BranchChecklistCard(
                             modifier = Modifier.padding(vertical = 6.dp)
                         )
                     } else {
-                        summary.tasks.forEach { task ->
-                            BranchTaskStatusRow(
-                                task = task,
-                                linkedEvidence = evidencesMap[task.id],
-                                onViewAdminEvidence = onViewAdminEvidence
-                            )
+                        val branchDayGroups = remember(summary.tasks) { buildDayTaskGroups(summary.tasks) }
+                        branchDayGroups.forEach { dayGroup ->
+                            val dayExpanded = expandedDaysInBranch[dayGroup.dateIso] ?: dayGroup.isToday
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                expandedDaysInBranch[dayGroup.dateIso] = !dayExpanded
+                                            }
+                                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = dayGroup.title,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = BrandNavy
+                                        )
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Text(
+                                                text = "${dayGroup.completedCount}/${dayGroup.totalCount}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (dayGroup.allCompleted) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Icon(
+                                                imageVector = if (dayExpanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(18.dp),
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+                                    AnimatedVisibility(visible = dayExpanded) {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(start = 8.dp, end = 8.dp, bottom = 8.dp),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            dayGroup.tasks.forEach { task ->
+                                                BranchTaskStatusRow(
+                                                    task = task,
+                                                    nowMillis = nowMillis,
+                                                    linkedEvidence = evidencesMap[task.id],
+                                                    onViewAdminEvidence = onViewAdminEvidence,
+                                                    onEditTask = { onEditTask(task) },
+                                                    onDeleteTask = { onDeleteTask(task) }
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -518,52 +946,69 @@ private fun BranchChecklistCard(
 @Composable
 private fun BranchTaskStatusRow(
     task: AssignedTask,
+    nowMillis: Long,
     linkedEvidence: TaskEvidence?,
-    onViewAdminEvidence: (TaskEvidence) -> Unit
+    onViewAdminEvidence: (TaskEvidence) -> Unit,
+    onEditTask: () -> Unit,
+    onDeleteTask: () -> Unit
 ) {
-    val isDone = task.parsedStatus == TaskStatus.COMPLETED
-    val isPastDeadline = !isDone && DateAndFormatters.isTaskPastDeadline(task.dueDate, task.dueTime)
-    val dotColor = if (isDone) SuccessGreen else BrandRed
-    val badgeBg = if (isDone) SuccessGreenSoft else BrandRedSoft
-    val statusText = when {
-        isDone -> "Realizada"
-        isPastDeadline -> "Vencida"
-        else -> "No realizada"
+    val scheduleStatus = DateAndFormatters.resolveTaskScheduleStatus(task, nowMillis)
+    val dotColor = when (scheduleStatus) {
+        TaskScheduleStatus.COMPLETED -> SuccessGreen
+        TaskScheduleStatus.IN_WINDOW -> SuccessGreen
+        TaskScheduleStatus.BEFORE_WINDOW -> BrandNavy
+        TaskScheduleStatus.AFTER_WINDOW -> WarningAmber
     }
+    val badgeBg = when (scheduleStatus) {
+        TaskScheduleStatus.COMPLETED -> SuccessGreenSoft
+        TaskScheduleStatus.IN_WINDOW -> SuccessGreenSoft
+        TaskScheduleStatus.BEFORE_WINDOW -> MaterialTheme.colorScheme.primaryContainer
+        TaskScheduleStatus.AFTER_WINDOW -> WarningAmberSoft
+    }
+    val statusText = when (scheduleStatus) {
+        TaskScheduleStatus.COMPLETED -> "Realizada"
+        TaskScheduleStatus.IN_WINDOW -> "En horario"
+        TaskScheduleStatus.BEFORE_WINDOW -> DateAndFormatters.formatScheduleStartHint(task)
+        TaskScheduleStatus.AFTER_WINDOW -> "Fuera de horario"
+    }
+    val isDone = task.parsedStatus == TaskStatus.COMPLETED
 
     Surface(
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
-        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(10.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(horizontal = 10.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            Box(
-                modifier = Modifier
-                    .size(12.dp)
-                    .clip(CircleShape)
-                    .background(dotColor)
-            )
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = task.title,
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurface
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(if (isDone) SuccessGreen else BrandRed)
                 )
-                Text(
-                    text = "${task.parsedType.labelEs} · ${DateAndFormatters.formatDeadlineDisplay(task.dueDate, task.dueTime, task.deadlineLabel)}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (isPastDeadline) BrandRed else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
 
-            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = task.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "${task.parsedType.labelEs} · ${DateAndFormatters.formatDeadlineDisplay(task.dueDate, task.dueTime, task.deadlineLabel)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
                 Surface(color = badgeBg, shape = RoundedCornerShape(50)) {
                     Text(
                         text = statusText,
@@ -572,21 +1017,54 @@ private fun BranchTaskStatusRow(
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                     )
                 }
+            }
 
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 if (isDone && linkedEvidence != null) {
                     TextButton(
                         onClick = { onViewAdminEvidence(linkedEvidence) },
-                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
-                        modifier = Modifier.height(28.dp)
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Visibility,
-                            contentDescription = "Ver foto de ${task.title}",
-                            modifier = Modifier.size(14.dp)
+                            contentDescription = "Ver archivos de ${task.title}",
+                            modifier = Modifier.size(15.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Foto", style = MaterialTheme.typography.labelSmall)
+                        Text(
+                            text = "Archivos (${linkedEvidence.resolvedFileCount})",
+                            style = MaterialTheme.typography.labelSmall
+                        )
                     }
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+
+                IconButton(
+                    onClick = onEditTask,
+                    modifier = Modifier.testTag("edit_branch_task_${task.id}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Edit,
+                        contentDescription = "Editar tarea ${task.title}",
+                        tint = BrandNavy,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                IconButton(
+                    onClick = onDeleteTask,
+                    modifier = Modifier.testTag("delete_branch_task_${task.id}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.DeleteOutline,
+                        contentDescription = "Eliminar tarea ${task.title}",
+                        tint = BrandRed,
+                        modifier = Modifier.size(18.dp)
+                    )
                 }
             }
         }
@@ -622,9 +1100,9 @@ private fun EmptyTasksState(
         Spacer(modifier = Modifier.height(6.dp))
         Text(
             text = if (isAdmin) {
-                "Solo se muestran las tareas dentro de su horario establecido. Crea una nueva tarea con el botón + cuando la necesites."
+                "No hay tareas con este filtro. Crea una nueva tarea con el botón + cuando la necesites."
             } else {
-                "No hay tareas activas en este horario. Las tareas aparecen únicamente durante el tiempo establecido para cumplirlas."
+                "No hay tareas registradas con este filtro por el momento."
             },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -646,27 +1124,49 @@ private fun EmptyTasksState(
 @Composable
 private fun TaskCardItem(
     task: AssignedTask,
+    nowMillis: Long,
     isAdmin: Boolean,
     linkedEvidence: TaskEvidence?,
     onDocumentClick: () -> Unit,
-    onViewAdminEvidence: (TaskEvidence) -> Unit
+    onViewAdminEvidence: (TaskEvidence) -> Unit,
+    onEditTask: () -> Unit,
+    onDeleteTask: () -> Unit
 ) {
     val isExtraordinary = task.parsedType == TaskType.EXTRAORDINARY
     val isCompleted = task.parsedStatus == TaskStatus.COMPLETED
-    val isPastDeadline = !isCompleted && DateAndFormatters.isTaskPastDeadline(task.dueDate, task.dueTime)
+    val scheduleStatus = DateAndFormatters.resolveTaskScheduleStatus(task, nowMillis)
     val deadlineDisplay = DateAndFormatters.formatDeadlineDisplay(task.dueDate, task.dueTime, task.deadlineLabel)
+
+    val scheduleBg = when (scheduleStatus) {
+        TaskScheduleStatus.COMPLETED -> SuccessGreenSoft
+        TaskScheduleStatus.IN_WINDOW -> SuccessGreenSoft
+        TaskScheduleStatus.BEFORE_WINDOW -> MaterialTheme.colorScheme.primaryContainer
+        TaskScheduleStatus.AFTER_WINDOW -> WarningAmberSoft
+    }
+    val scheduleFg = when (scheduleStatus) {
+        TaskScheduleStatus.COMPLETED -> SuccessGreen
+        TaskScheduleStatus.IN_WINDOW -> SuccessGreen
+        TaskScheduleStatus.BEFORE_WINDOW -> BrandNavy
+        TaskScheduleStatus.AFTER_WINDOW -> WarningAmber
+    }
+    val scheduleText = when (scheduleStatus) {
+        TaskScheduleStatus.COMPLETED -> "Completada"
+        TaskScheduleStatus.IN_WINDOW -> "En horario"
+        TaskScheduleStatus.BEFORE_WINDOW -> DateAndFormatters.formatScheduleStartHint(task)
+        TaskScheduleStatus.AFTER_WINDOW -> "Fuera de horario"
+    }
 
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .testTag("task_card_${task.id}"),
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(9.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -679,7 +1179,7 @@ private fun TaskCardItem(
                         shape = RoundedCornerShape(50)
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
@@ -711,26 +1211,7 @@ private fun TaskCardItem(
                     }
                 }
 
-                val statusBg = when {
-                    isCompleted -> SuccessGreenSoft
-                    isPastDeadline -> BrandRedSoft
-                    else -> MaterialTheme.colorScheme.surfaceVariant
-                }
-                val statusFg = when {
-                    isCompleted -> SuccessGreen
-                    isPastDeadline -> BrandRed
-                    else -> MaterialTheme.colorScheme.onSurfaceVariant
-                }
-                val statusText = when {
-                    isCompleted -> task.parsedStatus.labelEs
-                    isPastDeadline -> "Plazo vencido"
-                    else -> task.parsedStatus.labelEs
-                }
-
-                Surface(
-                    color = statusBg,
-                    shape = RoundedCornerShape(50)
-                ) {
+                Surface(color = scheduleBg, shape = RoundedCornerShape(50)) {
                     Row(
                         modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -739,13 +1220,13 @@ private fun TaskCardItem(
                         Icon(
                             imageVector = if (isCompleted) Icons.Filled.CheckCircle else Icons.Filled.Schedule,
                             contentDescription = null,
-                            tint = statusFg,
+                            tint = scheduleFg,
                             modifier = Modifier.size(14.dp)
                         )
                         Text(
-                            text = statusText,
+                            text = scheduleText,
                             style = MaterialTheme.typography.labelSmall,
-                            color = statusFg
+                            color = scheduleFg
                         )
                     }
                 }
@@ -778,14 +1259,14 @@ private fun TaskCardItem(
                 Text(
                     text = deadlineDisplay,
                     style = MaterialTheme.typography.labelSmall,
-                    color = if (isPastDeadline) BrandRed else MaterialTheme.colorScheme.onSurfaceVariant
+                    color = if (scheduleStatus == TaskScheduleStatus.AFTER_WINDOW) WarningAmber else MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 
             if (!isCompleted) {
                 Button(
                     onClick = onDocumentClick,
-                    enabled = !isPastDeadline,
+                    enabled = true,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(48.dp)
@@ -793,27 +1274,24 @@ private fun TaskCardItem(
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = BrandNavy,
-                        contentColor = Color.White,
-                        disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
-                        disabledContentColor = BrandRed
+                        contentColor = Color.White
                     )
                 ) {
                     Icon(
-                        imageVector = if (isPastDeadline) Icons.Filled.Lock else Icons.Filled.CameraAlt,
+                        imageVector = Icons.Filled.UploadFile,
                         contentDescription = null,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        if (isPastDeadline) "Plazo vencido · No editable"
-                        else "Documentar con Foto y Completar"
-                    )
+                    Text("Subir Evidencia (hasta 5 archivos)")
                 }
             } else {
                 Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    color = MaterialTheme.colorScheme.surface,
                     shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("task_locked_banner_${task.id}")
                 ) {
                     Row(
                         modifier = Modifier
@@ -834,8 +1312,12 @@ private fun TaskCardItem(
                                 modifier = Modifier.size(16.dp)
                             )
                             Text(
-                                text = if (isAdmin) "Evidencia fotográfica disponible"
-                                else "Evidencia confidencial (Solo Administrador)",
+                                text = if (isAdmin) {
+                                    val count = linkedEvidence?.resolvedFileCount ?: 1
+                                    "Bloqueada · $count archivo(s) adjunto(s)"
+                                } else {
+                                    "Completada y bloqueada · No admite más archivos"
+                                },
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -848,9 +1330,45 @@ private fun TaskCardItem(
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
-                                Text("Ver Foto")
+                                Text("Ver (${linkedEvidence.resolvedFileCount})")
                             }
                         }
+                    }
+                }
+            }
+
+            if (isAdmin) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = onEditTask,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.testTag("edit_task_button_${task.id}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Edit,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Editar", style = MaterialTheme.typography.labelMedium)
+                    }
+                    OutlinedButton(
+                        onClick = onDeleteTask,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = BrandRed),
+                        modifier = Modifier.testTag("delete_task_button_${task.id}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.DeleteOutline,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Eliminar", style = MaterialTheme.typography.labelMedium)
                     }
                 }
             }
@@ -859,31 +1377,59 @@ private fun TaskCardItem(
 }
 
 @Composable
-private fun PhotoDocumentationDialog(
+private fun TaskDocumentationDialog(
     task: AssignedTask,
     isBusy: Boolean,
     onDismiss: () -> Unit,
-    onSubmitBase64: (String) -> Unit
+    onSubmitFiles: (List<EncodedAttachment>) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var pendingCameraUriString by rememberSaveable { mutableStateOf<String?>(null) }
-    var compressedBase64 by remember { mutableStateOf<String?>(null) }
-    var isCompressing by remember { mutableStateOf(false) }
-    var photoError by remember { mutableStateOf<String?>(null) }
+    val attachedFiles = remember(task.id) { mutableStateListOf<EncodedAttachment>() }
+    var isProcessing by remember { mutableStateOf(false) }
+    var attachmentError by remember { mutableStateOf<String?>(null) }
 
-    fun handleUri(uri: Uri) {
-        isCompressing = true
-        photoError = null
+    fun appendUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val remaining = ImageCompressor.MAX_TASK_EVIDENCE_FILES - attachedFiles.size
+        if (remaining <= 0) {
+            attachmentError = "Máximo 5 archivos por tarea."
+            return
+        }
+        val toProcess = uris.take(remaining)
+        val overflow = uris.size > remaining
+        isProcessing = true
+        attachmentError = null
         scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                ImageCompressor.compressUriToBase64(context, uri)
+            val errors = mutableListOf<String>()
+            toProcess.forEach { uri ->
+                val encodedResult = withContext(Dispatchers.IO) {
+                    ImageCompressor.encodeUriAttachment(
+                        context = context,
+                        uri = uri,
+                        maxTotalBytes = ImageCompressor.MAX_TASK_EVIDENCE_FILE_BYTES,
+                        maxChunks = 4,
+                        maxSizeLabel = "1.5 MB"
+                    )
+                }
+                encodedResult.fold(
+                    onSuccess = { encoded ->
+                        if (attachedFiles.size < ImageCompressor.MAX_TASK_EVIDENCE_FILES) {
+                            attachedFiles.add(encoded)
+                        }
+                    },
+                    onFailure = { err ->
+                        errors.add(err.localizedMessage ?: "No se pudo procesar un archivo.")
+                    }
+                )
             }
-            isCompressing = false
-            result.fold(
-                onSuccess = { encoded -> compressedBase64 = encoded },
-                onFailure = { err -> photoError = err.localizedMessage ?: "No se pudo procesar la foto." }
-            )
+            isProcessing = false
+            attachmentError = when {
+                errors.isNotEmpty() -> errors.first()
+                overflow -> "Se agregaron los archivos hasta completar el máximo de 5."
+                else -> null
+            }
         }
     }
 
@@ -892,23 +1438,36 @@ private fun PhotoDocumentationDialog(
     ) { success ->
         val uri = pendingCameraUriString?.let { Uri.parse(it) }
         if (success && uri != null) {
-            handleUri(uri)
+            appendUris(listOf(uri))
         }
     }
 
     val photoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) {
-            handleUri(uri)
+        contract = ActivityResultContracts.PickMultipleVisualMedia(ImageCompressor.MAX_TASK_EVIDENCE_FILES)
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            appendUris(uris)
         }
     }
 
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            appendUris(uris)
+        }
+    }
+
+    val canAddMore = attachedFiles.size < ImageCompressor.MAX_TASK_EVIDENCE_FILES && !isBusy && !isProcessing
+
     AlertDialog(
-        onDismissRequest = { if (!isBusy && !isCompressing) onDismiss() },
+        onDismissRequest = { if (!isBusy && !isProcessing) onDismiss() },
         title = { Text("Documentar Tarea") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
                 Text(
                     text = task.title,
                     style = MaterialTheme.typography.titleSmall,
@@ -931,7 +1490,7 @@ private fun PhotoDocumentationDialog(
                             modifier = Modifier.size(18.dp)
                         )
                         Text(
-                            text = "Privacidad: al enviar, la fotografía solo podrá visualizarse por los administradores del sistema.",
+                            text = "Privacidad y cierre definitivo: puedes subir de 1 a 5 archivos (fotos o documentos, máx. 1.5 MB c/u). Al enviarse, la tarea queda bloqueada y solo el administrador verá los archivos.",
                             style = MaterialTheme.typography.bodySmall,
                             color = BrandRed
                         )
@@ -940,7 +1499,7 @@ private fun PhotoDocumentationDialog(
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     OutlinedButton(
                         onClick = {
@@ -949,17 +1508,18 @@ private fun PhotoDocumentationDialog(
                                 pendingCameraUriString = uri.toString()
                                 takePictureLauncher.launch(uri)
                             }.onFailure {
-                                photoError = "No se pudo abrir la cámara en este dispositivo."
+                                attachmentError = "No se pudo abrir la cámara en este dispositivo."
                             }
                         },
-                        enabled = !isBusy && !isCompressing,
+                        enabled = canAddMore,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
                         modifier = Modifier
                             .weight(1f)
                             .testTag("take_photo_button")
                     ) {
-                        Icon(Icons.Filled.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Cámara")
+                        Icon(Icons.Filled.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Cámara", style = MaterialTheme.typography.labelSmall)
                     }
 
                     OutlinedButton(
@@ -969,50 +1529,134 @@ private fun PhotoDocumentationDialog(
                                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                                 )
                             }.onFailure {
-                                photoError = "No se pudo abrir la galería en este dispositivo."
+                                attachmentError = "No se pudo abrir la galería en este dispositivo."
                             }
                         },
-                        enabled = !isBusy && !isCompressing,
+                        enabled = canAddMore,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
                         modifier = Modifier
                             .weight(1f)
                             .testTag("pick_gallery_button")
                     ) {
-                        Icon(Icons.Filled.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Galería")
+                        Icon(Icons.Filled.PhotoLibrary, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Galería", style = MaterialTheme.typography.labelSmall)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            runCatching {
+                                filePickerLauncher.launch(arrayOf("*/*"))
+                            }.onFailure {
+                                attachmentError = "No se pudo abrir el selector de archivos."
+                            }
+                        },
+                        enabled = canAddMore,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("pick_file_button")
+                    ) {
+                        Icon(Icons.Filled.AttachFile, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Archivo", style = MaterialTheme.typography.labelSmall)
                     }
                 }
 
-                if (isCompressing) {
+                Text(
+                    text = "Archivos adjuntos (${attachedFiles.size}/${ImageCompressor.MAX_TASK_EVIDENCE_FILES})",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = BrandNavy
+                )
+
+                if (isProcessing) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                        Text("Optimizando fotografía...", style = MaterialTheme.typography.bodySmall)
+                        Text("Procesando archivos...", style = MaterialTheme.typography.bodySmall)
                     }
                 }
 
-                compressedBase64?.let { encoded ->
-                    val previewBitmap = remember(encoded) {
-                        ImageCompressor.decodeBase64ToImageBitmap(encoded)
-                    }
-                    if (previewBitmap != null) {
-                        Image(
-                            bitmap = previewBitmap,
-                            contentDescription = "Vista previa antes de enviar",
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(150.dp)
-                                .clip(RoundedCornerShape(12.dp)),
-                            contentScale = ContentScale.Crop
-                        )
+                attachedFiles.forEachIndexed { index, file ->
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(
+                                        imageVector = if (file.mimeType.startsWith("image/")) {
+                                            Icons.Filled.PhotoLibrary
+                                        } else {
+                                            Icons.Filled.Description
+                                        },
+                                        contentDescription = null,
+                                        tint = BrandNavy,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Column {
+                                        Text(
+                                            text = "${index + 1}. ${file.fileName}",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Text(
+                                            text = "${file.mimeType} · ${ImageCompressor.formatFileSize(file.totalBytes)}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                                IconButton(
+                                    enabled = !isBusy && !isProcessing,
+                                    onClick = { attachedFiles.removeAt(index) }
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Close,
+                                        contentDescription = "Quitar ${file.fileName}",
+                                        tint = BrandRed
+                                    )
+                                }
+                            }
+
+                            if (file.mimeType.startsWith("image/") && file.singleBase64OrNull != null) {
+                                val previewBitmap = remember(file.singleBase64OrNull) {
+                                    ImageCompressor.decodeBase64ToImageBitmap(file.singleBase64OrNull ?: "")
+                                }
+                                if (previewBitmap != null) {
+                                    Image(
+                                        bitmap = previewBitmap,
+                                        contentDescription = "Vista previa ${file.fileName}",
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(110.dp)
+                                            .clip(RoundedCornerShape(10.dp)),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
 
-                if (photoError != null) {
+                if (attachmentError != null) {
                     Text(
-                        text = photoError ?: "",
+                        text = attachmentError ?: "",
                         style = MaterialTheme.typography.bodySmall,
                         color = BrandRed
                     )
@@ -1021,18 +1665,25 @@ private fun PhotoDocumentationDialog(
         },
         confirmButton = {
             Button(
-                onClick = { compressedBase64?.let(onSubmitBase64) },
-                enabled = compressedBase64 != null && !isBusy && !isCompressing,
+                onClick = {
+                    if (attachedFiles.isNotEmpty()) {
+                        onSubmitFiles(attachedFiles.toList())
+                    }
+                },
+                enabled = attachedFiles.isNotEmpty() && !isBusy && !isProcessing,
                 colors = ButtonDefaults.buttonColors(containerColor = BrandNavy),
                 modifier = Modifier.testTag("submit_photo_evidence_button")
             ) {
-                Text(if (isBusy) "Enviando..." else "Enviar y Completar")
+                Text(
+                    if (isBusy) "Enviando..."
+                    else "Enviar (${attachedFiles.size}) y Completar"
+                )
             }
         },
         dismissButton = {
             TextButton(
                 onClick = onDismiss,
-                enabled = !isBusy && !isCompressing
+                enabled = !isBusy && !isProcessing
             ) {
                 Text("Cancelar")
             }
@@ -1084,7 +1735,7 @@ private fun CreateTaskDialog(
                 OutlinedTextField(
                     value = description,
                     onValueChange = { description = it.take(500) },
-                    label = { Text("Instrucciones / qué fotografiar") },
+                    label = { Text("Instrucciones / qué adjuntar") },
                     minLines = 2,
                     maxLines = 3,
                     modifier = Modifier.testTag("new_task_desc_input")
@@ -1124,7 +1775,7 @@ private fun CreateTaskDialog(
                     }
                 }
 
-                Text("Límite para completarse", style = MaterialTheme.typography.labelMedium)
+                Text("Horario sugerido / referencia", style = MaterialTheme.typography.labelMedium)
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     DeadlinePreset.entries.forEach { preset ->
                         FilterChip(
@@ -1217,6 +1868,267 @@ private fun CreateTaskDialog(
                 modifier = Modifier.testTag("confirm_create_task_button")
             ) {
                 Text(if (isBusy) "Creando..." else "Asignar Tarea")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !isBusy) {
+                Text("Cancelar")
+            }
+        }
+    )
+}
+
+@Composable
+private fun EditTaskDialog(
+    task: AssignedTask,
+    matchingTasksCount: Int,
+    isBusy: Boolean,
+    onDismiss: () -> Unit,
+    onSave: (
+        title: String,
+        description: String,
+        taskType: TaskType,
+        priority: TaskPriority,
+        dueDate: String,
+        dueTime: String?,
+        deadlineLabel: String?,
+        applyToAllBranches: Boolean
+    ) -> Unit
+) {
+    var title by remember(task.id) { mutableStateOf(task.title) }
+    var description by remember(task.id) { mutableStateOf(task.description) }
+    var taskType by remember(task.id) { mutableStateOf(task.parsedType) }
+    var priority by remember(task.id) { mutableStateOf(task.parsedPriority) }
+    var dueDate by remember(task.id) { mutableStateOf(task.dueDate.ifBlank { DateAndFormatters.todayIso() }) }
+    var dueTime by remember(task.id) { mutableStateOf(task.dueTime ?: "") }
+    var deadlineLabel by remember(task.id) { mutableStateOf(task.deadlineLabel ?: "") }
+    var applyToAllBranches by remember(task.id) { mutableStateOf(false) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+
+    val todayIso = remember { DateAndFormatters.todayIso() }
+    val tomorrowIso = remember(todayIso) { DateAndFormatters.addDaysIso(todayIso, 1) }
+
+    AlertDialog(
+        onDismissRequest = { if (!isBusy) onDismiss() },
+        title = { Text("Editar Tarea") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Sucursal: ${task.assigneeName}",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = BrandNavy
+                )
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it.take(120) },
+                    label = { Text("Título de la tarea") },
+                    singleLine = true,
+                    modifier = Modifier.testTag("edit_task_title_input")
+                )
+                OutlinedTextField(
+                    value = description,
+                    onValueChange = { description = it.take(500) },
+                    label = { Text("Instrucciones / qué adjuntar") },
+                    minLines = 2,
+                    maxLines = 3,
+                    modifier = Modifier.testTag("edit_task_desc_input")
+                )
+
+                Text("Tipo de tarea", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TaskType.entries.forEach { type ->
+                        FilterChip(
+                            selected = taskType == type,
+                            onClick = { taskType = type },
+                            label = { Text(type.labelEs) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = if (type == TaskType.EXTRAORDINARY) BrandRed else BrandNavy,
+                                selectedLabelColor = Color.White
+                            )
+                        )
+                    }
+                }
+
+                Text("Prioridad", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TaskPriority.entries.forEach { p ->
+                        FilterChip(
+                            selected = priority == p,
+                            onClick = { priority = p },
+                            label = { Text(p.labelEs) }
+                        )
+                    }
+                }
+
+                Text("Fecha límite (AAAA-MM-DD)", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = dueDate == todayIso,
+                        onClick = { dueDate = todayIso },
+                        label = { Text("Hoy") }
+                    )
+                    FilterChip(
+                        selected = dueDate == tomorrowIso,
+                        onClick = { dueDate = tomorrowIso },
+                        label = { Text("Mañana") }
+                    )
+                }
+                OutlinedTextField(
+                    value = dueDate,
+                    onValueChange = { dueDate = it.take(10) },
+                    label = { Text("Fecha límite") },
+                    singleLine = true,
+                    modifier = Modifier.testTag("edit_task_due_date_input")
+                )
+
+                Text("Hora límite (HH:mm)", style = MaterialTheme.typography.labelMedium)
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf("" to "Sin hora", "11:30" to "11:30", "17:59" to "17:59", "23:59" to "23:59").forEach { (value, label) ->
+                        FilterChip(
+                            selected = dueTime == value,
+                            onClick = { dueTime = value },
+                            label = { Text(label) }
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = dueTime,
+                    onValueChange = { dueTime = it.take(5) },
+                    label = { Text("Hora (ej. 14:30 o 23:59, opcional)") },
+                    singleLine = true,
+                    modifier = Modifier.testTag("edit_task_due_time_input")
+                )
+
+                OutlinedTextField(
+                    value = deadlineLabel,
+                    onValueChange = { deadlineLabel = it.take(80) },
+                    label = { Text("Etiqueta de horario (opcional)") },
+                    singleLine = true,
+                    modifier = Modifier.testTag("edit_task_deadline_label_input")
+                )
+
+                if (matchingTasksCount > 1) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { applyToAllBranches = !applyToAllBranches },
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = applyToAllBranches,
+                            onCheckedChange = { applyToAllBranches = it }
+                        )
+                        Text(
+                            text = "Aplicar cambio a todas las sucursales con esta tarea hoy ($matchingTasksCount)",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+
+                if (errorMsg != null) {
+                    Text(text = errorMsg ?: "", style = MaterialTheme.typography.bodySmall, color = BrandRed)
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !isBusy,
+                onClick = {
+                    val cleanTitle = title.trim()
+                    val cleanDate = dueDate.trim()
+                    val cleanTime = dueTime.trim().takeIf { it.isNotEmpty() }
+                    when {
+                        cleanTitle.length < 3 ->
+                            errorMsg = "Escribe un título de al menos 3 caracteres."
+                        !cleanDate.matches(Regex("""^\d{4}-\d{2}-\d{2}$""")) ->
+                            errorMsg = "La fecha debe tener formato AAAA-MM-DD (ej. 2026-11-26)."
+                        cleanTime != null && !cleanTime.matches(Regex("""^([01]\d|2[0-3]):[0-5]\d$""")) ->
+                            errorMsg = "La hora debe tener formato HH:mm de 24h (ej. 14:30 o 23:59)."
+                        else -> onSave(
+                            cleanTitle,
+                            description.trim(),
+                            taskType,
+                            priority,
+                            cleanDate,
+                            cleanTime,
+                            deadlineLabel.trim().takeIf { it.isNotEmpty() },
+                            applyToAllBranches
+                        )
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = BrandNavy),
+                modifier = Modifier.testTag("confirm_edit_task_button")
+            ) {
+                Text(if (isBusy) "Guardando..." else "Guardar Cambios")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !isBusy) {
+                Text("Cancelar")
+            }
+        }
+    )
+}
+
+@Composable
+private fun DeleteTaskConfirmDialog(
+    task: AssignedTask,
+    matchingTasksCount: Int,
+    isBusy: Boolean,
+    onDismiss: () -> Unit,
+    onConfirmDelete: (deleteAllBranches: Boolean) -> Unit
+) {
+    var deleteAllBranches by remember(task.id) { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = { if (!isBusy) onDismiss() },
+        title = { Text("Eliminar Tarea") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = "¿Seguro que deseas eliminar \"${task.title}\" (${task.assigneeName})?",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                if (task.parsedStatus == TaskStatus.COMPLETED) {
+                    Text(
+                        text = "Esta tarea ya estaba completada; también se eliminarán sus archivos de evidencia.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = BrandRed
+                    )
+                }
+                if (matchingTasksCount > 1) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { deleteAllBranches = !deleteAllBranches },
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = deleteAllBranches,
+                            onCheckedChange = { deleteAllBranches = it }
+                        )
+                        Text(
+                            text = "Eliminar también en todas las sucursales con esta tarea hoy ($matchingTasksCount)",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = !isBusy,
+                onClick = { onConfirmDelete(deleteAllBranches) },
+                colors = ButtonDefaults.buttonColors(containerColor = BrandRed),
+                modifier = Modifier.testTag("confirm_delete_task_button")
+            ) {
+                Text(if (isBusy) "Eliminando..." else "Eliminar")
             }
         },
         dismissButton = {

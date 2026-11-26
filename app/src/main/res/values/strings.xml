@@ -20,7 +20,7 @@
     <string name="closing_notes_label">Observaciones de cierre (opcional)</string>
     <string name="save_closing_button">Guardar Cierre de Hoy</string>
     <string name="update_closing_button">Actualizar Cierre de Hoy</string>
-    <string name="biweekly_quota_title">Meta Quincenal (14 días)</string>
+    <string name="biweekly_quota_title">Meta Quincenal</string>
     <string name="projection_chart_title">Proyección de Cumplimiento</string>
     <string name="extraordinary_tasks_title">Tareas Extraordinarias</string>
     <string name="daily_tasks_title">Check List Diario</string>

@@ -42,6 +42,7 @@ import androidx.compose.material.icons.outlined.Group
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -86,6 +87,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.data.firestore.FirestoreProvider
 import com.example.data.local.AppPreferences
+import com.example.data.model.UiState
 import com.example.data.repository.AppRepository
 import com.example.data.repository.AuthRepository
 import com.example.notifications.NotificationHelper
@@ -219,6 +221,7 @@ private fun AuthenticatedApp(
     )
 
     val lastCachedBranch by viewModel.lastCachedBranch.collectAsStateWithLifecycle()
+    val adminCheck by viewModel.adminCheckState.collectAsStateWithLifecycle()
     val isAdmin by viewModel.isAdminState.collectAsStateWithLifecycle()
     val userProfile by viewModel.currentUserProfile.collectAsStateWithLifecycle()
     val branchConfirmed by viewModel.branchConfirmedThisSession.collectAsStateWithLifecycle()
@@ -231,6 +234,9 @@ private fun AuthenticatedApp(
     val chartSeries by viewModel.selectedChartSeries.collectAsStateWithLifecycle()
     val showDailyBriefing by viewModel.showFirstEntryBriefingToday.collectAsStateWithLifecycle()
     val tasksState by viewModel.tasksState.collectAsStateWithLifecycle()
+    val scheduleNowMillis by viewModel.scheduleTickerState.collectAsStateWithLifecycle()
+    val activeQuotaState by viewModel.activeQuotaState.collectAsStateWithLifecycle()
+    val activeQuota = (activeQuotaState as? UiState.Success)?.data
     val evidencesState by viewModel.evidencesState.collectAsStateWithLifecycle()
     val teamUsers by viewModel.teamUsers.collectAsStateWithLifecycle()
     val closingAttachmentDraft by viewModel.closingAttachmentDraft.collectAsStateWithLifecycle()
@@ -243,8 +249,10 @@ private fun AuthenticatedApp(
         contract = ActivityResultContracts.RequestPermission()
     ) { }
 
-    LaunchedEffect(branchConfirmed) {
-        if (branchConfirmed && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+    val isReadyForMainUi = (adminCheck == true) || branchConfirmed
+
+    LaunchedEffect(isReadyForMainUi) {
+        if (isReadyForMainUi && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             !NotificationHelper.canPostNotifications(context)
         ) {
             notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -276,7 +284,20 @@ private fun AuthenticatedApp(
         currentTab = AppTab.HOME
     }
 
-    if (!branchConfirmed) {
+    if (adminCheck == null) {
+        SetStatusBarAppearance(lightBackground = true)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center
+        ) {
+            CircularProgressIndicator(color = BrandNavy)
+        }
+        return
+    }
+
+    if (!isReadyForMainUi) {
         SetStatusBarAppearance(lightBackground = true)
         BranchSelectionScreen(
             initialBranch = userProfile?.branchName ?: lastCachedBranch,
@@ -294,7 +315,7 @@ private fun AuthenticatedApp(
     }
 
     val unreadCount = remember(notifications) { notifications.count { !it.acknowledged } }
-    val branchLabel = userProfile?.effectiveBranchLabel ?: "Sucursal"
+    val branchLabel = if (isAdmin) "Todas las sucursales" else userProfile?.effectiveBranchLabel ?: "Sucursal"
 
     val visibleTabs = remember(isAdmin) {
         if (isAdmin) listOf(AppTab.HOME, AppTab.TASKS, AppTab.EVIDENCES, AppTab.TEAM)
@@ -390,36 +411,59 @@ private fun AuthenticatedApp(
                         )
                     }
 
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clickable { viewModel.reopenBranchSelection() }
-                            .padding(horizontal = 14.dp, vertical = 7.dp)
-                            .testTag("switch_branch_pill"),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
+                    if (isAdmin) {
                         Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(horizontal = 14.dp, vertical = 7.dp)
+                                .testTag("admin_all_branches_pill"),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Filled.Storefront,
-                                contentDescription = "Cambiar sucursal",
+                                contentDescription = null,
                                 tint = BrandNavy,
                                 modifier = Modifier.size(15.dp)
                             )
                             Text(
-                                text = branchLabel,
+                                text = "Dashboard General · Todas las sucursales",
                                 style = MaterialTheme.typography.labelLarge,
                                 color = BrandNavy
                             )
                         }
-                        Text(
-                            text = "Cambiar",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = BrandNavy.copy(alpha = 0.72f)
-                        )
+                    } else {
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable { viewModel.reopenBranchSelection() }
+                                .padding(horizontal = 14.dp, vertical = 7.dp)
+                                .testTag("switch_branch_pill"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Storefront,
+                                    contentDescription = "Cambiar sucursal",
+                                    tint = BrandNavy,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Text(
+                                    text = branchLabel,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = BrandNavy
+                                )
+                            }
+                            Text(
+                                text = "Cambiar",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = BrandNavy.copy(alpha = 0.72f)
+                            )
+                        }
                     }
                 }
                 HorizontalDivider(thickness = 1.dp, color = BorderSubtle)
@@ -537,29 +581,52 @@ private fun AuthenticatedApp(
                     AppTab.TASKS -> TasksChecklistScreen(
                         isAdmin = isAdmin,
                         isBusy = isBusy,
+                        nowMillis = scheduleNowMillis,
                         tasksState = tasksState,
                         evidencesState = evidencesState,
                         teamUsers = teamUsers,
                         currentUserProfile = userProfile,
+                        activeQuota = activeQuota,
                         onCreateTask = { assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess ->
                             viewModel.createTask(assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess)
                         },
-                        onCompleteTaskWithEvidence = { task, base64, onSuccess ->
-                            viewModel.completeTaskWithEvidence(task, base64, onSuccess)
+                        onUpdateTasks = { tasksToUpdate, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess ->
+                            viewModel.updateTasks(tasksToUpdate, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess)
+                        },
+                        onDeleteTasks = { tasksToDelete, onSuccess ->
+                            viewModel.deleteTasks(tasksToDelete, onSuccess)
+                        },
+                        onCompleteTaskWithEvidenceFiles = { task, files, onSuccess ->
+                            viewModel.completeTaskWithEvidenceFiles(task, files, onSuccess)
+                        },
+                        onConfirmBranchResetForQuota = { branchName, branchUsers ->
+                            viewModel.confirmBranchChecklistResetForQuota(branchName, branchUsers)
+                        },
+                        onLoadEvidenceFiles = { evidence ->
+                            viewModel.loadTaskEvidenceFiles(evidence)
                         }
                     )
 
-                    AppTab.EVIDENCES -> AdminEvidencesScreen(evidencesState = evidencesState)
+                    AppTab.EVIDENCES -> AdminEvidencesScreen(
+                        evidencesState = evidencesState,
+                        onLoadEvidenceFiles = { evidence ->
+                            viewModel.loadTaskEvidenceFiles(evidence)
+                        }
+                    )
 
                     AppTab.TEAM -> TeamAdminScreen(
                         currentUserId = user.uid,
                         teamUsers = teamUsers,
+                        activeQuota = activeQuota,
                         isBusy = isBusy,
                         onToggleAdmin = { target, makeAdmin ->
                             viewModel.toggleUserAdminRole(target, makeAdmin)
                         },
                         onSeedChecklist = { target ->
                             viewModel.seedDailyChecklist(target)
+                        },
+                        onConfirmBranchResetForQuota = { branchName, branchUsers ->
+                            viewModel.confirmBranchChecklistResetForQuota(branchName, branchUsers)
                         }
                     )
                 }

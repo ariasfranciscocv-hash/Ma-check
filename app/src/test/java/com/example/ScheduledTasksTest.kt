@@ -44,15 +44,15 @@ class ScheduledTasksTest {
     }
 
     @Test
-    fun `saturday carry-over includes friday Inventario and monday 11_30 cutoff is enforced`() {
+    fun `tasksToEnsureOnDate creates only that day's tasks without previous-day carry-over`() {
         val saturdayNoon = Calendar.getInstance().apply {
             set(2026, Calendar.NOVEMBER, 28, 12, 0, 0)
             set(Calendar.MILLISECOND, 0)
         }.timeInMillis
         val saturdayEnsure = ScheduledTasksCatalog.tasksToEnsureOnDate("2026-11-28", saturdayNoon)
-        assertTrue(saturdayEnsure.any { (assignedDate, spec) ->
-            assignedDate == "2026-11-27" && spec.title == "Inventario"
-        })
+        assertTrue(saturdayEnsure.isNotEmpty())
+        assertTrue(saturdayEnsure.all { (assignedDate, _) -> assignedDate == "2026-11-28" })
+        assertFalse(saturdayEnsure.any { (assignedDate, _) -> assignedDate == "2026-11-27" })
 
         val monday1129 = Calendar.getInstance().apply {
             set(2026, Calendar.NOVEMBER, 30, 11, 29, 0)
@@ -67,9 +67,9 @@ class ScheduledTasksTest {
         assertTrue(DateAndFormatters.isTaskPastDeadline("2026-11-30", "11:30", monday1131))
 
         val mondayMorningEnsure = ScheduledTasksCatalog.tasksToEnsureOnDate("2026-11-30", monday1129)
-        assertTrue(mondayMorningEnsure.any { (assignedDate, spec) ->
-            assignedDate == "2026-11-29" && spec.title == "Exámenes"
-        })
+        assertTrue(mondayMorningEnsure.isNotEmpty())
+        assertTrue(mondayMorningEnsure.all { (assignedDate, _) -> assignedDate == "2026-11-30" })
+        assertFalse(mondayMorningEnsure.any { (assignedDate, _) -> assignedDate == "2026-11-29" })
     }
 
     @Test
@@ -141,6 +141,76 @@ class ScheduledTasksTest {
         assertTrue(DateAndFormatters.isTaskWithinActiveWindow(examenes, sundayEvening))
         assertTrue(DateAndFormatters.isTaskWithinActiveWindow(examenes, monday1130))
         assertFalse(DateAndFormatters.isTaskWithinActiveWindow(examenes, monday1131))
+    }
+
+    @Test
+    fun `schedule indicator distinguishes before_window, in_window, after_window, and completed while keeping tasks completable`() {
+        val task2pm = com.example.data.model.AssignedTask(
+            id = "sched_u1_2026-11-25_avance_ventas_1400",
+            title = "Actualización de avance de ventas (2:00 p.m.)",
+            dueDate = "2026-11-25",
+            dueTime = "17:59",
+            status = com.example.data.model.TaskStatus.PENDING.name
+        )
+        val at1359 = millisOf(2026, Calendar.NOVEMBER, 25, 13, 59)
+        val at1400 = millisOf(2026, Calendar.NOVEMBER, 25, 14, 0)
+        val at1800 = millisOf(2026, Calendar.NOVEMBER, 25, 18, 0)
+
+        assertEquals(
+            DateAndFormatters.TaskScheduleStatus.BEFORE_WINDOW,
+            DateAndFormatters.resolveTaskScheduleStatus(task2pm, at1359)
+        )
+        assertEquals(
+            DateAndFormatters.TaskScheduleStatus.IN_WINDOW,
+            DateAndFormatters.resolveTaskScheduleStatus(task2pm, at1400)
+        )
+        assertEquals(
+            DateAndFormatters.TaskScheduleStatus.AFTER_WINDOW,
+            DateAndFormatters.resolveTaskScheduleStatus(task2pm, at1800)
+        )
+
+        val completedTask = task2pm.copy(status = com.example.data.model.TaskStatus.COMPLETED.name)
+        assertEquals(
+            DateAndFormatters.TaskScheduleStatus.COMPLETED,
+            DateAndFormatters.resolveTaskScheduleStatus(completedTask, at1800)
+        )
+    }
+
+    @Test
+    fun `buildDayTaskGroups groups tasks by assigned day with today expanded first`() {
+        val tToday1 = com.example.data.model.AssignedTask(
+            id = "sched_u1_2026-11-26_apertura_piso",
+            title = "Apertura de piso",
+            dueDate = "2026-11-26",
+            status = com.example.data.model.TaskStatus.COMPLETED.name
+        )
+        val tToday2 = com.example.data.model.AssignedTask(
+            id = "sched_u1_2026-11-26_avance_ventas_1400",
+            title = "Avance 2pm",
+            dueDate = "2026-11-26",
+            dueTime = "17:59",
+            status = com.example.data.model.TaskStatus.PENDING.name
+        )
+        val tYesterday = com.example.data.model.AssignedTask(
+            id = "sched_u1_2026-11-25_cierre_caja_credito",
+            title = "Cierre de caja",
+            dueDate = "2026-11-25",
+            status = com.example.data.model.TaskStatus.PENDING.name
+        )
+
+        val groups = com.example.data.model.buildDayTaskGroups(
+            tasks = listOf(tYesterday, tToday1, tToday2),
+            todayIso = "2026-11-26"
+        )
+        assertEquals(2, groups.size)
+        assertEquals("2026-11-26", groups[0].dateIso)
+        assertTrue(groups[0].isToday)
+        assertEquals(1, groups[0].completedCount)
+        assertEquals(2, groups[0].totalCount)
+        assertEquals("2026-11-25", groups[1].dateIso)
+        assertFalse(groups[1].isToday)
+        assertEquals(0, groups[1].completedCount)
+        assertEquals(1, groups[1].totalCount)
     }
 
     private fun millisOf(year: Int, month: Int, day: Int, hour: Int, minute: Int): Long =

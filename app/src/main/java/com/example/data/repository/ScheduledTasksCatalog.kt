@@ -132,28 +132,13 @@ object ScheduledTasksCatalog {
     }
 
     /**
-     * Returns (assignedDateIso, spec) pairs that should exist for the user on [todayIso]:
-     * all scheduled tasks for [todayIso], plus any carry-over tasks from yesterday whose
-     * deadline extends into [todayIso] (e.g. Friday's "Inventario" on Saturday, and Sunday's
-     * "Exámenes" on Monday until 11:30 a.m.).
+     * Returns (assignedDateIso, spec) pairs for [todayIso] only, ensuring only
+     * the current day's tasks are created.
      */
     fun tasksToEnsureOnDate(
         todayIso: String,
-        nowMillis: Long = System.currentTimeMillis()
+        @Suppress("UNUSED_PARAMETER") nowMillis: Long = System.currentTimeMillis()
     ): List<Pair<String, ScheduledTaskSpec>> {
-        val result = mutableListOf<Pair<String, ScheduledTaskSpec>>()
-        tasksForDate(todayIso).forEach { spec ->
-            result.add(todayIso to spec)
-        }
-        val yesterdayIso = DateAndFormatters.addDaysIso(todayIso, -1)
-        tasksForDate(yesterdayIso)
-            .filter { spec ->
-                spec.dueDateIso >= todayIso &&
-                    !DateAndFormatters.isTaskPastDeadline(spec.dueDateIso, spec.dueTime, nowMillis)
-            }
-            .forEach { spec ->
-                result.add(yesterdayIso to spec)
-            }
-        return result
+        return tasksForDate(todayIso).map { spec -> todayIso to spec }
     }
 }

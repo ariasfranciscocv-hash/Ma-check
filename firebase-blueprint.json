@@ -11,9 +11,11 @@
         "photoUrl": { "type": "string" },
         "branchName": {
           "type": "string",
-          "enum": ["Sucursal 107", "Sucursal 109", "Sucursal 110", "Sucursal 112", "Sucursal 148"]
+          "enum": ["Sucursal 87", "Sucursal 107", "Sucursal 109", "Sucursal 110", "Sucursal 112", "Sucursal 148"]
         },
         "role": { "type": "string", "enum": ["ADMIN", "EMPLOYEE"] },
+        "confirmedQuotaId": { "type": "string" },
+        "lastChecklistResetAt": { "type": "string", "format": "date-time" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -61,7 +63,7 @@
     },
     "TaskEvidence": {
       "title": "TaskEvidence",
-      "description": "Restricted photo documentation readable exclusively by system administrators.",
+      "description": "Restricted task documentation (up to 5 files) readable exclusively by system administrators.",
       "type": "object",
       "properties": {
         "taskId": { "type": "string" },
@@ -69,9 +71,33 @@
         "uploaderName": { "type": "string" },
         "taskTitle": { "type": "string" },
         "imageBase64": { "type": "string" },
+        "fileCount": { "type": "integer" },
+        "primaryFileName": { "type": "string" },
         "capturedAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["taskId", "uploaderId", "uploaderName", "taskTitle", "imageBase64", "capturedAt"]
+      "required": ["taskId", "uploaderId", "uploaderName", "taskTitle", "capturedAt"]
+    },
+    "TaskEvidenceFilePart": {
+      "title": "TaskEvidenceFilePart",
+      "description": "File payload (or chunk) belonging to a task evidence record (max 5 files per task).",
+      "type": "object",
+      "properties": {
+        "evidenceId": { "type": "string" },
+        "taskId": { "type": "string" },
+        "uploaderId": { "type": "string" },
+        "fileIndex": { "type": "integer" },
+        "chunkIndex": { "type": "integer" },
+        "chunkCount": { "type": "integer" },
+        "fileName": { "type": "string" },
+        "mimeType": { "type": "string" },
+        "sizeBytes": { "type": "integer" },
+        "dataBase64": { "type": "string" },
+        "capturedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "evidenceId", "taskId", "uploaderId", "fileIndex", "chunkIndex", "chunkCount",
+        "fileName", "mimeType", "sizeBytes", "dataBase64", "capturedAt"
+      ]
     },
     "TaskNotification": {
       "title": "TaskNotification",
@@ -133,6 +159,8 @@
         "attachmentName": { "type": "string" },
         "attachmentMimeType": { "type": "string" },
         "attachmentBase64": { "type": "string" },
+        "attachmentChunkCount": { "type": "integer" },
+        "attachmentSizeBytes": { "type": "integer" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -142,6 +170,19 @@
         "appMaOperations", "newCustomerRequests",
         "notes", "createdAt", "updatedAt"
       ]
+    },
+    "SalesAttachmentChunk": {
+      "title": "SalesAttachmentChunk",
+      "description": "Base64 chunk for multi-megabyte files attached to a daily sales closing entry.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "entryId": { "type": "string" },
+        "chunkIndex": { "type": "integer" },
+        "dataBase64": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "entryId", "chunkIndex", "dataBase64", "createdAt"]
     }
   },
   "firestore": {
@@ -159,7 +200,11 @@
     },
     "/task_evidences/{evidenceId}": {
       "schema": { "$ref": "#/entities/TaskEvidence" },
-      "description": "Restricted photo evidences readable only by administrators."
+      "description": "Restricted task evidences readable only by administrators."
+    },
+    "/task_evidences/{evidenceId}/files/{partId}": {
+      "schema": { "$ref": "#/entities/TaskEvidenceFilePart" },
+      "description": "Up to 5 attached files (or chunks) for a task evidence record, readable only by administrators."
     },
     "/notifications/{notificationId}": {
       "schema": { "$ref": "#/entities/TaskNotification" },
@@ -172,6 +217,10 @@
     "/sales_entries/{entryId}": {
       "schema": { "$ref": "#/entities/DailySalesEntry" },
       "description": "Daily close-of-operations sales reports."
+    },
+    "/sales_entries/{entryId}/attachment_chunks/{chunkId}": {
+      "schema": { "$ref": "#/entities/SalesAttachmentChunk" },
+      "description": "Chunked file payloads for daily sales closing attachments larger than 480 KB."
     }
   }
 }

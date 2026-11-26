@@ -10,6 +10,7 @@ import com.example.data.model.BranchOptions
 import com.example.data.model.ClosingAttachmentDraft
 import com.example.data.model.DailySalesEntry
 import com.example.data.model.TaskEvidence
+import com.example.data.model.TaskEvidenceAttachmentFile
 import com.example.data.model.TaskNotification
 import com.example.data.model.TaskPriority
 import com.example.data.model.TaskStatus
@@ -17,6 +18,8 @@ import com.example.data.model.TaskType
 import com.example.data.model.UserProfile
 import com.example.data.model.UserRole
 import com.example.utils.DateAndFormatters
+import com.example.utils.EncodedAttachment
+import com.example.utils.ImageCompressor
 import com.google.firebase.Firebase
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.auth
@@ -35,7 +38,6 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
 
 private const val BOOTSTRAPPED_ADMIN_EMAIL = "arias.francisco.cv@gmail.com"
-private const val BOOTSTRAPPED_ADMIN_UID = "7aFXbgvVxbXXusy6vRWcnI1otSa2"
 
 class AppRepository(
     private val db: FirebaseFirestore
@@ -50,10 +52,7 @@ class AppRepository(
             ?: throw IllegalStateException("El usuario debe iniciar sesión con Google primero.")
 
     private fun isBootstrappedAdmin(email: String?, emailVerified: Boolean): Boolean =
-    auth.currentUser?.uid == BOOTSTRAPPED_ADMIN_UID ||
-    email.equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) ||
-    email.equals("pakow.arias@gmail.com", ignoreCase = true)
-    
+        email == BOOTSTRAPPED_ADMIN_EMAIL && emailVerified
 
     suspend fun syncCurrentUserProfile(
         uid: String,
@@ -326,7 +325,8 @@ class AppRepository(
     suspend fun seedDailyChecklistForUser(targetUser: UserProfile): Result<Int> {
         return syncScheduledTasksForAssignee(
             assigneeId = targetUser.userId,
-            assigneeName = targetUser.effectiveBranchLabel
+            assigneeName = targetUser.effectiveBranchLabel,
+            skipIfDayAlreadyCreated = false
         )
     }
 
@@ -335,13 +335,15 @@ class AppRepository(
             ?: return Result.failure(IllegalStateException("Usuario no autenticado."))
         return syncScheduledTasksForAssignee(
             assigneeId = uid,
-            assigneeName = branchLabel
+            assigneeName = branchLabel,
+            skipIfDayAlreadyCreated = true
         )
     }
 
     private suspend fun syncScheduledTasksForAssignee(
         assigneeId: String,
-        assigneeName: String
+        assigneeName: String,
+        skipIfDayAlreadyCreated: Boolean
     ): Result<Int> {
         return try {
             val actorUid = requireUserId()
@@ -355,6 +357,11 @@ class AppRepository(
                 .documents
                 .map { it.id }
                 .toSet()
+
+            val todayPrefix = "sched_${assigneeId}_${today}_"
+            if (skipIfDayAlreadyCreated && existingIds.any { it.startsWith(todayPrefix) }) {
+                return Result.success(0)
+            }
 
             val safeName = assigneeName.trim().ifBlank { "Sucursal" }.take(80)
             val missing = expected.filter { (assignedDate, spec) ->
@@ -400,37 +407,294 @@ class AppRepository(
         }
     }
 
-    suspend fun completeTaskWithPhotoEvidence(
+    suspend fun confirmBranchChecklistResetForQuota(
+        branchName: String,
+        branchUsers: List<UserProfile>,
+        quotaId: String
+    ): Result<Int> {
+        return try {
+            val adminUid = requireUserId()
+            require(quotaId.isNotBlank()) { "No hay una meta quincenal activa." }
+            require(branchUsers.isNotEmpty()) {
+                "No hay usuarios registrados en $branchName para confirmar el reinicio."
+            }
+
+            val today = DateAndFormatters.todayIso()
+            val expectedToday = ScheduledTasksCatalog.tasksToEnsureOnDate(today)
+            var recreatedTotal = 0
+
+            for (user in branchUsers) {
+                val existingSnap = db.collection("tasks")
+                    .whereEqualTo("assigneeId", user.userId)
+                    .get()
+                    .await()
+
+                val docsToDelete = existingSnap.documents
+                docsToDelete.chunked(380).forEach { chunk ->
+                    val deleteBatch = db.batch()
+                    chunk.forEach { doc -> deleteBatch.delete(doc.reference) }
+                    deleteBatch.commit().await()
+                }
+
+                val createBatch = db.batch()
+                val userRef = db.collection("users").document(user.userId)
+                createBatch.update(
+                    userRef,
+                    mapOf(
+                        "confirmedQuotaId" to quotaId,
+                        "lastChecklistResetAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                )
+
+                val safeName = branchName.trim().ifBlank { user.effectiveBranchLabel }.take(80)
+                expectedToday.forEach { (assignedDate, spec) ->
+                    val deterministicId = "sched_${user.userId}_${assignedDate}_${spec.slug}"
+                    val taskRef = db.collection("tasks").document(deterministicId)
+                    createBatch.set(
+                        taskRef,
+                        mapOf(
+                            "assigneeId" to user.userId,
+                            "assigneeName" to safeName,
+                            "createdBy" to adminUid,
+                            "title" to spec.title,
+                            "description" to spec.description,
+                            "taskType" to TaskType.DAILY.name,
+                            "priority" to TaskPriority.NORMAL.name,
+                            "dueDate" to spec.dueDateIso,
+                            "dueTime" to spec.dueTime,
+                            "deadlineLabel" to spec.deadlineLabel,
+                            "status" to TaskStatus.PENDING.name,
+                            "hasPhotoEvidence" to false,
+                            "createdAt" to FieldValue.serverTimestamp(),
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                    recreatedTotal++
+                }
+                createBatch.commit().await()
+            }
+
+            Result.success(recreatedTotal)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.WRITE, "tasks")
+            Result.failure(e)
+        }
+    }
+
+    suspend fun updateTasks(
+        tasks: List<AssignedTask>,
+        title: String,
+        description: String,
+        taskType: TaskType,
+        priority: TaskPriority,
+        dueDate: String,
+        dueTime: String?,
+        deadlineLabel: String?
+    ): Result<Int> {
+        val path = "tasks"
+        return try {
+            requireUserId()
+            require(tasks.isNotEmpty()) { "No se encontraron tareas para actualizar." }
+            val cleanTitle = title.trim()
+            val cleanDesc = description.trim().take(500)
+            val cleanDueDate = dueDate.trim()
+            val cleanDueTime = dueTime?.trim()?.takeIf { it.isNotEmpty() }
+            val cleanDeadlineLabel = deadlineLabel?.trim()?.take(80)?.takeIf { it.isNotEmpty() }
+
+            require(cleanTitle.length in 3..120) {
+                "El título debe tener entre 3 y 120 caracteres."
+            }
+            require(cleanDueDate.matches(Regex("""^\d{4}-\d{2}-\d{2}$"""))) {
+                "La fecha límite debe tener formato AAAA-MM-DD."
+            }
+            if (cleanDueTime != null) {
+                require(cleanDueTime.matches(Regex("""^([01]\d|2[0-3]):[0-5]\d$"""))) {
+                    "La hora límite debe tener formato HH:mm (ej. 14:30 o 23:59)."
+                }
+            }
+
+            tasks.chunked(380).forEach { chunk ->
+                val batch = db.batch()
+                chunk.forEach { task ->
+                    val ref = db.collection("tasks").document(task.id)
+                    val updatePayload = buildMap<String, Any> {
+                        put("title", cleanTitle)
+                        put("description", cleanDesc)
+                        put("taskType", taskType.name)
+                        put("priority", priority.name)
+                        put("dueDate", cleanDueDate)
+                        if (cleanDueTime != null) {
+                            put("dueTime", cleanDueTime)
+                        } else if (task.dueTime != null) {
+                            put("dueTime", FieldValue.delete())
+                        }
+                        if (cleanDeadlineLabel != null) {
+                            put("deadlineLabel", cleanDeadlineLabel)
+                        } else if (task.deadlineLabel != null) {
+                            put("deadlineLabel", FieldValue.delete())
+                        }
+                        put("updatedAt", FieldValue.serverTimestamp())
+                    }
+                    batch.update(ref, updatePayload)
+                }
+                batch.commit().await()
+            }
+            Result.success(tasks.size)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun deleteTasks(tasks: List<AssignedTask>): Result<Int> {
+        val path = "tasks"
+        return try {
+            requireUserId()
+            require(tasks.isNotEmpty()) { "No se encontraron tareas para eliminar." }
+
+            val refsToDelete = mutableListOf<com.google.firebase.firestore.DocumentReference>()
+            for (task in tasks) {
+                if (task.id.isBlank()) continue
+                refsToDelete.add(db.collection("tasks").document(task.id))
+
+                val evId = task.evidenceId?.takeIf { it.isNotBlank() }
+                if (evId != null) {
+                    val fileDocs = db.collection("task_evidences")
+                        .document(evId)
+                        .collection("files")
+                        .get()
+                        .await()
+                    fileDocs.documents.forEach { refsToDelete.add(it.reference) }
+                    refsToDelete.add(db.collection("task_evidences").document(evId))
+                }
+
+                val notifDocs = db.collection("notifications")
+                    .whereEqualTo("taskId", task.id)
+                    .get()
+                    .await()
+                notifDocs.documents.forEach { refsToDelete.add(it.reference) }
+            }
+
+            refsToDelete.chunked(380).forEach { chunk ->
+                val batch = db.batch()
+                chunk.forEach { ref -> batch.delete(ref) }
+                batch.commit().await()
+            }
+            Result.success(tasks.size)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.DELETE, path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun completeTaskWithEvidenceFiles(
         task: AssignedTask,
         uploaderName: String,
-        imageBase64: String
+        files: List<EncodedAttachment>
     ): Result<Unit> {
         val docPath = "tasks/${task.id}"
         return try {
             val uid = requireUserId()
             require(task.id.isNotBlank()) { "ID de tarea inválido." }
-            require(!DateAndFormatters.isTaskPastDeadline(task.dueDate, task.dueTime)) {
-                "El plazo límite para completar esta tarea ha vencido (${task.deadlineLabel ?: task.dueDate})."
+            require(task.parsedStatus == TaskStatus.PENDING) {
+                "Esta tarea ya fue completada y no admite nuevos archivos."
             }
-            require(imageBase64.length in 50..700_000) { "La evidencia fotográfica no es válida." }
+            require(files.size in 1..ImageCompressor.MAX_TASK_EVIDENCE_FILES) {
+                "Debes adjuntar entre 1 y ${ImageCompressor.MAX_TASK_EVIDENCE_FILES} archivos."
+            }
+            files.forEach { file ->
+                require(file.totalBytes in 1..ImageCompressor.MAX_TASK_EVIDENCE_FILE_BYTES) {
+                    "El archivo ${file.fileName} supera el máximo de 1.5 MB."
+                }
+                require(
+                    file.base64Chunks.size in 1..4 &&
+                        file.base64Chunks.all { it.isNotEmpty() && it.length <= 700_000 }
+                ) {
+                    "El archivo ${file.fileName} supera el tamaño permitido."
+                }
+            }
+
+            val taskRef = db.collection("tasks").document(task.id)
+            val liveSnap = taskRef.get().await()
+            require(liveSnap.exists() && liveSnap.getString("status") == TaskStatus.PENDING.name) {
+                "Esta tarea ya fue completada y quedó bloqueada."
+            }
 
             val evidenceRef = db.collection("task_evidences").document()
-            val taskRef = db.collection("tasks").document(task.id)
+            val safeUploader = uploaderName.trim().ifBlank { "Sucursal" }.take(80)
+            val safeTitle = task.title.trim().ifBlank { "Tarea" }.take(120)
+            val firstImagePreview = files.firstOrNull {
+                it.mimeType.startsWith("image/", ignoreCase = true) &&
+                    it.base64Chunks.size == 1 &&
+                    it.base64Chunks.first().length <= 700_000
+            }?.base64Chunks?.firstOrNull()
 
-            val batch = db.batch()
-            batch.set(
-                evidenceRef,
-                mapOf(
-                    "taskId" to task.id,
-                    "uploaderId" to uid,
-                    "uploaderName" to uploaderName.trim().ifBlank { "Empleado" }.take(80),
-                    "taskTitle" to task.title.trim().ifBlank { "Tarea" }.take(120),
-                    "imageBase64" to imageBase64,
-                    "capturedAt" to FieldValue.serverTimestamp()
-                )
+            val evidencePayload = buildMap<String, Any> {
+                put("taskId", task.id)
+                put("uploaderId", uid)
+                put("uploaderName", safeUploader)
+                put("taskTitle", safeTitle)
+                if (firstImagePreview != null) {
+                    put("imageBase64", firstImagePreview)
+                }
+                put("fileCount", files.size.toLong())
+                put("primaryFileName", files.first().fileName.trim().ifBlank { "archivo" }.take(120))
+                put("capturedAt", FieldValue.serverTimestamp())
+            }
+
+            data class PartWrite(
+                val docId: String,
+                val payload: Map<String, Any>
             )
-            batch.update(
-                taskRef,
+
+            val partWrites = buildList {
+                files.forEachIndexed { fileIdx, file ->
+                    val cleanName = file.fileName.trim().ifBlank { "archivo_${fileIdx + 1}" }.take(120)
+                    val cleanMime = file.mimeType.trim().ifBlank { "application/octet-stream" }.take(100)
+                    val chunkCount = file.base64Chunks.size
+                    file.base64Chunks.forEachIndexed { chunkIdx, chunkBase64 ->
+                        add(
+                            PartWrite(
+                                docId = "file_${fileIdx}_part_${chunkIdx}",
+                                payload = mapOf(
+                                    "evidenceId" to evidenceRef.id,
+                                    "taskId" to task.id,
+                                    "uploaderId" to uid,
+                                    "fileIndex" to fileIdx,
+                                    "chunkIndex" to chunkIdx,
+                                    "chunkCount" to chunkCount,
+                                    "fileName" to cleanName,
+                                    "mimeType" to cleanMime,
+                                    "sizeBytes" to file.totalBytes.coerceIn(1, ImageCompressor.MAX_TASK_EVIDENCE_FILE_BYTES),
+                                    "dataBase64" to chunkBase64,
+                                    "capturedAt" to FieldValue.serverTimestamp()
+                                )
+                            )
+                        )
+                    }
+                }
+            }
+
+            val partBatches = partWrites.chunked(4)
+            partBatches.forEachIndexed { batchIdx, chunk ->
+                val batch = db.batch()
+                if (batchIdx == 0) {
+                    batch.set(evidenceRef, evidencePayload)
+                }
+                chunk.forEach { part ->
+                    batch.set(evidenceRef.collection("files").document(part.docId), part.payload)
+                }
+                batch.commit().await()
+            }
+
+            taskRef.update(
                 mapOf(
                     "status" to TaskStatus.COMPLETED.name,
                     "hasPhotoEvidence" to true,
@@ -438,13 +702,75 @@ class AppRepository(
                     "completedAt" to FieldValue.serverTimestamp(),
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
-            )
-            batch.commit().await()
+            ).await()
+
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.UPDATE, docPath)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun loadTaskEvidenceFiles(evidence: TaskEvidence): Result<List<TaskEvidenceAttachmentFile>> {
+        if (evidence.id.isBlank()) {
+            return Result.failure(IllegalStateException("Evidencia inválida."))
+        }
+        val path = "task_evidences/${evidence.id}/files"
+        return try {
+            requireUserId()
+            val snapshot = db.collection("task_evidences")
+                .document(evidence.id)
+                .collection("files")
+                .get()
+                .await()
+
+            if (snapshot.isEmpty) {
+                val legacyBase64 = evidence.imageBase64.takeIf { it.isNotBlank() }
+                    ?: error("No se encontraron archivos adjuntos en esta evidencia.")
+                val approxBytes = ((legacyBase64.length * 3) / 4).coerceAtLeast(1)
+                return Result.success(
+                    listOf(
+                        TaskEvidenceAttachmentFile(
+                            fileIndex = 0,
+                            fileName = evidence.primaryFileName?.takeIf { it.isNotBlank() } ?: "evidencia.jpg",
+                            mimeType = "image/jpeg",
+                            sizeBytes = approxBytes,
+                            base64Chunks = listOf(legacyBase64)
+                        )
+                    )
+                )
+            }
+
+            val files = snapshot.documents
+                .groupBy { (it.get("fileIndex") as? Number)?.toInt() ?: 0 }
+                .entries
+                .sortedBy { it.key }
+                .mapNotNull { (fileIdx, docs) ->
+                    val sortedDocs = docs.sortedBy { (it.get("chunkIndex") as? Number)?.toInt() ?: 0 }
+                    val firstDoc = sortedDocs.firstOrNull() ?: return@mapNotNull null
+                    val chunks = sortedDocs.mapNotNull { doc ->
+                        doc.getString("dataBase64")?.takeIf { it.isNotBlank() }
+                    }
+                    if (chunks.isEmpty()) return@mapNotNull null
+                    TaskEvidenceAttachmentFile(
+                        fileIndex = fileIdx,
+                        fileName = firstDoc.getString("fileName")?.takeIf { it.isNotBlank() }
+                            ?: "archivo_${fileIdx + 1}",
+                        mimeType = firstDoc.getString("mimeType")?.takeIf { it.isNotBlank() }
+                            ?: "application/octet-stream",
+                        sizeBytes = (firstDoc.get("sizeBytes") as? Number)?.toInt() ?: 0,
+                        base64Chunks = chunks
+                    )
+                }
+
+            require(files.isNotEmpty()) { "No se pudieron reconstruir los archivos adjuntos." }
+            Result.success(files)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.LIST, path)
             Result.failure(e)
         }
     }

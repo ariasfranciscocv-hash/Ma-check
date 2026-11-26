@@ -68,4 +68,30 @@ class ImageCompressorTest {
         assertEquals("120 KB", ImageCompressor.formatFileSize(120 * 1024))
         assertEquals("2.5 MB", ImageCompressor.formatFileSize((2.5 * 1024 * 1024).toInt()))
     }
+
+    @Test
+    fun `task evidence file up to 1_5 MB fits within 4 chunks`() {
+        val bytes = ByteArray(ImageCompressor.MAX_TASK_EVIDENCE_FILE_BYTES) { (it % 97).toByte() }
+        val chunks = ImageCompressor.chunkBytesToBase64(
+            bytes = bytes,
+            maxTotalBytes = ImageCompressor.MAX_TASK_EVIDENCE_FILE_BYTES,
+            maxSizeLabel = "1.5 MB"
+        ) { slice ->
+            Base64.getEncoder().encodeToString(slice)
+        }
+        assertEquals(4, chunks.size)
+        assertTrue(chunks.all { it.isNotEmpty() && it.length <= 700_000 })
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `task evidence file over 1_5 MB is rejected`() {
+        val oversized = ByteArray(ImageCompressor.MAX_TASK_EVIDENCE_FILE_BYTES + 1)
+        ImageCompressor.chunkBytesToBase64(
+            bytes = oversized,
+            maxTotalBytes = ImageCompressor.MAX_TASK_EVIDENCE_FILE_BYTES,
+            maxSizeLabel = "1.5 MB"
+        ) { slice ->
+            Base64.getEncoder().encodeToString(slice)
+        }
+    }
 }

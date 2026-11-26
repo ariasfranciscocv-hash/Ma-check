@@ -91,7 +91,15 @@ test("Role security: employee cannot self-assign ADMIN; spoofed unverified admin
     })
   );
 
-  // Selecting valid Sucursal succeeds
+  // Selecting valid Sucursal succeeds (including Sucursal 87)
+  await assertSucceeds(
+    aliceDb.collection("users").doc(ALICE_UID).update({
+      branchName: "Sucursal 87",
+      displayName: "Sucursal 87",
+      updatedAt: pastTime(650),
+    })
+  );
+
   await assertSucceeds(
     aliceDb.collection("users").doc(ALICE_UID).update({
       branchName: "Sucursal 107",
@@ -209,6 +217,176 @@ test("Tasks & private photo evidence: employees manage only own tasks; ONLY admi
       updatedAt: pastTime(100),
     })
   );
+
+  // Completed task is locked: neither employee nor admin can attach new evidences or files
+  await assertFails(
+    aliceDb.collection("task_evidences").doc("ev_second").set({
+      taskId: "task_1",
+      uploaderId: ALICE_UID,
+      uploaderName: "Alice",
+      taskTitle: "Acomodar sala principal",
+      fileCount: 1,
+      primaryFileName: "extra.pdf",
+      capturedAt: pastTime(50),
+    })
+  );
+  await assertFails(
+    adminDb.collection("task_evidences").doc("ev_second_admin").set({
+      taskId: "task_1",
+      uploaderId: ADMIN_UID,
+      uploaderName: "Admin",
+      taskTitle: "Acomodar sala principal",
+      fileCount: 1,
+      primaryFileName: "extra.pdf",
+      capturedAt: pastTime(50),
+    })
+  );
+  await assertFails(
+    adminDb.collection("tasks").doc("task_1").update({
+      evidenceId: "ev_other",
+      updatedAt: pastTime(50),
+    })
+  );
+});
+
+test("Multi-file task evidences (up to 5 files, PDF/Excel/photos) & per-branch quota reset fields", async () => {
+  const adminDb = testEnv
+    .authenticatedContext(ADMIN_UID, { email: ADMIN_EMAIL, email_verified: true })
+    .firestore();
+  const aliceDb = testEnv
+    .authenticatedContext(ALICE_UID, { email: "alice@example.com", email_verified: true })
+    .firestore();
+  const bobDb = testEnv
+    .authenticatedContext(BOB_UID, { email: "bob@example.com", email_verified: true })
+    .firestore();
+
+  // Setup Alice user doc
+  await assertSucceeds(
+    aliceDb.collection("users").doc(ALICE_UID).set({
+      userId: ALICE_UID,
+      displayName: "Sucursal 107",
+      branchName: "Sucursal 107",
+      email: "alice@example.com",
+      role: "EMPLOYEE",
+      createdAt: pastTime(5000),
+      updatedAt: pastTime(5000),
+    })
+  );
+
+  // Employee cannot modify confirmedQuotaId directly
+  await assertFails(
+    aliceDb.collection("users").doc(ALICE_UID).update({
+      confirmedQuotaId: "q_2",
+      updatedAt: pastTime(1000),
+    })
+  );
+
+  // Admin can confirm quota reset individually per branch
+  await assertSucceeds(
+    adminDb.collection("users").doc(ALICE_UID).update({
+      confirmedQuotaId: "q_2",
+      lastChecklistResetAt: pastTime(1000),
+      updatedAt: pastTime(1000),
+    })
+  );
+
+  // Pending task for multi-file evidence
+  await assertSucceeds(
+    adminDb.collection("tasks").doc("task_multi").set({
+      assigneeId: ALICE_UID,
+      assigneeName: "Sucursal 107",
+      createdBy: ADMIN_UID,
+      title: "Inventario semanal",
+      description: "Subir hasta 5 archivos de respaldo",
+      taskType: "DAILY",
+      priority: "NORMAL",
+      dueDate: "2026-11-26",
+      dueTime: "23:59",
+      status: "PENDING",
+      hasPhotoEvidence: false,
+      createdAt: pastTime(2000),
+      updatedAt: pastTime(2000),
+    })
+  );
+
+  // Batch 1: task_evidences (PDFs only, no imageBase64) + files 0..4
+  const batch1 = aliceDb.batch();
+  const evRef = aliceDb.collection("task_evidences").doc("ev_multi");
+  batch1.set(evRef, {
+    taskId: "task_multi",
+    uploaderId: ALICE_UID,
+    uploaderName: "Sucursal 107",
+    taskTitle: "Inventario semanal",
+    fileCount: 5,
+    primaryFileName: "conteo_1.pdf",
+    capturedAt: pastTime(500),
+  });
+  for (let i = 0; i < 5; i++) {
+    batch1.set(evRef.collection("files").doc(`file_${i}_part_0`), {
+      evidenceId: "ev_multi",
+      taskId: "task_multi",
+      uploaderId: ALICE_UID,
+      fileIndex: i,
+      chunkIndex: 0,
+      chunkCount: 1,
+      fileName: `conteo_${i + 1}.pdf`,
+      mimeType: "application/pdf",
+      sizeBytes: 12000,
+      dataBase64: "JVBERi0xLjQK",
+      capturedAt: pastTime(500),
+    });
+  }
+  await assertSucceeds(batch1.commit());
+
+  // 6th file (fileIndex 5) is rejected by rules
+  await assertFails(
+    aliceDb.collection("task_evidences").doc("ev_multi").collection("files").doc("file_5_part_0").set({
+      evidenceId: "ev_multi",
+      taskId: "task_multi",
+      uploaderId: ALICE_UID,
+      fileIndex: 5,
+      chunkIndex: 0,
+      chunkCount: 1,
+      fileName: "extra_6.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 1200,
+      dataBase64: "JVBERi0=",
+      capturedAt: pastTime(400),
+    })
+  );
+
+  // Complete the task
+  await assertSucceeds(
+    aliceDb.collection("tasks").doc("task_multi").update({
+      status: "COMPLETED",
+      hasPhotoEvidence: true,
+      evidenceId: "ev_multi",
+      completedAt: pastTime(300),
+      updatedAt: pastTime(300),
+    })
+  );
+
+  // After completion, no more files can be added even for valid fileIndex
+  await assertFails(
+    aliceDb.collection("task_evidences").doc("ev_multi").collection("files").doc("file_0_part_1").set({
+      evidenceId: "ev_multi",
+      taskId: "task_multi",
+      uploaderId: ALICE_UID,
+      fileIndex: 0,
+      chunkIndex: 1,
+      chunkCount: 2,
+      fileName: "conteo_1.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 12000,
+      dataBase64: "JVBERi0=",
+      capturedAt: pastTime(100),
+    })
+  );
+
+  // Only Admin can read /files subcollection; Alice & Bob cannot
+  await assertFails(aliceDb.collection("task_evidences").doc("ev_multi").collection("files").get());
+  await assertFails(bobDb.collection("task_evidences").doc("ev_multi").collection("files").get());
+  await assertSucceeds(adminDb.collection("task_evidences").doc("ev_multi").collection("files").get());
 });
 
 test("Extraordinary notifications: admin sends, only target employee reads & acknowledges", async () => {
@@ -334,7 +512,7 @@ test("Biweekly quotas & 5-metric daily sales entries: isolated per user, admin s
   await assertFails(aliceDb.collection("sales_entries").get());
   await assertSucceeds(adminDb.collection("sales_entries").get());
 
-  // Employee can save daily closing with comment + phone file/photo attachment
+  // Employee can save daily closing with comment + phone file/photo attachment (including small <50 char base64 files)
   await assertSucceeds(
     aliceDb.collection("sales_entries").doc("q_1_2026-11-25_alice_123").set({
       userId: ALICE_UID,
@@ -347,11 +525,91 @@ test("Biweekly quotas & 5-metric daily sales entries: isolated per user, admin s
       appMaOperations: 8,
       newCustomerRequests: 9,
       notes: "Cierre con soporte adjunto",
-      attachmentName: "corte_caja.pdf",
-      attachmentMimeType: "application/pdf",
-      attachmentBase64: "B".repeat(120),
+      attachmentName: "nota.txt",
+      attachmentMimeType: "text/plain",
+      attachmentBase64: "SG9sYQ==",
+      attachmentChunkCount: 1,
+      attachmentSizeBytes: 4,
       createdAt: pastTime(),
       updatedAt: pastTime(),
+    })
+  );
+
+  // Employee can save chunked multi-megabyte attachment atomically in a batch
+  const chunkedEntryId = "q_1_2026-11-26_alice_123";
+  const chunkBatch = aliceDb.batch();
+  chunkBatch.set(aliceDb.collection("sales_entries").doc(chunkedEntryId), {
+    userId: ALICE_UID,
+    userName: "Sucursal 107",
+    quotaId: "q_1",
+    dateString: "2026-11-26",
+    globalSales: 40000.0,
+    creditSales: 24000.0,
+    newCustomers: 5,
+    appMaOperations: 7,
+    newCustomerRequests: 8,
+    notes: "Reporte PDF grande",
+    attachmentName: "reporte_grande.pdf",
+    attachmentMimeType: "application/pdf",
+    attachmentChunkCount: 2,
+    attachmentSizeBytes: 900000,
+    createdAt: pastTime(),
+    updatedAt: pastTime(),
+  });
+  chunkBatch.set(
+    aliceDb.collection("sales_entries").doc(chunkedEntryId).collection("attachment_chunks").doc("chunk_0"),
+    {
+      userId: ALICE_UID,
+      entryId: chunkedEntryId,
+      chunkIndex: 0,
+      dataBase64: "C".repeat(200),
+      createdAt: pastTime(),
+    }
+  );
+  chunkBatch.set(
+    aliceDb.collection("sales_entries").doc(chunkedEntryId).collection("attachment_chunks").doc("chunk_1"),
+    {
+      userId: ALICE_UID,
+      entryId: chunkedEntryId,
+      chunkIndex: 1,
+      dataBase64: "D".repeat(200),
+      createdAt: pastTime(),
+    }
+  );
+  await assertSucceeds(chunkBatch.commit());
+
+  // Owner and admin can read chunks; another employee cannot
+  await assertSucceeds(
+    aliceDb.collection("sales_entries").doc(chunkedEntryId).collection("attachment_chunks").where("userId", "==", ALICE_UID).get()
+  );
+  await assertSucceeds(
+    adminDb.collection("sales_entries").doc(chunkedEntryId).collection("attachment_chunks").where("userId", "==", ALICE_UID).get()
+  );
+  await assertFails(
+    bobDb.collection("sales_entries").doc(chunkedEntryId).collection("attachment_chunks").where("userId", "==", ALICE_UID).get()
+  );
+  await assertFails(
+    bobDb.collection("sales_entries").doc(chunkedEntryId).collection("attachment_chunks").doc("chunk_0").get()
+  );
+  // Owner can replace an existing chunk via set() (triggers update rule)
+  await assertSucceeds(
+    aliceDb.collection("sales_entries").doc(chunkedEntryId).collection("attachment_chunks").doc("chunk_0").set({
+      userId: ALICE_UID,
+      entryId: chunkedEntryId,
+      chunkIndex: 0,
+      dataBase64: "Z".repeat(250),
+      createdAt: pastTime(500),
+    })
+  );
+
+  // Reject invalid chunkIndex >= 8
+  await assertFails(
+    aliceDb.collection("sales_entries").doc(chunkedEntryId).collection("attachment_chunks").doc("chunk_8").set({
+      userId: ALICE_UID,
+      entryId: chunkedEntryId,
+      chunkIndex: 8,
+      dataBase64: "E".repeat(100),
+      createdAt: pastTime(),
     })
   );
 });
@@ -454,4 +712,57 @@ test("Scheduled Friday/Sunday tasks: employee can materialize official self-sche
       updatedAt: pastTime(),
     })
   );
+});
+
+test("Admin can edit and delete existing daily tasks; employees cannot delete or edit details", async () => {
+  const adminDb = testEnv
+    .authenticatedContext(ADMIN_UID, { email: ADMIN_EMAIL, email_verified: true })
+    .firestore();
+  const aliceDb = testEnv
+    .authenticatedContext(ALICE_UID, { email: "alice@example.com", email_verified: true })
+    .firestore();
+
+  const dailyTaskId = "sched_alice_123_2026-11-26_apertura_piso";
+  await assertSucceeds(
+    aliceDb.collection("tasks").doc(dailyTaskId).set({
+      assigneeId: ALICE_UID,
+      assigneeName: "Sucursal 107",
+      createdBy: ALICE_UID,
+      title: "Apertura de piso y encendido de exhibición",
+      description: "Foto de luces encendidas",
+      taskType: "DAILY",
+      priority: "NORMAL",
+      dueDate: "2026-11-26",
+      dueTime: "23:59",
+      deadlineLabel: "Límite: Hoy al cierre",
+      status: "PENDING",
+      hasPhotoEvidence: false,
+      createdAt: pastTime(2000),
+      updatedAt: pastTime(2000),
+    })
+  );
+
+  // Employee cannot edit task title or delete task
+  await assertFails(
+    aliceDb.collection("tasks").doc(dailyTaskId).update({
+      title: "Título modificado por empleado",
+      updatedAt: pastTime(500),
+    })
+  );
+  await assertFails(aliceDb.collection("tasks").doc(dailyTaskId).delete());
+
+  // Admin can modify existing daily task (title, description, priority, dueTime)
+  await assertSucceeds(
+    adminDb.collection("tasks").doc(dailyTaskId).update({
+      title: "Apertura y exhibición principal",
+      description: "Incluir foto de fachada e iluminación",
+      priority: "URGENT",
+      dueTime: "11:30",
+      deadlineLabel: "Límite: 11:30 a.m.",
+      updatedAt: pastTime(300),
+    })
+  );
+
+  // Admin can delete existing daily task
+  await assertSucceeds(adminDb.collection("tasks").doc(dailyTaskId).delete());
 });

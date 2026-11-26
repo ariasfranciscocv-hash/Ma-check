@@ -80,6 +80,8 @@ data class UserProfile(
     val photoUrl: String? = null,
     val branchName: String? = null,
     val role: String = UserRole.EMPLOYEE.name,
+    val confirmedQuotaId: String? = null,
+    val lastChecklistResetAt: Timestamp? = null,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
 ) {
@@ -122,8 +124,22 @@ data class TaskEvidence(
     val uploaderName: String = "",
     val taskTitle: String = "",
     val imageBase64: String = "",
+    val fileCount: Long = 1L,
+    val primaryFileName: String? = null,
     @ServerTimestamp val capturedAt: Timestamp? = null
-)
+) {
+    val resolvedFileCount: Int get() = fileCount.toInt().coerceIn(1, 5)
+}
+
+data class TaskEvidenceAttachmentFile(
+    val fileIndex: Int,
+    val fileName: String,
+    val mimeType: String,
+    val sizeBytes: Int,
+    val base64Chunks: List<String>
+) {
+    val isImage: Boolean get() = mimeType.startsWith("image/", ignoreCase = true)
+}
 
 @Keep
 @IgnoreExtraProperties
@@ -220,6 +236,67 @@ data class ChartSeries(
     val projectedCumulativeByDay: List<Double>
 )
 
+data class BranchSalesSummary(
+    val branchName: String,
+    val globalSales: Double,
+    val creditSales: Double,
+    val newCustomers: Long,
+    val appMaOperations: Long,
+    val newCustomerRequests: Long,
+    val hasTodayClosing: Boolean,
+    val entriesCount: Int
+)
+
+fun buildBranchSalesSummaries(
+    teamUsers: List<UserProfile>,
+    entries: List<DailySalesEntry>,
+    todayIso: String
+): List<BranchSalesSummary> {
+    val uidToBranch = teamUsers
+        .mapNotNull { user ->
+            val branch = user.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+            if (branch != null) user.userId to branch else null
+        }
+        .toMap()
+
+    val entriesByBranch = entries.groupBy { entry ->
+        uidToBranch[entry.userId]
+            ?: entry.userName.takeIf { it in BranchOptions.ALL_BRANCHES }
+            ?: entry.userName.ifBlank { "Sin sucursal" }
+    }
+
+    val officialSummaries = BranchOptions.ALL_BRANCHES.map { branch ->
+        val branchEntries = entriesByBranch[branch].orEmpty()
+        BranchSalesSummary(
+            branchName = branch,
+            globalSales = branchEntries.sumOf { it.globalSales },
+            creditSales = branchEntries.sumOf { it.creditSales },
+            newCustomers = branchEntries.sumOf { it.newCustomers },
+            appMaOperations = branchEntries.sumOf { it.appMaOperations },
+            newCustomerRequests = branchEntries.sumOf { it.newCustomerRequests },
+            hasTodayClosing = branchEntries.any { it.dateString == todayIso },
+            entriesCount = branchEntries.size
+        )
+    }
+
+    val extraKeys = entriesByBranch.keys.filter { it !in BranchOptions.ALL_BRANCHES }.sorted()
+    val extraSummaries = extraKeys.map { branch ->
+        val branchEntries = entriesByBranch[branch].orEmpty()
+        BranchSalesSummary(
+            branchName = branch,
+            globalSales = branchEntries.sumOf { it.globalSales },
+            creditSales = branchEntries.sumOf { it.creditSales },
+            newCustomers = branchEntries.sumOf { it.newCustomers },
+            appMaOperations = branchEntries.sumOf { it.appMaOperations },
+            newCustomerRequests = branchEntries.sumOf { it.newCustomerRequests },
+            hasTodayClosing = branchEntries.any { it.dateString == todayIso },
+            entriesCount = branchEntries.size
+        )
+    }
+
+    return officialSummaries + extraSummaries
+}
+
 data class SalesProjectionSummary(
     val quota: BiweeklyQuota,
     val daysElapsed: Int,
@@ -227,7 +304,8 @@ data class SalesProjectionSummary(
     val metrics: List<MetricProgress>,
     val entriesCount: Int,
     val todayEntry: DailySalesEntry?,
-    val recentEntries: List<DailySalesEntry> = emptyList()
+    val recentEntries: List<DailySalesEntry> = emptyList(),
+    val branchBreakdowns: List<BranchSalesSummary> = emptyList()
 )
 
 data class BranchTaskSummary(
@@ -290,4 +368,46 @@ fun buildBranchTaskSummaries(
     }
 
     return officialSummaries + extraSummaries
+}
+
+data class DayTaskGroup(
+    val dateIso: String,
+    val title: String,
+    val isToday: Boolean,
+    val tasks: List<AssignedTask>,
+    val completedCount: Int,
+    val totalCount: Int
+) {
+    val allCompleted: Boolean get() = totalCount > 0 && completedCount == totalCount
+}
+
+fun buildDayTaskGroups(
+    tasks: List<AssignedTask>,
+    todayIso: String = com.example.utils.DateAndFormatters.todayIso()
+): List<DayTaskGroup> {
+    if (tasks.isEmpty()) return emptyList()
+    val grouped = tasks.groupBy { task ->
+        com.example.utils.DateAndFormatters.extractTaskDayIso(task)
+    }
+    val sortedDays = grouped.keys.sortedWith(
+        compareByDescending<String> { it == todayIso }.thenByDescending { it }
+    )
+    return sortedDays.map { dayIso ->
+        val dayTasks = grouped[dayIso].orEmpty().sortedWith(
+            compareBy<AssignedTask> { it.parsedStatus == TaskStatus.COMPLETED }
+                .thenByDescending { it.parsedType == TaskType.EXTRAORDINARY }
+                .thenByDescending { it.parsedPriority == TaskPriority.URGENT }
+                .thenBy { it.dueTime ?: "23:59" }
+                .thenBy { it.title.lowercase() }
+        )
+        val completed = dayTasks.count { it.parsedStatus == TaskStatus.COMPLETED }
+        DayTaskGroup(
+            dateIso = dayIso,
+            title = com.example.utils.DateAndFormatters.formatDayGroupHeader(dayIso, todayIso),
+            isToday = dayIso == todayIso,
+            tasks = dayTasks,
+            completedCount = completed,
+            totalCount = dayTasks.size
+        )
+    }
 }

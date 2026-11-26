@@ -4,11 +4,9 @@ import android.content.ContentResolver
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.media.ExifInterface
 import android.net.Uri
-import android.os.Build
 import android.provider.OpenableColumns
 import android.util.Base64
 import android.webkit.MimeTypeMap
@@ -38,6 +36,8 @@ object ImageCompressor {
     private const val MAX_BASE64_CHARS = 650_000
     internal const val CHUNK_RAW_BYTES = 450_000
     internal const val MAX_TOTAL_FILE_BYTES = 3_500_000
+    internal const val MAX_TASK_EVIDENCE_FILE_BYTES = 1_500_000
+    internal const val MAX_TASK_EVIDENCE_FILES = 5
 
     private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "gif")
 
@@ -86,11 +86,13 @@ object ImageCompressor {
     internal fun chunkBytesToBase64(
         bytes: ByteArray,
         chunkSizeBytes: Int = CHUNK_RAW_BYTES,
+        maxTotalBytes: Int = MAX_TOTAL_FILE_BYTES,
+        maxSizeLabel: String = "3.5 MB",
         encoder: (ByteArray) -> String = { slice -> Base64.encodeToString(slice, Base64.NO_WRAP) }
     ): List<String> {
         require(bytes.isNotEmpty()) { "El archivo seleccionado está vacío." }
-        require(bytes.size <= MAX_TOTAL_FILE_BYTES) {
-            "El archivo supera el máximo permitido de 3.5 MB."
+        require(bytes.size <= maxTotalBytes) {
+            "El archivo supera el máximo permitido de $maxSizeLabel."
         }
         if (bytes.size <= chunkSizeBytes) {
             return listOf(encoder(bytes))
@@ -135,7 +137,13 @@ object ImageCompressor {
         } ?: false
     }
 
-    fun encodeUriAttachment(context: Context, uri: Uri): Result<EncodedAttachment> = runCatching {
+    fun encodeUriAttachment(
+        context: Context,
+        uri: Uri,
+        maxTotalBytes: Int = MAX_TOTAL_FILE_BYTES,
+        maxChunks: Int = 8,
+        maxSizeLabel: String = "3.5 MB"
+    ): Result<EncodedAttachment> = runCatching {
         val resolver = context.contentResolver
         val rawName = queryDisplayName(context, uri)
             ?: uri.lastPathSegment?.substringAfterLast('/')
@@ -166,8 +174,8 @@ object ImageCompressor {
                 val read = input.read(buffer)
                 if (read == -1) break
                 total += read
-                require(total <= MAX_TOTAL_FILE_BYTES) {
-                    "El archivo supera el máximo permitido de 3.5 MB."
+                require(total <= maxTotalBytes) {
+                    "El archivo supera el máximo permitido de $maxSizeLabel."
                 }
                 out.write(buffer, 0, read)
             }
@@ -175,9 +183,13 @@ object ImageCompressor {
         } ?: error("No se pudo abrir el archivo seleccionado.")
 
         require(bytes.isNotEmpty()) { "El archivo seleccionado está vacío." }
-        val chunks = chunkBytesToBase64(bytes)
-        require(chunks.size <= 8 && chunks.all { it.isNotEmpty() && it.length <= 700_000 }) {
-            "El archivo supera el máximo permitido de 3.5 MB."
+        val chunks = chunkBytesToBase64(
+            bytes = bytes,
+            maxTotalBytes = maxTotalBytes,
+            maxSizeLabel = maxSizeLabel
+        )
+        require(chunks.size <= maxChunks && chunks.all { it.isNotEmpty() && it.length <= 700_000 }) {
+            "El archivo supera el máximo permitido de $maxSizeLabel."
         }
         EncodedAttachment(
             fileName = safeName,
@@ -201,127 +213,123 @@ object ImageCompressor {
 
     fun compressUriToBase64(context: Context, uri: Uri): Result<String> = runCatching {
         val resolver = context.contentResolver
-        val tempFile = File(context.cacheDir, "tmp_img_${System.currentTimeMillis()}.bin")
-        try {
-            val copied = openStream(resolver, uri)?.use { input ->
-                tempFile.outputStream().use { output -> input.copyTo(output) }
-                true
-            } ?: false
+        val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        openStream(resolver, uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, boundsOptions)
+        } ?: error("No se pudo abrir la imagen seleccionada.")
 
-            val rawBitmap: Bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                val source = if (copied && tempFile.exists() && tempFile.length() > 0L) {
-                    ImageDecoder.createSource(tempFile)
-                } else {
-                    ImageDecoder.createSource(resolver, uri)
-                }
-                ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
-                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-                    val maxSide = max(info.size.width, info.size.height)
-                    if (maxSide > MAX_DIMENSION_PX) {
-                        val scale = MAX_DIMENSION_PX.toFloat() / maxSide.toFloat()
-                        decoder.setTargetSize(
-                            (info.size.width * scale).toInt().coerceAtLeast(1),
-                            (info.size.height * scale).toInt().coerceAtLeast(1)
-                        )
-                    }
-                }
-            } else {
-                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                if (copied && tempFile.exists()) {
-                    BitmapFactory.decodeFile(tempFile.absolutePath, bounds)
-                } else {
-                    openStream(resolver, uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-                }
-                            var sampleSize = 1
-            val maxSide = max(bounds.outWidth, bounds.outHeight)
-            while (maxSide / sampleSize > MAX_DIMENSION_PX * 2) {
-                sampleSize *= 2
-            }
-            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            val decoded = if (copied && tempFile.exists()) {
-                BitmapFactory.decodeFile(tempFile.absolutePath, decodeOpts)
-            } else {
-                openStream(resolver, uri)?.use { BitmapFactory.decodeStream(it, null, decodeOpts) }
-            } ?: error("No se pudo abrir la imagen seleccionada.")
+        val srcWidth = boundsOptions.outWidth
+        val srcHeight = boundsOptions.outHeight
+        require(srcWidth > 0 && srcHeight > 0) { "Formato de imagen no válido." }
 
-            val rotated = applyExifRotation(decoded, tempFile)
-            scaleDownIfNeeded(rotated, MAX_DIMENSION_PX)
+        val orientation = runCatching {
+            openStream(resolver, uri)?.use { stream ->
+                ExifInterface(stream).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            } ?: ExifInterface.ORIENTATION_NORMAL
+        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
+        var sampleSize = 1
+        while (srcWidth / sampleSize > MAX_DIMENSION_PX * 2 || srcHeight / sampleSize > MAX_DIMENSION_PX * 2) {
+            sampleSize *= 2
         }
 
-        val finalBitmap = scaleDownIfNeeded(rawBitmap, MAX_DIMENSION_PX)
+        val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        val rawBitmap = openStream(resolver, uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, decodeOptions)
+        } ?: error("No se pudo decodificar la fotografía.")
+
+        val maxSide = max(rawBitmap.width, rawBitmap.height)
+        val matrix = Matrix()
+        if (maxSide > MAX_DIMENSION_PX) {
+            val scale = MAX_DIMENSION_PX.toFloat() / maxSide.toFloat()
+            matrix.postScale(scale, scale)
+        }
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+        }
+
+        val transformedBitmap = if (!matrix.isIdentity) {
+            Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
+        } else {
+            rawBitmap
+        }
+
         var quality = JPEG_QUALITY
-        var base64: String
+        var encoded: String
         do {
             val out = ByteArrayOutputStream()
-            finalBitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
-            base64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+            transformedBitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            val bytes = out.toByteArray()
+            encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
             quality -= 10
-        } while (base64.length > MAX_BASE64_CHARS && quality >= 30)
+        } while (encoded.length > MAX_BASE64_CHARS && quality >= 25)
 
-        base64
-    } finally {
-        runCatching { tempFile.delete() }
+        if (transformedBitmap !== rawBitmap) {
+            transformedBitmap.recycle()
+        }
+        rawBitmap.recycle()
+
+        require(encoded.isNotEmpty() && encoded.length <= MAX_BASE64_CHARS) {
+            "La fotografía excede el tamaño permitido para evidencia."
+        }
+        encoded
     }
-}
 
-private fun scaleDownIfNeeded(bitmap: Bitmap, maxDim: Int): Bitmap {
-    val maxSide = max(bitmap.width, bitmap.height)
-    if (maxSide <= maxDim) return bitmap
-    val ratio = maxDim.toFloat() / maxSide.toFloat()
-    val w = (bitmap.width * ratio).toInt().coerceAtLeast(1)
-    val h = (bitmap.height * ratio).toInt().coerceAtLeast(1)
-    return Bitmap.createScaledBitmap(bitmap, w, h, true)
-}
-
-private fun applyExifRotation(bitmap: Bitmap, file: File): Bitmap {
-    if (!file.exists()) return bitmap
-    val orientation = runCatching {
-        ExifInterface(file.absolutePath).getAttributeInt(
-            ExifInterface.TAG_ORIENTATION,
-            ExifInterface.ORIENTATION_NORMAL
-        )
-    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
-    val degrees = when (orientation) {
-        ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-        ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-        ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-        else -> 0f
+    fun decodeBase64ToImageBitmap(base64: String): ImageBitmap? {
+        if (base64.isBlank()) return null
+        return try {
+            val bytes = Base64.decode(base64, Base64.DEFAULT)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+        } catch (_: Exception) {
+            null
+        }
     }
-    if (degrees == 0f) return bitmap
-    val matrix = Matrix().apply { postRotate(degrees) }
-    return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-}
 
-fun decodeBase64ToImageBitmap(base64: String?): ImageBitmap? {
-    if (base64.isNullOrBlank()) return null
-    return runCatching {
-        val clean = base64.substringAfter("base64,", base64)
-        val bytes = Base64.decode(clean, Base64.DEFAULT)
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-    }.getOrNull()
-}
+    fun decodeBase64ChunksToImageBitmap(chunks: List<String>): ImageBitmap? {
+        if (chunks.isEmpty()) return null
+        if (chunks.size == 1) return decodeBase64ToImageBitmap(chunks.first())
+        return try {
+            val out = ByteArrayOutputStream()
+            chunks.forEach { chunk ->
+                out.write(Base64.decode(chunk, Base64.DEFAULT))
+            }
+            val bytes = out.toByteArray()
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun createViewableCacheUri(context: Context, fileName: String, base64: String): Uri? {
+        return createViewableCacheUriFromChunks(context, fileName, listOf(base64))
+    }
 
     fun createViewableCacheUriFromChunks(
         context: Context,
         fileName: String,
         base64Chunks: List<String>
-    ): Uri? = runCatching {
+    ): Uri? {
         if (base64Chunks.isEmpty()) return null
-        val dir = File(context.cacheDir, "shared_attachments").apply { mkdirs() }
-        val safeName = fileName.ifBlank { "archivo_${System.currentTimeMillis()}" }
-            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
-        val outFile = File(dir, safeName)
-        outFile.outputStream().use { output ->
-            for (chunk in base64Chunks) {
-                val clean = chunk.substringAfter("base64,", chunk)
-                val bytes = Base64.decode(clean, Base64.DEFAULT)
-                output.write(bytes)
+        return try {
+            val safeName = fileName.replace(Regex("[^a-zA-Z0-9._-]"), "_").ifBlank { "adjunto.bin" }
+            val dir = File(context.cacheDir, "evidences").apply { mkdirs() }
+            val outFile = File(dir, safeName)
+            outFile.outputStream().use { fos ->
+                base64Chunks.forEach { chunk ->
+                    val decoded = Base64.decode(chunk, Base64.DEFAULT)
+                    fos.write(decoded)
+                }
             }
+            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", outFile)
+        } catch (_: Exception) {
+            null
         }
-        FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            outFile
-        )
-    }.getOrNull()
+    }
 }

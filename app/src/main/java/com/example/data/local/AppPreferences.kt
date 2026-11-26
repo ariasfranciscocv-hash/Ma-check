@@ -15,6 +15,7 @@ class AppPreferences(private val context: Context) {
     private fun briefingKey(uid: String) = stringPreferencesKey("last_briefing_date_$uid")
     private fun alertedKey(uid: String) = stringSetPreferencesKey("alerted_notifications_$uid")
     private fun branchKey(uid: String) = stringPreferencesKey("last_branch_$uid")
+    private fun tasksSyncDateKey(uid: String) = stringPreferencesKey("last_tasks_sync_date_$uid")
 
     fun observeLastBriefingDate(uid: String): Flow<String?> =
         context.dataStore.data.map { prefs -> prefs[briefingKey(uid)] }
@@ -31,6 +32,15 @@ class AppPreferences(private val context: Context) {
     suspend fun saveLastBranch(uid: String, branchName: String) {
         context.dataStore.edit { prefs ->
             prefs[branchKey(uid)] = branchName
+        }
+    }
+
+    fun observeLastTasksSyncDate(uid: String): Flow<String?> =
+        context.dataStore.data.map { prefs -> prefs[tasksSyncDateKey(uid)] }
+
+    suspend fun saveLastTasksSyncDate(uid: String, dateString: String) {
+        context.dataStore.edit { prefs ->
+            prefs[tasksSyncDateKey(uid)] = dateString
         }
     }
 

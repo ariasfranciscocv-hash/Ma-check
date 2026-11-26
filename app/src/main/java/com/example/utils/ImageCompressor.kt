@@ -301,29 +301,27 @@ fun decodeBase64ToImageBitmap(base64: String?): ImageBitmap? {
     }.getOrNull()
 }
 
-fun createViewableCacheUriFromChunks(
-    context: Context,
-    fileName: String,
-    chunks: List<String>
-): Uri? = runCatching {
-    if (chunks.isEmpty()) return null
-    val dir = File(context.cacheDir, "shared_attachments").apply { mkdirs() }
-    val safeName = fileName.ifBlank { "archivo_${System.currentTimeMillis()}" }
-        .replace(Regex("[^a-zA-Z0-9._-]"), "_")
-    val outFile = File(dir, safeName)
-    outFile.outputStream().use { output ->
-        for (chunk in chunks) {
-            val clean = chunk.substringAfter("base64,", chunk)
-            val bytes = Base64.decode(clean, Base64.DEFAULT)
-            output.write(bytes)
+    fun createViewableCacheUriFromChunks(
+        context: Context,
+        fileName: String,
+        base64Chunks: List<String>
+    ): Uri? = runCatching {
+        if (base64Chunks.isEmpty()) return null
+        val dir = File(context.cacheDir, "shared_attachments").apply { mkdirs() }
+        val safeName = fileName.ifBlank { "archivo_${System.currentTimeMillis()}" }
+            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val outFile = File(dir, safeName)
+        outFile.outputStream().use { output ->
+            for (chunk in base64Chunks) {
+                val clean = chunk.substringAfter("base64,", chunk)
+                val bytes = Base64.decode(clean, Base64.DEFAULT)
+                output.write(bytes)
+            }
         }
-    }
-    FileProvider.getUriForFile(
-        context,
-        "${context.packageName}.fileprovider",
-        outFile
-    )
-}.getOrNull()
+        FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            outFile
+        )
+    }.getOrNull()
 }
-
-                

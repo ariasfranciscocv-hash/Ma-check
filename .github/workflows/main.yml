@@ -1,33 +1,33 @@
-name: Actualizar App desde ZIP
+name: Build Android APK
 
 on:
+  push:
+    branches: [ "main" ]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  extraer-y-actualizar:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Descargar repositorio
-        uses: actions/checkout@v4
-
-      - name: Extraer ZIP sin borrar configuraciones
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Configure API Key
         run: |
-          mkdir temp_nuevo
-          unzip -o *.zip -d temp_nuevo
-          cp -rn temp_nuevo/* ./ || true
-          cp -rf temp_nuevo/src ./ 2>/dev/null || true
-          cp -rf temp_nuevo/public ./ 2>/dev/null || true
-          cp -f temp_nuevo/index.html temp_nuevo/package.json ./ 2>/dev/null || true
-          rm -rf temp_nuevo *.zip
-
-      - name: Guardar cambios en GitHub
-        run: |
-          git config user.name "GitHub Action"
-          git config user.email "action@github.com"
-          git add .
-          git commit -m "Actualizacion automatica desde ZIP" || exit 0
-          git push
+          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> local.properties
+      - name: Generate debug keystore
+        run: keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -startdate "2024/01/01 00:00:00" -dname "CN=Android Debug,O=Android,C=US"
+      - name: Print SHA-1
+        run: keytool -list -v -keystore debug.keystore -storepass android -alias androiddebugkey | grep SHA1
+      - name: Build with Gradle
+        run: gradle assembleDebug
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
           

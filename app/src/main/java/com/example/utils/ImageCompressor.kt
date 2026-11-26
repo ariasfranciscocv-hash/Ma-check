@@ -232,5 +232,98 @@ object ImageCompressor {
                 } else {
                     openStream(resolver, uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
                 }
-                var sampleSize = 1
+                            var sampleSize = 1
+            val maxSide = max(bounds.outWidth, bounds.outHeight)
+            while (maxSide / sampleSize > MAX_DIMENSION_PX * 2) {
+                sampleSize *= 2
+            }
+            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            val decoded = if (copied && tempFile.exists()) {
+                BitmapFactory.decodeFile(tempFile.absolutePath, decodeOpts)
+            } else {
+                openStream(resolver, uri)?.use { BitmapFactory.decodeStream(it, null, decodeOpts) }
+            } ?: error("No se pudo abrir la imagen seleccionada.")
+
+            val rotated = applyExifRotation(decoded, tempFile)
+            scaleDownIfNeeded(rotated, MAX_DIMENSION_PX)
+        }
+
+        val finalBitmap = scaleDownIfNeeded(rawBitmap, MAX_DIMENSION_PX)
+        var quality = JPEG_QUALITY
+        var base64: String
+        do {
+            val out = ByteArrayOutputStream()
+            finalBitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            base64 = Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP)
+            quality -= 10
+        } while (base64.length > MAX_BASE64_CHARS && quality >= 30)
+
+        base64
+    } finally {
+        runCatching { tempFile.delete() }
+    }
+}
+
+private fun scaleDownIfNeeded(bitmap: Bitmap, maxDim: Int): Bitmap {
+    val maxSide = max(bitmap.width, bitmap.height)
+    if (maxSide <= maxDim) return bitmap
+    val ratio = maxDim.toFloat() / maxSide.toFloat()
+    val w = (bitmap.width * ratio).toInt().coerceAtLeast(1)
+    val h = (bitmap.height * ratio).toInt().coerceAtLeast(1)
+    return Bitmap.createScaledBitmap(bitmap, w, h, true)
+}
+
+private fun applyExifRotation(bitmap: Bitmap, file: File): Bitmap {
+    if (!file.exists()) return bitmap
+    val orientation = runCatching {
+        ExifInterface(file.absolutePath).getAttributeInt(
+            ExifInterface.TAG_ORIENTATION,
+            ExifInterface.ORIENTATION_NORMAL
+        )
+    }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+    val degrees = when (orientation) {
+        ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+        ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+        ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+        else -> 0f
+    }
+    if (degrees == 0f) return bitmap
+    val matrix = Matrix().apply { postRotate(degrees) }
+    return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+}
+
+fun decodeBase64ToImageBitmap(base64: String?): ImageBitmap? {
+    if (base64.isNullOrBlank()) return null
+    return runCatching {
+        val clean = base64.substringAfter("base64,", base64)
+        val bytes = Base64.decode(clean, Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+    }.getOrNull()
+}
+
+fun createViewableCacheUriFromChunks(
+    context: Context,
+    fileName: String,
+    chunks: List<String>
+): Uri? = runCatching {
+    if (chunks.isEmpty()) return null
+    val dir = File(context.cacheDir, "shared_attachments").apply { mkdirs() }
+    val safeName = fileName.ifBlank { "archivo_${System.currentTimeMillis()}" }
+        .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+    val outFile = File(dir, safeName)
+    outFile.outputStream().use { output ->
+        for (chunk in chunks) {
+            val clean = chunk.substringAfter("base64,", chunk)
+            val bytes = Base64.decode(clean, Base64.DEFAULT)
+            output.write(bytes)
+        }
+    }
+    FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        outFile
+    )
+}.getOrNull()
+}
+
                 

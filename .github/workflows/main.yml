@@ -1,13 +1,33 @@
-- name: Actualizar codigo desde ZIP
-  run: |
-    mkdir temp_nuevo
-    unzip -o tu_archivo_nuevo.zip -d temp_nuevo
-    # Copia solo el codigo nuevo (ej. src o www) sin tocar android/ ni .github/
-    cp -rf temp_nuevo/* ./
-    rm -rf temp_nuevo tu_archivo_nuevo.zip
-    git config user.name "GitHub Action"
-    git config user.email "action@github.com"
-    git add .
-    git commit -m "Actualizacion masiva desde ZIP"
-    git push
-    
+name: Actualizar App desde ZIP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  extraer-y-actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Extraer ZIP sin borrar configuraciones
+        run: |
+          mkdir temp_nuevo
+          unzip -o *.zip -d temp_nuevo
+          cp -rn temp_nuevo/* ./ || true
+          cp -rf temp_nuevo/src ./ 2>/dev/null || true
+          cp -rf temp_nuevo/public ./ 2>/dev/null || true
+          cp -f temp_nuevo/index.html temp_nuevo/package.json ./ 2>/dev/null || true
+          rm -rf temp_nuevo *.zip
+
+      - name: Guardar cambios en GitHub
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add .
+          git commit -m "Actualizacion automatica desde ZIP" || exit 0
+          git push
+          

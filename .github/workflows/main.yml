@@ -37,9 +37,10 @@ jobs:
             git push
           fi
           cp -f app/debug.keystore ~/.android/debug.keystore
+          cp -f app/debug.keystore ./debug.keystore
 
       - name: Print SHA-1
-        run: keytool -list -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey | grep SHA1
+        run: keytool -list -v -keystore ./debug.keystore -storepass android -alias androiddebugkey | grep SHA1
 
       - name: Build with Gradle
         run: gradle assembleDebug
@@ -49,4 +50,3 @@ jobs:
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/*.apk
-          

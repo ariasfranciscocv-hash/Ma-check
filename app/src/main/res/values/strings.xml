@@ -3,7 +3,8 @@
     <string name="brand_name">Muebles América</string>
     <string name="brand_subtitle">División Andrea Enriquez</string>
     <string name="sign_in_with_google">Continuar con Google</string>
-    <string name="sign_in_tagline">Inicia sesión con tu cuenta autorizada para gestionar tareas diarias, documentar evidencias y registrar tu cierre de ventas.</string>
+    <string name="sign_in_title">Cumplimiento de tareas</string>
+    <string name="sign_in_tagline">Registro de evidencias</string>
     <string name="role_admin">Administrador</string>
     <string name="role_employee">Empleado</string>
     <string name="nav_home">Inicio</string>
@@ -33,4 +34,4 @@
     <string name="notifications_title">Notificaciones</string>
     <string name="sign_out">Cerrar sesión</string>
     <string name="retry">Reintentar</string>
-    </resources>
+</resources>

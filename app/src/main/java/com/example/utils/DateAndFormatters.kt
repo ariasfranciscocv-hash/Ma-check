@@ -1,5 +1,6 @@
 package com.example.utils
 
+import com.example.data.model.AssignedTask
 import com.example.data.model.SalesMetricType
 import java.text.NumberFormat
 import java.text.SimpleDateFormat
@@ -103,24 +104,82 @@ object DateAndFormatters {
         return Calendar.getInstance().apply { time = parsed }.get(Calendar.DAY_OF_WEEK)
     }
 
+    private val scheduledIdDateRegex = Regex("""^sched_.+_(\d{4}-\d{2}-\d{2})_[a-z0-9_]+$""")
+
+    private fun parseDateTimeMillis(
+        dateIso: String,
+        timeHm: String?,
+        endOfMinute: Boolean
+    ): Long? {
+        val parsedDate = runCatching {
+            synchronized(isoFormat) { isoFormat.parse(dateIso) }
+        }.getOrNull() ?: return null
+        val parts = timeHm?.split(":")
+        val hour = parts?.getOrNull(0)?.toIntOrNull()?.coerceIn(0, 23)
+            ?: if (endOfMinute) 23 else 0
+        val minute = parts?.getOrNull(1)?.toIntOrNull()?.coerceIn(0, 59)
+            ?: if (endOfMinute) 59 else 0
+
+        return Calendar.getInstance().apply {
+            time = parsedDate
+            set(Calendar.HOUR_OF_DAY, hour)
+            set(Calendar.MINUTE, minute)
+            set(Calendar.SECOND, if (endOfMinute) 59 else 0)
+            set(Calendar.MILLISECOND, if (endOfMinute) 999 else 0)
+        }.timeInMillis
+    }
+
+    fun extractScheduledAssignedDate(taskId: String): String? =
+        scheduledIdDateRegex.find(taskId)?.groupValues?.getOrNull(1)
+
+    fun resolveTaskWindowMillis(task: AssignedTask): Pair<Long, Long>? {
+        if (task.dueDate.isBlank()) return null
+
+        val is2pmTask = task.id.endsWith("_avance_ventas_1400") ||
+            task.title.contains("2:00 p.m.", ignoreCase = true)
+        val is6pmTask = task.id.endsWith("_avance_ventas_1800") ||
+            task.title.contains("6:00 p.m.", ignoreCase = true)
+
+        val scheduledStartDate = extractScheduledAssignedDate(task.id)
+        val startDateIso = scheduledStartDate ?: if (is2pmTask || is6pmTask) task.dueDate else null
+
+        val startMillis = when {
+            is2pmTask -> parseDateTimeMillis(startDateIso!!, "14:00", endOfMinute = false)
+            is6pmTask -> parseDateTimeMillis(startDateIso!!, "18:00", endOfMinute = false)
+            scheduledStartDate != null -> parseDateTimeMillis(scheduledStartDate, "00:00", endOfMinute = false)
+            else -> {
+                val createdDateIso = task.createdAt?.toDate()?.let { createdDate ->
+                    synchronized(isoFormat) { isoFormat.format(createdDate) }
+                }
+                parseDateTimeMillis(createdDateIso ?: task.dueDate, "00:00", endOfMinute = false)
+            }
+        } ?: return null
+
+        val effectiveEndTime = when {
+            is2pmTask && (task.dueTime.isNullOrBlank() || task.dueTime == "23:59") -> "17:59"
+            else -> task.dueTime?.takeIf { it.isNotBlank() } ?: "23:59"
+        }
+        val endMillis = parseDateTimeMillis(task.dueDate, effectiveEndTime, endOfMinute = true)
+            ?: return null
+
+        return startMillis to endMillis
+    }
+
+    fun isTaskWithinActiveWindow(
+        task: AssignedTask,
+        nowMillis: Long = System.currentTimeMillis()
+    ): Boolean {
+        val (startMillis, endMillis) = resolveTaskWindowMillis(task) ?: return true
+        return nowMillis in startMillis..endMillis
+    }
+
     fun isTaskPastDeadline(
         dueDateIso: String,
         dueTime: String?,
         nowMillis: Long = System.currentTimeMillis()
     ): Boolean {
-        val parsedDate = runCatching { isoFormat.parse(dueDateIso) }.getOrNull() ?: return false
-        val parts = dueTime?.split(":")
-        val hour = parts?.getOrNull(0)?.toIntOrNull()?.coerceIn(0, 23) ?: 23
-        val minute = parts?.getOrNull(1)?.toIntOrNull()?.coerceIn(0, 59) ?: 59
-
-        val deadlineCal = Calendar.getInstance().apply {
-            time = parsedDate
-            set(Calendar.HOUR_OF_DAY, hour)
-            set(Calendar.MINUTE, minute)
-            set(Calendar.SECOND, 59)
-            set(Calendar.MILLISECOND, 999)
-        }
-        return nowMillis > deadlineCal.timeInMillis
+        val deadlineMillis = parseDateTimeMillis(dueDateIso, dueTime, endOfMinute = true) ?: return false
+        return nowMillis > deadlineMillis
     }
 
     fun formatDeadlineDisplay(

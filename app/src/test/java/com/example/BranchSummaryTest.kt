@@ -49,7 +49,11 @@ class BranchSummaryTest {
         )
 
         val summaries = buildBranchTaskSummaries(users, tasks)
-        assertEquals(5, summaries.size)
+        assertEquals(6, summaries.size)
+
+        val s87 = summaries.first { it.branchName == "Sucursal 87" }
+        assertFalse(s87.allTasksCompleted)
+        assertEquals(0, s87.totalCount)
 
         val s107 = summaries.first { it.branchName == "Sucursal 107" }
         assertTrue(s107.allTasksCompleted)

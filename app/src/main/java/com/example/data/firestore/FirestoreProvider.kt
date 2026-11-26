@@ -6,26 +6,19 @@ import com.example.R
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreSettings
 import com.google.firebase.firestore.firestoreSettings
-import com.google.firebase.firestore.persistentCacheSettings
+import com.google.firebase.firestore.memoryCacheSettings
 
 /**
- * Provides the named Cloud Firestore instance configured with durable local disk persistence
- * so offline task completions, photo evidences, and sales closings survive restarts and sync
- * automatically when connectivity returns.
+ * Provides the named Cloud Firestore instance configured with memory-only cache
+ * (no offline local disk persistence).
  */
 object FirestoreProvider {
 
     private const val TAG = "FirestoreProvider"
-    const val CACHE_SIZE_BYTES: Long = 100L * 1024L * 1024L // 100 MB
-
     private val configuredDatabases = mutableSetOf<String>()
 
-    fun buildPersistentSettings(): FirebaseFirestoreSettings = firestoreSettings {
-        setLocalCacheSettings(
-            persistentCacheSettings {
-                setSizeBytes(CACHE_SIZE_BYTES)
-            }
-        )
+    fun buildOnlineOnlySettings(): FirebaseFirestoreSettings = firestoreSettings {
+        setLocalCacheSettings(memoryCacheSettings {})
     }
 
     fun getInstance(context: Context): FirebaseFirestore {
@@ -35,7 +28,7 @@ object FirestoreProvider {
         synchronized(this) {
             if (databaseId !in configuredDatabases) {
                 try {
-                    firestore.firestoreSettings = buildPersistentSettings()
+                    firestore.firestoreSettings = buildOnlineOnlySettings()
                 } catch (e: IllegalStateException) {
                     Log.w(TAG, "Firestore settings already initialized for $databaseId", e)
                 }

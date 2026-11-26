@@ -62,8 +62,8 @@ object ScheduledTasksCatalog {
                     title = "Actualización de avance de ventas (2:00 p.m.)",
                     description = "Actualizar el avance de ventas de las 2:00 p.m. y documentar con evidencia fotográfica.",
                     dueDateIso = dateIso,
-                    dueTime = "23:59",
-                    deadlineLabel = "Horario: 2:00 p.m."
+                    dueTime = "17:59",
+                    deadlineLabel = "Horario: 2:00 p.m. – 5:59 p.m."
                 )
             )
             baseTasks.add(
@@ -73,7 +73,7 @@ object ScheduledTasksCatalog {
                     description = "Actualizar el avance de ventas de las 6:00 p.m. y documentar con evidencia fotográfica.",
                     dueDateIso = dateIso,
                     dueTime = "23:59",
-                    deadlineLabel = "Horario: 6:00 p.m."
+                    deadlineLabel = "Horario: 6:00 p.m. – cierre"
                 )
             )
         }

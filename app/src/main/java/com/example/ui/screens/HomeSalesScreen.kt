@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -32,9 +33,9 @@ import androidx.compose.material.icons.filled.AttachMoney
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.EditCalendar
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GroupAdd
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -77,6 +78,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.BiweeklyQuota
 import com.example.data.model.ChartSeries
+import com.example.data.model.ClosingAttachmentDraft
 import com.example.data.model.DailySalesEntry
 import com.example.data.model.MetricProgress
 import com.example.data.model.ProjectionPace
@@ -87,13 +89,13 @@ import com.example.ui.components.MueblesAmericaLogo
 import com.example.ui.components.ProjectionLineChart
 import com.example.ui.theme.BrandNavy
 import com.example.ui.theme.BrandRed
+import com.example.ui.theme.BrandRedSoft
 import com.example.ui.theme.MonoFontFamily
 import com.example.ui.theme.SuccessGreen
 import com.example.ui.theme.SuccessGreenSoft
 import com.example.ui.theme.WarningAmber
 import com.example.ui.theme.WarningAmberSoft
 import com.example.utils.DateAndFormatters
-import com.example.utils.EncodedAttachment
 import com.example.utils.ImageCompressor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -105,10 +107,12 @@ fun HomeSalesScreen(
     isAdmin: Boolean,
     isBusy: Boolean,
     projectionState: UiState<SalesProjectionSummary?>,
-    pendingSalesEntryIds: Set<String> = emptySet(),
     selectedMetric: SalesMetricType,
     chartSeries: ChartSeries?,
     showDailyBriefing: Boolean,
+    closingAttachmentDraft: ClosingAttachmentDraft,
+    onUpdateAttachmentDraft: (ClosingAttachmentDraft) -> Unit,
+    onLoadEntryAttachmentChunks: suspend (DailySalesEntry) -> Result<List<String>>,
     onDismissBriefing: () -> Unit,
     onSelectMetric: (SalesMetricType) -> Unit,
     onSaveDailyClosing: (
@@ -119,9 +123,7 @@ fun HomeSalesScreen(
         appMaOperations: Long,
         newCustomerRequests: Long,
         notes: String,
-        attachmentName: String?,
-        attachmentMimeType: String?,
-        attachmentBase64: String?
+        attachmentDraft: ClosingAttachmentDraft
     ) -> Unit,
     onSaveBiweeklyQuota: (
         title: String,
@@ -211,13 +213,13 @@ fun HomeSalesScreen(
                     }
                 } else {
                     item {
-                        val todayPendingSync = summary.todayEntry?.id?.let { it in pendingSalesEntryIds } == true
                         DailyClosingFormCard(
                             summary = summary,
                             branchLabel = branchLabel,
                             isBusy = isBusy,
-                            isPendingSync = todayPendingSync,
-                            onSave = { g, c, nc, ma, req, notes, attName, attMime, attBase64 ->
+                            closingAttachmentDraft = closingAttachmentDraft,
+                            onUpdateAttachmentDraft = onUpdateAttachmentDraft,
+                            onSave = { g, c, nc, ma, req, notes, draft ->
                                 onSaveDailyClosing(
                                     summary.quota.id,
                                     g,
@@ -226,9 +228,7 @@ fun HomeSalesScreen(
                                     ma,
                                     req,
                                     notes,
-                                    attName,
-                                    attMime,
-                                    attBase64
+                                    draft
                                 )
                             }
                         )
@@ -264,7 +264,8 @@ fun HomeSalesScreen(
                     }
 
                     val entriesWithDetails = summary.recentEntries.filter {
-                        it.notes.isNotBlank() || !it.attachmentBase64.isNullOrBlank()
+                        it.notes.isNotBlank() ||
+                            (!it.attachmentName.isNullOrBlank() && (!it.attachmentBase64.isNullOrBlank() || it.attachmentChunkCount > 0L))
                     }
                     if (entriesWithDetails.isNotEmpty()) {
                         item {
@@ -276,7 +277,10 @@ fun HomeSalesScreen(
                             )
                         }
                         items(entriesWithDetails.size) { index ->
-                            RecentClosingAttachmentCard(entry = entriesWithDetails[index])
+                            RecentClosingAttachmentCard(
+                                entry = entriesWithDetails[index],
+                                onLoadEntryAttachmentChunks = onLoadEntryAttachmentChunks
+                            )
                         }
                     }
                 }
@@ -406,8 +410,9 @@ private fun DailyClosingFormCard(
     summary: SalesProjectionSummary,
     branchLabel: String,
     isBusy: Boolean,
-    isPendingSync: Boolean,
-    onSave: (Double, Double, Long, Long, Long, String, String?, String?, String?) -> Unit
+    closingAttachmentDraft: ClosingAttachmentDraft,
+    onUpdateAttachmentDraft: (ClosingAttachmentDraft) -> Unit,
+    onSave: (Double, Double, Long, Long, Long, String, ClosingAttachmentDraft) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -430,23 +435,7 @@ private fun DailyClosingFormCard(
     var notesText by rememberSaveable(summary.quota.id, existingToday?.id) {
         mutableStateOf(existingToday?.notes ?: "")
     }
-    var attachment by remember(summary.quota.id, existingToday?.id) {
-        mutableStateOf(
-            if (existingToday?.attachmentBase64 != null &&
-                existingToday.attachmentName != null &&
-                existingToday.attachmentMimeType != null
-            ) {
-                EncodedAttachment(
-                    fileName = existingToday.attachmentName,
-                    mimeType = existingToday.attachmentMimeType,
-                    base64 = existingToday.attachmentBase64
-                )
-            } else {
-                null
-            }
-        )
-    }
-    var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingCameraUriString by rememberSaveable { mutableStateOf<String?>(null) }
     var isProcessingAttachment by remember { mutableStateOf(false) }
     var attachmentError by remember { mutableStateOf<String?>(null) }
     var validationError by remember { mutableStateOf<String?>(null) }
@@ -460,8 +449,12 @@ private fun DailyClosingFormCard(
             }
             isProcessingAttachment = false
             result.fold(
-                onSuccess = { encoded -> attachment = encoded },
-                onFailure = { err -> attachmentError = err.localizedMessage ?: "No se pudo adjuntar el archivo." }
+                onSuccess = { encoded ->
+                    onUpdateAttachmentDraft(ClosingAttachmentDraft.Selected(encoded))
+                },
+                onFailure = { err ->
+                    attachmentError = err.localizedMessage ?: "No se pudo adjuntar el archivo."
+                }
             )
         }
     }
@@ -469,7 +462,7 @@ private fun DailyClosingFormCard(
     val cameraLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.TakePicture()
     ) { success ->
-        val uri = pendingCameraUri
+        val uri = pendingCameraUriString?.let { Uri.parse(it) }
         if (success && uri != null) {
             handlePickedUri(uri)
         }
@@ -499,18 +492,6 @@ private fun DailyClosingFormCard(
             appMaOpsText = existingToday.appMaOperations.toString()
             newRequestsText = existingToday.newCustomerRequests.toString()
             notesText = existingToday.notes
-            attachment = if (existingToday.attachmentBase64 != null &&
-                existingToday.attachmentName != null &&
-                existingToday.attachmentMimeType != null
-            ) {
-                EncodedAttachment(
-                    fileName = existingToday.attachmentName,
-                    mimeType = existingToday.attachmentMimeType,
-                    base64 = existingToday.attachmentBase64
-                )
-            } else {
-                null
-            }
         }
     }
 
@@ -543,7 +524,7 @@ private fun DailyClosingFormCard(
                 }
                 if (existingToday != null) {
                     Surface(
-                        color = if (isPendingSync) WarningAmberSoft else SuccessGreenSoft,
+                        color = SuccessGreenSoft,
                         shape = RoundedCornerShape(50)
                     ) {
                         Row(
@@ -552,15 +533,15 @@ private fun DailyClosingFormCard(
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
                             Icon(
-                                imageVector = if (isPendingSync) Icons.Filled.CloudUpload else Icons.Filled.CheckCircle,
+                                imageVector = Icons.Filled.CheckCircle,
                                 contentDescription = null,
-                                tint = if (isPendingSync) WarningAmber else SuccessGreen,
+                                tint = SuccessGreen,
                                 modifier = Modifier.size(15.dp)
                             )
                             Text(
-                                text = if (isPendingSync) "Local · Pendiente" else "Registrado",
+                                text = "Registrado",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (isPendingSync) WarningAmber else SuccessGreen
+                                color = SuccessGreen
                             )
                         }
                     }
@@ -653,7 +634,7 @@ private fun DailyClosingFormCard(
             )
 
             Text(
-                text = "Adjuntar foto o archivo del teléfono (opcional)",
+                text = "Adjuntar foto o archivo del teléfono (opcional, hasta 3.5 MB)",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -664,9 +645,13 @@ private fun DailyClosingFormCard(
             ) {
                 OutlinedButton(
                     onClick = {
-                        val uri = ImageCompressor.createTempCameraUri(context)
-                        pendingCameraUri = uri
-                        cameraLauncher.launch(uri)
+                        runCatching {
+                            val uri = ImageCompressor.createTempCameraUri(context)
+                            pendingCameraUriString = uri.toString()
+                            cameraLauncher.launch(uri)
+                        }.onFailure {
+                            attachmentError = "No se pudo abrir la cámara en este dispositivo."
+                        }
                     },
                     enabled = !isBusy && !isProcessingAttachment,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
@@ -681,9 +666,13 @@ private fun DailyClosingFormCard(
 
                 OutlinedButton(
                     onClick = {
-                        photoPickerLauncher.launch(
-                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                        )
+                        runCatching {
+                            photoPickerLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        }.onFailure {
+                            attachmentError = "No se pudo abrir la galería de imágenes."
+                        }
                     },
                     enabled = !isBusy && !isProcessingAttachment,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
@@ -697,7 +686,13 @@ private fun DailyClosingFormCard(
                 }
 
                 OutlinedButton(
-                    onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                    onClick = {
+                        runCatching {
+                            filePickerLauncher.launch(arrayOf("*/*"))
+                        }.onFailure {
+                            attachmentError = "No se pudo abrir el selector de archivos."
+                        }
+                    },
                     enabled = !isBusy && !isProcessingAttachment,
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     modifier = Modifier
@@ -720,7 +715,52 @@ private fun DailyClosingFormCard(
                 }
             }
 
-            attachment?.let { att ->
+            val displayedAttachmentName: String?
+            val displayedAttachmentSubtitle: String?
+            val displayedInlinePreviewBase64: String?
+            val isUnsavedDraft: Boolean
+
+            when (closingAttachmentDraft) {
+                is ClosingAttachmentDraft.Selected -> {
+                    val att = closingAttachmentDraft.attachment
+                    displayedAttachmentName = att.fileName
+                    displayedAttachmentSubtitle = "${att.mimeType} · ${ImageCompressor.formatFileSize(att.totalBytes)} · Listo para subir al guardar"
+                    displayedInlinePreviewBase64 = if (att.mimeType.startsWith("image/")) att.singleBase64OrNull else null
+                    isUnsavedDraft = true
+                }
+                ClosingAttachmentDraft.Removed -> {
+                    displayedAttachmentName = null
+                    displayedAttachmentSubtitle = null
+                    displayedInlinePreviewBase64 = null
+                    isUnsavedDraft = false
+                }
+                ClosingAttachmentDraft.Unchanged -> {
+                    val hasSavedAttachment = existingToday != null &&
+                        !existingToday.attachmentName.isNullOrBlank() &&
+                        (!existingToday.attachmentBase64.isNullOrBlank() || existingToday.attachmentChunkCount > 0L)
+                    if (hasSavedAttachment && existingToday != null) {
+                        displayedAttachmentName = existingToday.attachmentName
+                        val sizeText = if (existingToday.attachmentSizeBytes > 0L) {
+                            " · ${ImageCompressor.formatFileSize(existingToday.attachmentSizeBytes.toInt())}"
+                        } else {
+                            ""
+                        }
+                        displayedAttachmentSubtitle = "${existingToday.attachmentMimeType ?: "Archivo"}$sizeText · Subido"
+                        displayedInlinePreviewBase64 = if (existingToday.attachmentMimeType?.startsWith("image/") == true) {
+                            existingToday.attachmentBase64
+                        } else {
+                            null
+                        }
+                    } else {
+                        displayedAttachmentName = null
+                        displayedAttachmentSubtitle = null
+                        displayedInlinePreviewBase64 = null
+                    }
+                    isUnsavedDraft = false
+                }
+            }
+
+            if (displayedAttachmentName != null) {
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(14.dp),
@@ -748,18 +788,25 @@ private fun DailyClosingFormCard(
                                 )
                                 Column {
                                     Text(
-                                        text = att.fileName,
+                                        text = displayedAttachmentName,
                                         style = MaterialTheme.typography.labelMedium,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
-                                    Text(
-                                        text = att.mimeType,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
+                                    if (displayedAttachmentSubtitle != null) {
+                                        Text(
+                                            text = displayedAttachmentSubtitle,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (isUnsavedDraft) BrandNavy else MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
                                 }
                             }
-                            IconButton(onClick = { attachment = null }) {
+                            IconButton(
+                                onClick = {
+                                    attachmentError = null
+                                    onUpdateAttachmentDraft(ClosingAttachmentDraft.Removed)
+                                }
+                            ) {
                                 Icon(
                                     imageVector = Icons.Filled.Close,
                                     contentDescription = "Quitar adjunto",
@@ -768,9 +815,9 @@ private fun DailyClosingFormCard(
                             }
                         }
 
-                        if (att.mimeType.startsWith("image/")) {
-                            val bmp = remember(att.base64) {
-                                ImageCompressor.decodeBase64ToImageBitmap(att.base64)
+                        if (displayedInlinePreviewBase64 != null) {
+                            val bmp = remember(displayedInlinePreviewBase64) {
+                                ImageCompressor.decodeBase64ToImageBitmap(displayedInlinePreviewBase64)
                             }
                             if (bmp != null) {
                                 Image(
@@ -789,19 +836,55 @@ private fun DailyClosingFormCard(
             }
 
             if (attachmentError != null) {
-                Text(
-                    text = attachmentError ?: "",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = BrandRed
-                )
+                Surface(
+                    color = BrandRedSoft,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.ErrorOutline,
+                            contentDescription = null,
+                            tint = BrandRed,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = attachmentError ?: "",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = BrandRed
+                        )
+                    }
+                }
             }
 
             if (validationError != null) {
-                Text(
-                    text = validationError ?: "",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = BrandRed
-                )
+                Surface(
+                    color = BrandRedSoft,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.ErrorOutline,
+                            contentDescription = null,
+                            tint = BrandRed,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = validationError ?: "",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = BrandRed
+                        )
+                    }
+                }
             }
 
             Button(
@@ -812,7 +895,7 @@ private fun DailyClosingFormCard(
                     val ma = appMaOpsText.toLongOrNull()
                     val req = newRequestsText.toLongOrNull()
                     if (g == null || c == null || nc == null || ma == null || req == null) {
-                        validationError = "Captura un valor numérico en los 5 indicadores (usa 0 si no hubo)."
+                        validationError = "Captura un valor numérico en los 5 indicadores (usa 0 si no hubo) para guardar el cierre y subir el archivo."
                     } else {
                         validationError = null
                         onSave(
@@ -822,9 +905,7 @@ private fun DailyClosingFormCard(
                             ma,
                             req,
                             notesText,
-                            attachment?.fileName,
-                            attachment?.mimeType,
-                            attachment?.base64
+                            closingAttachmentDraft
                         )
                     }
                 },
@@ -849,9 +930,15 @@ private fun DailyClosingFormCard(
 }
 
 @Composable
-private fun RecentClosingAttachmentCard(entry: DailySalesEntry) {
+private fun RecentClosingAttachmentCard(
+    entry: DailySalesEntry,
+    onLoadEntryAttachmentChunks: suspend (DailySalesEntry) -> Result<List<String>>
+) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var showImageDialog by remember { mutableStateOf(false) }
+    var isLoadingAttachment by remember { mutableStateOf(false) }
+    var openError by remember { mutableStateOf<String?>(null) }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -885,33 +972,75 @@ private fun RecentClosingAttachmentCard(entry: DailySalesEntry) {
                     color = MaterialTheme.colorScheme.onSurface
                 )
             }
-            if (!entry.attachmentBase64.isNullOrBlank() && !entry.attachmentName.isNullOrBlank()) {
+            val hasAttachment = !entry.attachmentName.isNullOrBlank() &&
+                (!entry.attachmentBase64.isNullOrBlank() || entry.attachmentChunkCount > 0L)
+            if (hasAttachment && entry.attachmentName != null) {
                 val isImage = entry.attachmentMimeType?.startsWith("image/") == true
                 OutlinedButton(
+                    enabled = !isLoadingAttachment,
                     onClick = {
-                        if (isImage) {
+                        openError = null
+                        if (isImage && !entry.attachmentBase64.isNullOrBlank()) {
                             showImageDialog = true
                         } else {
-                            val uri = ImageCompressor.createViewableCacheUri(
-                                context,
-                                entry.attachmentName,
-                                entry.attachmentBase64
-                            )
-                            if (uri != null) {
-                                val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-                                    setDataAndType(uri, entry.attachmentMimeType ?: "*/*")
-                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            isLoadingAttachment = true
+                            scope.launch {
+                                val chunksResult = withContext(Dispatchers.IO) {
+                                    onLoadEntryAttachmentChunks(entry)
                                 }
-                                runCatching { context.startActivity(viewIntent) }
+                                isLoadingAttachment = false
+                                chunksResult.fold(
+                                    onSuccess = { chunks ->
+                                        val uri = withContext(Dispatchers.IO) {
+                                            ImageCompressor.createViewableCacheUriFromChunks(
+                                                context = context,
+                                                fileName = entry.attachmentName,
+                                                base64Chunks = chunks
+                                            )
+                                        }
+                                        if (uri != null) {
+                                            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                                                setDataAndType(uri, entry.attachmentMimeType ?: "*/*")
+                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                            }
+                                            runCatching {
+                                                context.startActivity(viewIntent)
+                                            }.onFailure {
+                                                openError = "No hay una aplicación instalada para abrir este tipo de archivo."
+                                            }
+                                        } else {
+                                            openError = "No se pudo preparar el archivo para abrirlo."
+                                        }
+                                    },
+                                    onFailure = { err ->
+                                        openError = err.localizedMessage ?: "No se pudo descargar el archivo."
+                                    }
+                                )
                             }
                         }
                     },
                     shape = RoundedCornerShape(10.dp)
                 ) {
-                    Icon(Icons.Filled.AttachFile, contentDescription = null, modifier = Modifier.size(16.dp))
+                    if (isLoadingAttachment) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    } else {
+                        Icon(Icons.Filled.AttachFile, contentDescription = null, modifier = Modifier.size(16.dp))
+                    }
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text(entry.attachmentName, style = MaterialTheme.typography.labelSmall)
+                    val sizeLabel = if (entry.attachmentSizeBytes > 0L) {
+                        " (${ImageCompressor.formatFileSize(entry.attachmentSizeBytes.toInt())})"
+                    } else {
+                        ""
+                    }
+                    Text("${entry.attachmentName}$sizeLabel", style = MaterialTheme.typography.labelSmall)
                 }
+            }
+            if (openError != null) {
+                Text(
+                    text = openError ?: "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = BrandRed
+                )
             }
         }
     }
@@ -1013,8 +1142,8 @@ private fun ProjectionOverviewCard(
                         onClick = { onSelectMetric(metric) },
                         label = { Text(metric.shortTitleEs) },
                         colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = BrandNavy,
-                            selectedLabelColor = Color.White
+                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                            selectedLabelColor = BrandNavy
                         )
                     )
                 }
@@ -1127,9 +1256,9 @@ private fun MetricScorecardItem(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
+        border = if (isSelected) BorderStroke(1.5.dp, BrandNavy) else null,
         colors = CardDefaults.cardColors(
-            containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
-            else MaterialTheme.colorScheme.surface
+            containerColor = if (isSelected) Color(0xFFF8FBFF) else MaterialTheme.colorScheme.surface
         )
     ) {
         Column(

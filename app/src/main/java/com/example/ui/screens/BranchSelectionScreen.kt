@@ -82,7 +82,7 @@ fun BranchSelectionScreen(
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    colors = listOf(Color(0xFFFFFFFF), Color(0xFFF3F6FC))
+                    colors = listOf(Color(0xFFFFFFFF), Color(0xFFFAFBFD), Color(0xFFF5F8FD))
                 )
             )
             .safeDrawingPadding(),

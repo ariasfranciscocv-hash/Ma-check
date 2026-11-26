@@ -82,12 +82,70 @@ class ScheduledTasksTest {
             val t6 = tasks.firstOrNull { it.slug == "avance_ventas_1800" }
             assertNotNull("Expected 2pm task on $iso", t2)
             assertNotNull("Expected 6pm task on $iso", t6)
-            assertEquals("Horario: 2:00 p.m.", t2!!.deadlineLabel)
-            assertEquals("Horario: 6:00 p.m.", t6!!.deadlineLabel)
+            assertEquals("17:59", t2!!.dueTime)
+            assertEquals("23:59", t6!!.dueTime)
+            assertEquals("Horario: 2:00 p.m. – 5:59 p.m.", t2.deadlineLabel)
+            assertEquals("Horario: 6:00 p.m. – cierre", t6.deadlineLabel)
         }
 
         // 2026-11-29 is Sunday: should NOT include the Mon-Sat sales checkpoints
         val sundayTasks = ScheduledTasksCatalog.tasksForDate("2026-11-29")
         assertFalse(sundayTasks.any { it.slug == "avance_ventas_1400" || it.slug == "avance_ventas_1800" })
     }
+
+    @Test
+    fun `sales checkpoint tasks are visible only inside their established time windows`() {
+        val task2pm = com.example.data.model.AssignedTask(
+            id = "sched_u1_2026-11-25_avance_ventas_1400",
+            title = "Actualización de avance de ventas (2:00 p.m.)",
+            dueDate = "2026-11-25",
+            dueTime = "17:59"
+        )
+        val task6pm = com.example.data.model.AssignedTask(
+            id = "sched_u1_2026-11-25_avance_ventas_1800",
+            title = "Actualización de avance de ventas (6:00 p.m.)",
+            dueDate = "2026-11-25",
+            dueTime = "23:59"
+        )
+
+        val at1359 = millisOf(2026, Calendar.NOVEMBER, 25, 13, 59)
+        val at1400 = millisOf(2026, Calendar.NOVEMBER, 25, 14, 0)
+        val at1759 = millisOf(2026, Calendar.NOVEMBER, 25, 17, 59)
+        val at1800 = millisOf(2026, Calendar.NOVEMBER, 25, 18, 0)
+        val nextDay = millisOf(2026, Calendar.NOVEMBER, 26, 0, 5)
+
+        assertFalse(DateAndFormatters.isTaskWithinActiveWindow(task2pm, at1359))
+        assertTrue(DateAndFormatters.isTaskWithinActiveWindow(task2pm, at1400))
+        assertTrue(DateAndFormatters.isTaskWithinActiveWindow(task2pm, at1759))
+        assertFalse(DateAndFormatters.isTaskWithinActiveWindow(task2pm, at1800))
+
+        assertFalse(DateAndFormatters.isTaskWithinActiveWindow(task6pm, at1759))
+        assertTrue(DateAndFormatters.isTaskWithinActiveWindow(task6pm, at1800))
+        assertFalse(DateAndFormatters.isTaskWithinActiveWindow(task6pm, nextDay))
+    }
+
+    @Test
+    fun `daily, inventario, and examenes tasks hide automatically once their deadline expires`() {
+        val examenes = com.example.data.model.AssignedTask(
+            id = "sched_u1_2026-11-29_examenes",
+            title = "Exámenes",
+            dueDate = "2026-11-30",
+            dueTime = "11:30"
+        )
+        val beforeStart = millisOf(2026, Calendar.NOVEMBER, 28, 23, 55)
+        val sundayEvening = millisOf(2026, Calendar.NOVEMBER, 29, 20, 0)
+        val monday1130 = millisOf(2026, Calendar.NOVEMBER, 30, 11, 30)
+        val monday1131 = millisOf(2026, Calendar.NOVEMBER, 30, 11, 31)
+
+        assertFalse(DateAndFormatters.isTaskWithinActiveWindow(examenes, beforeStart))
+        assertTrue(DateAndFormatters.isTaskWithinActiveWindow(examenes, sundayEvening))
+        assertTrue(DateAndFormatters.isTaskWithinActiveWindow(examenes, monday1130))
+        assertFalse(DateAndFormatters.isTaskWithinActiveWindow(examenes, monday1131))
+    }
+
+    private fun millisOf(year: Int, month: Int, day: Int, hour: Int, minute: Int): Long =
+        Calendar.getInstance().apply {
+            set(year, month, day, hour, minute, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.timeInMillis
 }

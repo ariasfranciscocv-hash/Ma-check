@@ -183,7 +183,7 @@ fun SplashLaunchScreen(modifier: Modifier = Modifier) {
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    colors = listOf(Color(0xFFFFFFFF), Color(0xFFF1F5FC), Color(0xFFE4ECF9))
+                    colors = listOf(Color(0xFFFFFFFF), Color(0xFFFAFBFD), Color(0xFFF3F7FD))
                 )
             ),
         contentAlignment = Alignment.Center

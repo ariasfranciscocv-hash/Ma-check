@@ -61,6 +61,7 @@ enum class SalesMetricType(
 
 object BranchOptions {
     val ALL_BRANCHES = listOf(
+        "Sucursal 87",
         "Sucursal 107",
         "Sucursal 109",
         "Sucursal 110",
@@ -174,9 +175,17 @@ data class DailySalesEntry(
     val attachmentName: String? = null,
     val attachmentMimeType: String? = null,
     val attachmentBase64: String? = null,
+    val attachmentChunkCount: Long = 0L,
+    val attachmentSizeBytes: Long = 0L,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
 )
+
+sealed interface ClosingAttachmentDraft {
+    data object Unchanged : ClosingAttachmentDraft
+    data object Removed : ClosingAttachmentDraft
+    data class Selected(val attachment: com.example.utils.EncodedAttachment) : ClosingAttachmentDraft
+}
 
 sealed interface UiState<out T> {
     data object Loading : UiState<Nothing>

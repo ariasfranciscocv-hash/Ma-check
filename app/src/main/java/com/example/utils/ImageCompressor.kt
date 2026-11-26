@@ -1,31 +1,114 @@
 package com.example.utils
 
+import android.content.ContentResolver
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Base64
+import android.webkit.MimeTypeMap
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.core.content.FileProvider
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
+import java.util.Locale
 import kotlin.math.max
 
 data class EncodedAttachment(
     val fileName: String,
     val mimeType: String,
-    val base64: String
-)
+    val totalBytes: Int,
+    val base64Chunks: List<String>
+) {
+    val isChunked: Boolean get() = base64Chunks.size > 1
+    val singleBase64OrNull: String? get() = if (base64Chunks.size == 1) base64Chunks.first() else null
+}
 
 object ImageCompressor {
 
     private const val MAX_DIMENSION_PX = 768
     private const val JPEG_QUALITY = 68
     private const val MAX_BASE64_CHARS = 650_000
-    private const val MAX_RAW_FILE_BYTES = 480_000
+    internal const val CHUNK_RAW_BYTES = 450_000
+    internal const val MAX_TOTAL_FILE_BYTES = 3_500_000
+
+    private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "bmp", "gif")
+
+    private val KNOWN_MIME_TYPES = mapOf(
+        "pdf" to "application/pdf",
+        "txt" to "text/plain",
+        "csv" to "text/csv",
+        "doc" to "application/msword",
+        "docx" to "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" to "application/vnd.ms-excel",
+        "xlsx" to "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" to "application/vnd.ms-powerpoint",
+        "pptx" to "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "zip" to "application/zip",
+        "jpg" to "image/jpeg",
+        "jpeg" to "image/jpeg",
+        "png" to "image/png",
+        "webp" to "image/webp",
+        "heic" to "image/heic",
+        "heif" to "image/heif",
+        "gif" to "image/gif",
+        "bmp" to "image/bmp"
+    )
+
+    internal fun inferMimeType(fileName: String, reportedMimeType: String?): String {
+        val cleanedReported = reportedMimeType?.trim()?.takeIf { it.isNotEmpty() }?.take(100)
+        if (cleanedReported != null && !cleanedReported.equals("application/octet-stream", ignoreCase = true)) {
+            return cleanedReported
+        }
+        val ext = fileName.substringAfterLast('.', "").lowercase(Locale.ROOT)
+        if (ext.isNotEmpty()) {
+            KNOWN_MIME_TYPES[ext]?.let { return it }
+            runCatching {
+                MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+            }.getOrNull()?.takeIf { it.isNotBlank() }?.let { return it.take(100) }
+        }
+        return cleanedReported ?: "application/octet-stream"
+    }
+
+    internal fun isLikelyImage(fileName: String, mimeType: String?): Boolean {
+        if (mimeType?.startsWith("image/", ignoreCase = true) == true) return true
+        val ext = fileName.substringAfterLast('.', "").lowercase(Locale.ROOT)
+        return ext in IMAGE_EXTENSIONS
+    }
+
+    internal fun chunkBytesToBase64(
+        bytes: ByteArray,
+        chunkSizeBytes: Int = CHUNK_RAW_BYTES,
+        encoder: (ByteArray) -> String = { slice -> Base64.encodeToString(slice, Base64.NO_WRAP) }
+    ): List<String> {
+        require(bytes.isNotEmpty()) { "El archivo seleccionado está vacío." }
+        require(bytes.size <= MAX_TOTAL_FILE_BYTES) {
+            "El archivo supera el máximo permitido de 3.5 MB."
+        }
+        if (bytes.size <= chunkSizeBytes) {
+            return listOf(encoder(bytes))
+        }
+        val chunks = mutableListOf<String>()
+        var offset = 0
+        while (offset < bytes.size) {
+            val end = minOf(offset + chunkSizeBytes, bytes.size)
+            chunks.add(encoder(bytes.copyOfRange(offset, end)))
+            offset = end
+        }
+        return chunks
+    }
+
+    fun formatFileSize(bytes: Int): String = when {
+        bytes <= 0 -> "Archivo"
+        bytes < 1024 -> "$bytes B"
+        bytes < 1024 * 1024 -> "${(bytes / 1024.0).toInt().coerceAtLeast(1)} KB"
+        else -> String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
+    }
 
     fun createTempCameraUri(context: Context): Uri {
         val dir = File(context.cacheDir, "evidences").apply { mkdirs() }
@@ -37,33 +120,52 @@ object ImageCompressor {
         )
     }
 
+    private fun openStream(resolver: ContentResolver, uri: Uri): InputStream? {
+        return runCatching { resolver.openInputStream(uri) }.getOrNull()
+            ?: runCatching { resolver.openAssetFileDescriptor(uri, "r")?.createInputStream() }.getOrNull()
+    }
+
+    private fun probeImageBounds(resolver: ContentResolver, uri: Uri): Boolean {
+        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        return openStream(resolver, uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream, null, options)
+            options.outWidth > 0 && options.outHeight > 0
+        } ?: false
+    }
+
     fun encodeUriAttachment(context: Context, uri: Uri): Result<EncodedAttachment> = runCatching {
         val resolver = context.contentResolver
-        val rawName = queryDisplayName(context, uri) ?: "adjunto_${System.currentTimeMillis()}"
+        val rawName = queryDisplayName(context, uri)
+            ?: uri.lastPathSegment?.substringAfterLast('/')
+            ?: "adjunto_${System.currentTimeMillis()}"
         val safeName = rawName.trim().ifBlank { "adjunto" }.take(120)
-        val rawMime = resolver.getType(uri)?.trim()?.takeIf { it.isNotEmpty() }?.take(100)
-            ?: "application/octet-stream"
+        val effectiveMime = inferMimeType(safeName, runCatching { resolver.getType(uri) }.getOrNull())
 
-        if (rawMime.startsWith("image/")) {
+        val treatAsImage = isLikelyImage(safeName, effectiveMime) ||
+            (effectiveMime == "application/octet-stream" && probeImageBounds(resolver, uri))
+
+        if (treatAsImage) {
             val base64 = compressUriToBase64(context, uri).getOrThrow()
             val imageName = if (safeName.contains(".")) safeName else "$safeName.jpg"
+            val approxBytes = ((base64.length * 3) / 4).coerceAtLeast(1)
             return@runCatching EncodedAttachment(
                 fileName = imageName,
                 mimeType = "image/jpeg",
-                base64 = base64
+                totalBytes = approxBytes,
+                base64Chunks = listOf(base64)
             )
         }
 
-        val bytes = resolver.openInputStream(uri)?.use { input ->
+        val bytes = openStream(resolver, uri)?.use { input ->
             val out = ByteArrayOutputStream()
-            val buffer = ByteArray(8192)
+            val buffer = ByteArray(16_384)
             var total = 0
             while (true) {
                 val read = input.read(buffer)
                 if (read == -1) break
                 total += read
-                require(total <= MAX_RAW_FILE_BYTES) {
-                    "El archivo supera el máximo permitido de 480 KB."
+                require(total <= MAX_TOTAL_FILE_BYTES) {
+                    "El archivo supera el máximo permitido de 3.5 MB."
                 }
                 out.write(buffer, 0, read)
             }
@@ -71,14 +173,15 @@ object ImageCompressor {
         } ?: error("No se pudo abrir el archivo seleccionado.")
 
         require(bytes.isNotEmpty()) { "El archivo seleccionado está vacío." }
-        val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
-        require(base64.length in 50..MAX_BASE64_CHARS) {
-            "El archivo no cumple con el tamaño válido."
+        val chunks = chunkBytesToBase64(bytes)
+        require(chunks.size <= 8 && chunks.all { it.isNotEmpty() && it.length <= 700_000 }) {
+            "El archivo supera el máximo permitido de 3.5 MB."
         }
         EncodedAttachment(
             fileName = safeName,
-            mimeType = rawMime,
-            base64 = base64
+            mimeType = effectiveMime,
+            totalBytes = bytes.size,
+            base64Chunks = chunks
         )
     }
 
@@ -97,7 +200,7 @@ object ImageCompressor {
     fun compressUriToBase64(context: Context, uri: Uri): Result<String> = runCatching {
         val resolver = context.contentResolver
         val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        resolver.openInputStream(uri)?.use { stream ->
+        openStream(resolver, uri)?.use { stream ->
             BitmapFactory.decodeStream(stream, null, boundsOptions)
         } ?: error("No se pudo abrir la imagen seleccionada.")
 
@@ -105,20 +208,40 @@ object ImageCompressor {
         val srcHeight = boundsOptions.outHeight
         require(srcWidth > 0 && srcHeight > 0) { "Formato de imagen no válido." }
 
+        val orientation = runCatching {
+            openStream(resolver, uri)?.use { stream ->
+                ExifInterface(stream).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            } ?: ExifInterface.ORIENTATION_NORMAL
+        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
+
         var sampleSize = 1
         while (srcWidth / sampleSize > MAX_DIMENSION_PX * 2 || srcHeight / sampleSize > MAX_DIMENSION_PX * 2) {
             sampleSize *= 2
         }
 
         val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-        val rawBitmap = resolver.openInputStream(uri)?.use { stream ->
+        val rawBitmap = openStream(resolver, uri)?.use { stream ->
             BitmapFactory.decodeStream(stream, null, decodeOptions)
         } ?: error("No se pudo decodificar la fotografía.")
 
         val maxSide = max(rawBitmap.width, rawBitmap.height)
-        val scaledBitmap = if (maxSide > MAX_DIMENSION_PX) {
+        val matrix = Matrix()
+        if (maxSide > MAX_DIMENSION_PX) {
             val scale = MAX_DIMENSION_PX.toFloat() / maxSide.toFloat()
-            val matrix = Matrix().apply { postScale(scale, scale) }
+            matrix.postScale(scale, scale)
+        }
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+        }
+
+        val transformedBitmap = if (!matrix.isIdentity) {
             Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
         } else {
             rawBitmap
@@ -128,18 +251,18 @@ object ImageCompressor {
         var encoded: String
         do {
             val out = ByteArrayOutputStream()
-            scaledBitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+            transformedBitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
             val bytes = out.toByteArray()
             encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
             quality -= 10
         } while (encoded.length > MAX_BASE64_CHARS && quality >= 25)
 
-        if (scaledBitmap !== rawBitmap) {
-            scaledBitmap.recycle()
+        if (transformedBitmap !== rawBitmap) {
+            transformedBitmap.recycle()
         }
         rawBitmap.recycle()
 
-        require(encoded.length in 50..MAX_BASE64_CHARS) {
+        require(encoded.isNotEmpty() && encoded.length <= MAX_BASE64_CHARS) {
             "La fotografía excede el tamaño permitido para evidencia."
         }
         encoded
@@ -156,12 +279,25 @@ object ImageCompressor {
     }
 
     fun createViewableCacheUri(context: Context, fileName: String, base64: String): Uri? {
+        return createViewableCacheUriFromChunks(context, fileName, listOf(base64))
+    }
+
+    fun createViewableCacheUriFromChunks(
+        context: Context,
+        fileName: String,
+        base64Chunks: List<String>
+    ): Uri? {
+        if (base64Chunks.isEmpty()) return null
         return try {
-            val bytes = Base64.decode(base64, Base64.DEFAULT)
             val safeName = fileName.replace(Regex("[^a-zA-Z0-9._-]"), "_").ifBlank { "adjunto.bin" }
             val dir = File(context.cacheDir, "evidences").apply { mkdirs() }
             val outFile = File(dir, safeName)
-            outFile.writeBytes(bytes)
+            outFile.outputStream().use { fos ->
+                base64Chunks.forEach { chunk ->
+                    val decoded = Base64.decode(chunk, Base64.DEFAULT)
+                    fos.write(decoded)
+                }
+            }
             FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", outFile)
         } catch (_: Exception) {
             null

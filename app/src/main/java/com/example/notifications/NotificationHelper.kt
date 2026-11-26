@@ -17,12 +17,14 @@ import com.example.R
 object NotificationHelper {
 
     private const val CHANNEL_ID = "extraordinary_tasks_channel"
+    private const val LEGACY_CUSTOM_SOUND_CHANNEL_ID = "extraordinary_tasks_channel_v2"
     private const val CHANNEL_NAME = "Tareas Extraordinarias"
     private const val CHANNEL_DESC = "Avisos inmediatos cuando el administrador asigna una tarea extraordinaria."
 
     fun ensureChannel(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            manager.deleteNotificationChannel(LEGACY_CUSTOM_SOUND_CHANNEL_ID)
             val existing = manager.getNotificationChannel(CHANNEL_ID)
             if (existing == null) {
                 val channel = NotificationChannel(

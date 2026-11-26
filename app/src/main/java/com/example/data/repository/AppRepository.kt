@@ -3,13 +3,11 @@ package com.example.data.repository
 import android.content.Context
 import com.example.data.firestore.FirestoreProvider
 import com.example.data.firestore.OperationType
-import com.example.data.firestore.SnapshotSyncResult
-import com.example.data.firestore.WriteOutcome
-import com.example.data.firestore.awaitWriteOfflineAware
 import com.example.data.firestore.handleFirestoreError
 import com.example.data.model.AssignedTask
 import com.example.data.model.BiweeklyQuota
 import com.example.data.model.BranchOptions
+import com.example.data.model.ClosingAttachmentDraft
 import com.example.data.model.DailySalesEntry
 import com.example.data.model.TaskEvidence
 import com.example.data.model.TaskNotification
@@ -18,20 +16,14 @@ import com.example.data.model.TaskStatus
 import com.example.data.model.TaskType
 import com.example.data.model.UserProfile
 import com.example.data.model.UserRole
-import com.example.utils.ConnectivityChecker
 import com.example.utils.DateAndFormatters
 import com.google.firebase.Firebase
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.auth
-import com.google.firebase.firestore.DocumentReference
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.FirebaseFirestoreException
-import com.google.firebase.firestore.MetadataChanges
-import com.google.firebase.firestore.Query
-import com.google.firebase.firestore.QuerySnapshot
-import com.google.firebase.firestore.Source
 import com.google.firebase.firestore.snapshots
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
@@ -41,22 +33,14 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
-import kotlinx.coroutines.withTimeoutOrNull
 
 private const val BOOTSTRAPPED_ADMIN_EMAIL = "arias.francisco.cv@gmail.com"
 
 class AppRepository(
-    private val db: FirebaseFirestore,
-    private val isOnlineCheck: () -> Boolean = { true }
+    private val db: FirebaseFirestore
 ) {
 
-    constructor(
-        context: Context,
-        connectivityChecker: ConnectivityChecker? = null
-    ) : this(
-        db = FirestoreProvider.getInstance(context),
-        isOnlineCheck = { connectivityChecker?.isCurrentlyOnline() ?: true }
-    )
+    constructor(context: Context) : this(FirestoreProvider.getInstance(context))
 
     private val auth = Firebase.auth
 
@@ -66,26 +50,6 @@ class AppRepository(
 
     private fun isBootstrappedAdmin(email: String?, emailVerified: Boolean): Boolean =
         email == BOOTSTRAPPED_ADMIN_EMAIL && emailVerified
-
-    private suspend fun getDocumentOfflineAware(docRef: DocumentReference): DocumentSnapshot? {
-        if (!isOnlineCheck()) {
-            return runCatching { docRef.get(Source.CACHE).await() }.getOrNull()
-        }
-        val serverOrDefault = runCatching {
-            withTimeoutOrNull(3_500L) { docRef.get(Source.DEFAULT).await() }
-        }.getOrNull()
-        return serverOrDefault ?: runCatching { docRef.get(Source.CACHE).await() }.getOrNull()
-    }
-
-    private suspend fun getQueryOfflineAware(query: Query): QuerySnapshot {
-        if (!isOnlineCheck()) {
-            return query.get(Source.CACHE).await()
-        }
-        val onlineSnap = runCatching {
-            withTimeoutOrNull(4_000L) { query.get(Source.DEFAULT).await() }
-        }.getOrNull()
-        return onlineSnap ?: query.get(Source.CACHE).await()
-    }
 
     suspend fun syncCurrentUserProfile(
         uid: String,
@@ -100,13 +64,7 @@ class AppRepository(
             check(currentUid == uid) { "La sesión activa no coincide con el usuario." }
 
             val userRef = db.collection("users").document(uid)
-            val online = isOnlineCheck()
-            val snapshot = getDocumentOfflineAware(userRef)
-
-            if (!online) {
-                // Offline: keep cached profile intact so app launches cleanly without network errors
-                return Result.success(Unit)
-            }
+            val snapshot = userRef.get().await()
 
             val safeName = displayName?.trim()?.takeIf { it.isNotEmpty() }?.take(80)
                 ?: email?.substringBefore("@")?.take(80)?.ifBlank { "Usuario MA" }
@@ -115,7 +73,7 @@ class AppRepository(
             val safePhoto = photoUrl?.trim()?.takeIf { it.isNotEmpty() }?.take(500)
             val bootstrapped = isBootstrappedAdmin(safeEmail, emailVerified)
 
-            if (snapshot == null || !snapshot.exists()) {
+            if (!snapshot.exists()) {
                 val payload = buildMap<String, Any> {
                     put("userId", uid)
                     put("displayName", safeName)
@@ -125,43 +83,28 @@ class AppRepository(
                     put("createdAt", FieldValue.serverTimestamp())
                     put("updatedAt", FieldValue.serverTimestamp())
                 }
-                awaitWriteOfflineAware(
-                    task = userRef.set(payload),
-                    isOnline = online,
-                    operationType = OperationType.CREATE,
-                    path = docPath
-                )
+                userRef.set(payload).await()
             } else {
                 val updateMap = buildMap<String, Any> {
                     put("displayName", safeName)
                     if (safePhoto != null) put("photoUrl", safePhoto)
                     put("updatedAt", FieldValue.serverTimestamp())
                 }
-                awaitWriteOfflineAware(
-                    task = userRef.update(updateMap),
-                    isOnline = online,
-                    operationType = OperationType.UPDATE,
-                    path = docPath
-                )
+                userRef.update(updateMap).await()
             }
 
             if (bootstrapped) {
                 val adminRef = db.collection("admins").document(uid)
-                val adminSnap = getDocumentOfflineAware(adminRef)
-                if (adminSnap == null || !adminSnap.exists()) {
-                    awaitWriteOfflineAware(
-                        task = adminRef.set(
-                            mapOf(
-                                "userId" to uid,
-                                "email" to safeEmail,
-                                "grantedBy" to uid,
-                                "createdAt" to FieldValue.serverTimestamp()
-                            )
-                        ),
-                        isOnline = online,
-                        operationType = OperationType.CREATE,
-                        path = "admins/$uid"
-                    )
+                val adminSnap = adminRef.get().await()
+                if (!adminSnap.exists()) {
+                    adminRef.set(
+                        mapOf(
+                            "userId" to uid,
+                            "email" to safeEmail,
+                            "grantedBy" to uid,
+                            "createdAt" to FieldValue.serverTimestamp()
+                        )
+                    ).await()
                 }
             }
             Result.success(Unit)
@@ -173,7 +116,7 @@ class AppRepository(
         }
     }
 
-    suspend fun updateCurrentUserBranch(branchName: String): Result<WriteOutcome<Unit>> {
+    suspend fun updateCurrentUserBranch(branchName: String): Result<Unit> {
         val uid = auth.currentUser?.uid
             ?: return Result.failure(IllegalStateException("Usuario no autenticado."))
         val path = "users/$uid"
@@ -181,21 +124,16 @@ class AppRepository(
             require(branchName in BranchOptions.ALL_BRANCHES) {
                 "Selecciona una sucursal válida."
             }
-            val online = isOnlineCheck()
-            val synced = awaitWriteOfflineAware(
-                task = db.collection("users").document(uid)
-                    .update(
-                        mapOf(
-                            "branchName" to branchName,
-                            "displayName" to branchName,
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                    ),
-                isOnline = online,
-                operationType = OperationType.UPDATE,
-                path = path
-            )
-            Result.success(WriteOutcome(Unit, synced))
+            db.collection("users").document(uid)
+                .update(
+                    mapOf(
+                        "branchName" to branchName,
+                        "displayName" to branchName,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                )
+                .await()
+            Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -246,7 +184,7 @@ class AppRepository(
             }
     }
 
-    suspend fun setUserRole(targetUser: UserProfile, makeAdmin: Boolean): Result<WriteOutcome<Unit>> {
+    suspend fun setUserRole(targetUser: UserProfile, makeAdmin: Boolean): Result<Unit> {
         val path = "users/${targetUser.userId}"
         return try {
             val adminUid = requireUserId()
@@ -279,13 +217,8 @@ class AppRepository(
             } else {
                 batch.delete(adminRef)
             }
-            val synced = awaitWriteOfflineAware(
-                task = batch.commit(),
-                isOnline = isOnlineCheck(),
-                operationType = OperationType.UPDATE,
-                path = path
-            )
-            Result.success(WriteOutcome(Unit, synced))
+            batch.commit().await()
+            Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -294,20 +227,16 @@ class AppRepository(
         }
     }
 
-    fun observeTasksWithSync(uid: String, isAdmin: Boolean): Flow<SnapshotSyncResult<AssignedTask>> {
+    fun observeTasks(uid: String, isAdmin: Boolean): Flow<List<AssignedTask>> {
         val path = "tasks"
         val query = if (isAdmin) {
             db.collection(path)
         } else {
             db.collection(path).whereEqualTo("assigneeId", uid)
         }
-        return query.snapshots(MetadataChanges.INCLUDE)
+        return query.snapshots()
             .map { snapshot ->
-                val pendingIds = snapshot.documents
-                    .filter { it.metadata.hasPendingWrites() }
-                    .map { it.id }
-                    .toSet()
-                val sorted = snapshot
+                snapshot
                     .toObjects(AssignedTask::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
                     .sortedWith(
                         compareBy<AssignedTask> { it.parsedStatus == TaskStatus.COMPLETED }
@@ -315,7 +244,6 @@ class AppRepository(
                             .thenByDescending { it.parsedPriority == TaskPriority.URGENT }
                             .thenByDescending { it.createdAt ?: Timestamp(0, 0) }
                     )
-                SnapshotSyncResult(items = sorted, pendingWriteIds = pendingIds)
             }
             .catch { error ->
                 handleFlowError(error, OperationType.LIST, path, uid)
@@ -332,7 +260,7 @@ class AppRepository(
         dueDate: String,
         dueTime: String? = null,
         deadlineLabel: String? = null
-    ): Result<WriteOutcome<Int>> {
+    ): Result<Int> {
         val path = "tasks"
         return try {
             val adminUid = requireUserId()
@@ -381,13 +309,8 @@ class AppRepository(
                     )
                 }
             }
-            val synced = awaitWriteOfflineAware(
-                task = batch.commit(),
-                isOnline = isOnlineCheck(),
-                operationType = OperationType.CREATE,
-                path = path
-            )
-            Result.success(WriteOutcome(assignees.size, synced))
+            batch.commit().await()
+            Result.success(assignees.size)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -396,14 +319,14 @@ class AppRepository(
         }
     }
 
-    suspend fun seedDailyChecklistForUser(targetUser: UserProfile): Result<WriteOutcome<Int>> {
+    suspend fun seedDailyChecklistForUser(targetUser: UserProfile): Result<Int> {
         return syncScheduledTasksForAssignee(
             assigneeId = targetUser.userId,
             assigneeName = targetUser.effectiveBranchLabel
         )
     }
 
-    suspend fun syncScheduledTasksForCurrentUser(branchLabel: String): Result<WriteOutcome<Int>> {
+    suspend fun syncScheduledTasksForCurrentUser(branchLabel: String): Result<Int> {
         val uid = auth.currentUser?.uid
             ?: return Result.failure(IllegalStateException("Usuario no autenticado."))
         return syncScheduledTasksForAssignee(
@@ -415,15 +338,16 @@ class AppRepository(
     private suspend fun syncScheduledTasksForAssignee(
         assigneeId: String,
         assigneeName: String
-    ): Result<WriteOutcome<Int>> {
+    ): Result<Int> {
         return try {
             val actorUid = requireUserId()
             val today = DateAndFormatters.todayIso()
             val expected = ScheduledTasksCatalog.tasksToEnsureOnDate(today)
 
-            val existingIds = getQueryOfflineAware(
-                db.collection("tasks").whereEqualTo("assigneeId", assigneeId)
-            )
+            val existingIds = db.collection("tasks")
+                .whereEqualTo("assigneeId", assigneeId)
+                .get()
+                .await()
                 .documents
                 .map { it.id }
                 .toSet()
@@ -435,7 +359,7 @@ class AppRepository(
             }
 
             if (missing.isEmpty()) {
-                return Result.success(WriteOutcome(0, true))
+                return Result.success(0)
             }
 
             val batch = db.batch()
@@ -462,13 +386,8 @@ class AppRepository(
                     )
                 )
             }
-            val synced = awaitWriteOfflineAware(
-                task = batch.commit(),
-                isOnline = isOnlineCheck(),
-                operationType = OperationType.CREATE,
-                path = "tasks"
-            )
-            Result.success(WriteOutcome(missing.size, synced))
+            batch.commit().await()
+            Result.success(missing.size)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -481,7 +400,7 @@ class AppRepository(
         task: AssignedTask,
         uploaderName: String,
         imageBase64: String
-    ): Result<WriteOutcome<Unit>> {
+    ): Result<Unit> {
         val docPath = "tasks/${task.id}"
         return try {
             val uid = requireUserId()
@@ -516,13 +435,8 @@ class AppRepository(
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
             )
-            val synced = awaitWriteOfflineAware(
-                task = batch.commit(),
-                isOnline = isOnlineCheck(),
-                operationType = OperationType.UPDATE,
-                path = docPath
-            )
-            Result.success(WriteOutcome(Unit, synced))
+            batch.commit().await()
+            Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -567,18 +481,14 @@ class AppRepository(
         return try {
             requireUserId()
             require(notificationId.isNotBlank())
-            awaitWriteOfflineAware(
-                task = db.collection("notifications").document(notificationId)
-                    .update(
-                        mapOf(
-                            "acknowledged" to true,
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                    ),
-                isOnline = isOnlineCheck(),
-                operationType = OperationType.UPDATE,
-                path = path
-            )
+            db.collection("notifications").document(notificationId)
+                .update(
+                    mapOf(
+                        "acknowledged" to true,
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                )
+                .await()
             Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
@@ -613,7 +523,7 @@ class AppRepository(
         targetNewCustomers: Long,
         targetAppMaOperations: Long,
         targetNewCustomerRequests: Long
-    ): Result<WriteOutcome<Unit>> {
+    ): Result<Unit> {
         val path = "biweekly_quotas"
         return try {
             val adminUid = requireUserId()
@@ -622,9 +532,10 @@ class AppRepository(
             require(targetGlobalSales > 0.0) { "La meta de venta global debe ser mayor a 0." }
             require(totalDays in 1L..31L) { "La duración debe estar entre 1 y 31 días." }
 
-            val existingActive = getQueryOfflineAware(
-                db.collection(path).whereEqualTo("active", true)
-            )
+            val existingActive = db.collection(path)
+                .whereEqualTo("active", true)
+                .get()
+                .await()
 
             val batch = db.batch()
             existingActive.documents.forEach { doc ->
@@ -656,13 +567,8 @@ class AppRepository(
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
             )
-            val synced = awaitWriteOfflineAware(
-                task = batch.commit(),
-                isOnline = isOnlineCheck(),
-                operationType = OperationType.WRITE,
-                path = path
-            )
-            Result.success(WriteOutcome(Unit, synced))
+            batch.commit().await()
+            Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -674,38 +580,32 @@ class AppRepository(
     suspend fun ensureDefaultQuotaForAdminIfMissing(): Result<Unit> {
         val path = "biweekly_quotas"
         return try {
-            if (!isOnlineCheck()) {
-                return Result.success(Unit)
-            }
             val adminUid = requireUserId()
-            val activeSnap = getQueryOfflineAware(
-                db.collection(path).whereEqualTo("active", true).limit(1)
-            )
+            val activeSnap = db.collection(path)
+                .whereEqualTo("active", true)
+                .limit(1)
+                .get()
+                .await()
             if (activeSnap.isEmpty) {
                 val (startDate, endDate) = DateAndFormatters.defaultBiweeklyRange()
                 val days = DateAndFormatters.daysBetweenInclusive(startDate, endDate).toLong().coerceIn(1L, 31L)
-                awaitWriteOfflineAware(
-                    task = db.collection(path).document().set(
-                        mapOf(
-                            "title" to DateAndFormatters.defaultBiweeklyTitle(),
-                            "startDate" to startDate,
-                            "endDate" to endDate,
-                            "totalDays" to days,
-                            "targetGlobalSales" to 250_000.0,
-                            "targetCreditSales" to 150_000.0,
-                            "targetNewCustomers" to 45L,
-                            "targetAppMaOperations" to 60L,
-                            "targetNewCustomerRequests" to 75L,
-                            "active" to true,
-                            "createdBy" to adminUid,
-                            "createdAt" to FieldValue.serverTimestamp(),
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
-                    ),
-                    isOnline = true,
-                    operationType = OperationType.CREATE,
-                    path = path
-                )
+                db.collection(path).document().set(
+                    mapOf(
+                        "title" to DateAndFormatters.defaultBiweeklyTitle(),
+                        "startDate" to startDate,
+                        "endDate" to endDate,
+                        "totalDays" to days,
+                        "targetGlobalSales" to 250_000.0,
+                        "targetCreditSales" to 150_000.0,
+                        "targetNewCustomers" to 45L,
+                        "targetAppMaOperations" to 60L,
+                        "targetNewCustomerRequests" to 75L,
+                        "active" to true,
+                        "createdBy" to adminUid,
+                        "createdAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                ).await()
             }
             Result.success(Unit)
         } catch (e: CancellationException) {
@@ -716,23 +616,18 @@ class AppRepository(
         }
     }
 
-    fun observeSalesEntriesWithSync(uid: String, isAdmin: Boolean): Flow<SnapshotSyncResult<DailySalesEntry>> {
+    fun observeSalesEntries(uid: String, isAdmin: Boolean): Flow<List<DailySalesEntry>> {
         val path = "sales_entries"
         val query = if (isAdmin) {
             db.collection(path)
         } else {
             db.collection(path).whereEqualTo("userId", uid)
         }
-        return query.snapshots(MetadataChanges.INCLUDE)
+        return query.snapshots()
             .map { snapshot ->
-                val pendingIds = snapshot.documents
-                    .filter { it.metadata.hasPendingWrites() }
-                    .map { it.id }
-                    .toSet()
-                val sorted = snapshot
+                snapshot
                     .toObjects(DailySalesEntry::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
                     .sortedByDescending { it.dateString }
-                SnapshotSyncResult(items = sorted, pendingWriteIds = pendingIds)
             }
             .catch { error ->
                 handleFlowError(error, OperationType.LIST, path, uid)
@@ -750,10 +645,8 @@ class AppRepository(
         appMaOperations: Long,
         newCustomerRequests: Long,
         notes: String,
-        attachmentName: String? = null,
-        attachmentMimeType: String? = null,
-        attachmentBase64: String? = null
-    ): Result<WriteOutcome<Unit>> {
+        attachmentDraft: ClosingAttachmentDraft = ClosingAttachmentDraft.Unchanged
+    ): Result<Unit> {
         val uid = auth.currentUser?.uid
             ?: return Result.failure(IllegalStateException("Usuario no autenticado."))
         val docId = "${quotaId}_${dateString}_${uid}"
@@ -764,21 +657,33 @@ class AppRepository(
             require(newCustomers >= 0L && appMaOperations >= 0L && newCustomerRequests >= 0L) {
                 "Las unidades deben ser mayores o iguales a 0."
             }
-            if (attachmentBase64 != null) {
-                require(attachmentBase64.length in 50..700_000) {
+
+            if (attachmentDraft is ClosingAttachmentDraft.Selected) {
+                val att = attachmentDraft.attachment
+                require(att.base64Chunks.size in 1..8) {
+                    "El archivo o foto adjunta excede el tamaño máximo de 3.5 MB."
+                }
+                require(att.base64Chunks.all { it.isNotEmpty() && it.length <= 700_000 }) {
                     "El archivo o foto adjunta excede el tamaño permitido."
                 }
             }
 
             val docRef = db.collection("sales_entries").document(docId)
-            val existing = getDocumentOfflineAware(docRef)
+            val existing = docRef.get().await()
             val cleanNotes = notes.trim().take(300)
-            val cleanAttName = attachmentName?.trim()?.takeIf { it.isNotEmpty() }?.take(120)
-            val cleanAttMime = attachmentMimeType?.trim()?.takeIf { it.isNotEmpty() }?.take(100)
-            val cleanAttBase64 = attachmentBase64?.takeIf { it.isNotBlank() }
 
-            val online = isOnlineCheck()
-            val writeTask = if (existing == null || !existing.exists()) {
+            val existingChunksSnap = if (attachmentDraft != ClosingAttachmentDraft.Unchanged && existing.exists()) {
+                docRef.collection("attachment_chunks")
+                    .whereEqualTo("userId", uid)
+                    .get()
+                    .await()
+            } else {
+                null
+            }
+
+            val batch = db.batch()
+
+            if (!existing.exists()) {
                 val payload = buildMap<String, Any> {
                     put("userId", uid)
                     put("userName", userName.trim().ifBlank { "Usuario" }.take(80))
@@ -790,15 +695,22 @@ class AppRepository(
                     put("appMaOperations", appMaOperations)
                     put("newCustomerRequests", newCustomerRequests)
                     put("notes", cleanNotes)
-                    if (cleanAttName != null && cleanAttMime != null && cleanAttBase64 != null) {
+                    if (attachmentDraft is ClosingAttachmentDraft.Selected) {
+                        val att = attachmentDraft.attachment
+                        val cleanAttName = att.fileName.trim().ifBlank { "adjunto" }.take(120)
+                        val cleanAttMime = att.mimeType.trim().ifBlank { "application/octet-stream" }.take(100)
                         put("attachmentName", cleanAttName)
                         put("attachmentMimeType", cleanAttMime)
-                        put("attachmentBase64", cleanAttBase64)
+                        put("attachmentChunkCount", att.base64Chunks.size.toLong())
+                        put("attachmentSizeBytes", att.totalBytes.coerceIn(0, 3_500_000).toLong())
+                        if (!att.isChunked) {
+                            put("attachmentBase64", att.base64Chunks.first())
+                        }
                     }
                     put("createdAt", FieldValue.serverTimestamp())
                     put("updatedAt", FieldValue.serverTimestamp())
                 }
-                docRef.set(payload)
+                batch.set(docRef, payload)
             } else {
                 val updatePayload = buildMap<String, Any> {
                     put("globalSales", globalSales)
@@ -807,31 +719,111 @@ class AppRepository(
                     put("appMaOperations", appMaOperations)
                     put("newCustomerRequests", newCustomerRequests)
                     put("notes", cleanNotes)
-                    if (cleanAttName != null && cleanAttMime != null && cleanAttBase64 != null) {
-                        put("attachmentName", cleanAttName)
-                        put("attachmentMimeType", cleanAttMime)
-                        put("attachmentBase64", cleanAttBase64)
-                    } else {
-                        put("attachmentName", FieldValue.delete())
-                        put("attachmentMimeType", FieldValue.delete())
-                        put("attachmentBase64", FieldValue.delete())
+                    when (attachmentDraft) {
+                        ClosingAttachmentDraft.Unchanged -> Unit
+                        ClosingAttachmentDraft.Removed -> {
+                            put("attachmentName", FieldValue.delete())
+                            put("attachmentMimeType", FieldValue.delete())
+                            put("attachmentBase64", FieldValue.delete())
+                            put("attachmentChunkCount", FieldValue.delete())
+                            put("attachmentSizeBytes", FieldValue.delete())
+                        }
+                        is ClosingAttachmentDraft.Selected -> {
+                            val att = attachmentDraft.attachment
+                            val cleanAttName = att.fileName.trim().ifBlank { "adjunto" }.take(120)
+                            val cleanAttMime = att.mimeType.trim().ifBlank { "application/octet-stream" }.take(100)
+                            put("attachmentName", cleanAttName)
+                            put("attachmentMimeType", cleanAttMime)
+                            put("attachmentChunkCount", att.base64Chunks.size.toLong())
+                            put("attachmentSizeBytes", att.totalBytes.coerceIn(0, 3_500_000).toLong())
+                            if (!att.isChunked) {
+                                put("attachmentBase64", att.base64Chunks.first())
+                            } else {
+                                put("attachmentBase64", FieldValue.delete())
+                            }
+                        }
                     }
                     put("updatedAt", FieldValue.serverTimestamp())
                 }
-                docRef.update(updatePayload)
+                batch.update(docRef, updatePayload)
             }
 
-            val synced = awaitWriteOfflineAware(
-                task = writeTask,
-                isOnline = online,
-                operationType = OperationType.WRITE,
-                path = path
-            )
-            Result.success(WriteOutcome(Unit, synced))
+            when (attachmentDraft) {
+                ClosingAttachmentDraft.Unchanged -> Unit
+                ClosingAttachmentDraft.Removed -> {
+                    existingChunksSnap?.documents?.forEach { chunkDoc ->
+                        batch.delete(chunkDoc.reference)
+                    }
+                }
+                is ClosingAttachmentDraft.Selected -> {
+                    val att = attachmentDraft.attachment
+                    val newChunkIds = if (att.isChunked) {
+                        att.base64Chunks.indices.map { idx -> "chunk_$idx" }.toSet()
+                    } else {
+                        emptySet()
+                    }
+                    existingChunksSnap?.documents?.forEach { chunkDoc ->
+                        if (chunkDoc.id !in newChunkIds) {
+                            batch.delete(chunkDoc.reference)
+                        }
+                    }
+                    if (att.isChunked) {
+                        att.base64Chunks.forEachIndexed { idx, chunkBase64 ->
+                            val chunkRef = docRef.collection("attachment_chunks").document("chunk_$idx")
+                            batch.set(
+                                chunkRef,
+                                mapOf(
+                                    "userId" to uid,
+                                    "entryId" to docId,
+                                    "chunkIndex" to idx,
+                                    "dataBase64" to chunkBase64,
+                                    "createdAt" to FieldValue.serverTimestamp()
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+
+            batch.commit().await()
+
+            Result.success(Unit)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.WRITE, path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun loadSalesEntryAttachmentChunks(entry: DailySalesEntry): Result<List<String>> {
+        val inline = entry.attachmentBase64?.takeIf { it.isNotBlank() }
+        if (inline != null) {
+            return Result.success(listOf(inline))
+        }
+        if (entry.id.isBlank() || entry.attachmentChunkCount <= 0L) {
+            return Result.failure(IllegalStateException("El archivo adjunto no está disponible."))
+        }
+        val path = "sales_entries/${entry.id}/attachment_chunks"
+        return try {
+            requireUserId()
+            val snapshot = db.collection("sales_entries")
+                .document(entry.id)
+                .collection("attachment_chunks")
+                .whereEqualTo("userId", entry.userId)
+                .get()
+                .await()
+            val orderedChunks = snapshot.documents
+                .sortedBy { (it.get("chunkIndex") as? Number)?.toInt() ?: 0 }
+                .mapNotNull { it.getString("dataBase64")?.takeIf { b -> b.isNotBlank() } }
+            require(orderedChunks.isNotEmpty()) {
+                "No se encontraron fragmentos del archivo adjunto."
+            }
+            Result.success(orderedChunks)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.LIST, path)
             Result.failure(e)
         }
     }

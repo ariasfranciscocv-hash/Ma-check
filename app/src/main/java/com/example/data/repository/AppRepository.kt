@@ -35,6 +35,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
 
 private const val BOOTSTRAPPED_ADMIN_EMAIL = "arias.francisco.cv@gmail.com"
+private const val BOOTSTRAPPED_ADMIN_UID = "7aFXbgvVxbXXusy6vRWcnI1otSa2"
 
 class AppRepository(
     private val db: FirebaseFirestore
@@ -49,7 +50,10 @@ class AppRepository(
             ?: throw IllegalStateException("El usuario debe iniciar sesión con Google primero.")
 
     private fun isBootstrappedAdmin(email: String?, emailVerified: Boolean): Boolean =
-        email == BOOTSTRAPPED_ADMIN_EMAIL && emailVerified
+    auth.currentUser?.uid == BOOTSTRAPPED_ADMIN_UID ||
+    email.equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) ||
+    email.equals("pakow.arias@gmail.com", ignoreCase = true)
+    
 
     suspend fun syncCurrentUserProfile(
         uid: String,

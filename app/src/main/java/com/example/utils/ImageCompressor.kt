@@ -151,7 +151,7 @@ object ImageCompressor {
         val safeName = rawName.trim().ifBlank { "adjunto" }.take(120)
         val effectiveMime = inferMimeType(safeName, runCatching { resolver.getType(uri) }.getOrNull())
 
-                val treatAsImage = isLikelyImage(safeName, effectiveMime) || probeImageBounds(resolver, uri)
+                        val treatAsImage = isLikelyImage(safeName, effectiveMime) || probeImageBounds(resolver, uri)
 
         if (treatAsImage) {
             val base64 = compressUriToBase64(context, uri).getOrThrow()

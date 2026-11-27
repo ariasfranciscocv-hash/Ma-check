@@ -271,7 +271,6 @@ object ImageCompressor {
         if (transformedBitmap !== rawBitmap) {
             transformedBitmap.recycle()
         }
-        rawBitmap.recycle()
 
         require(encoded.isNotEmpty() && encoded.length <= MAX_BASE64_CHARS) {
             "La fotografía excede el tamaño permitido para evidencia."

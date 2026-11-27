@@ -297,6 +297,7 @@ private fun AuthenticatedApp(
     val chartSeries by viewModel.selectedChartSeries.collectAsStateWithLifecycle()
     val showDailyBriefing by viewModel.showFirstEntryBriefingToday.collectAsStateWithLifecycle()
     val tasksState by viewModel.tasksState.collectAsStateWithLifecycle()
+    val dailyTaskTemplates by viewModel.dailyTaskTemplatesState.collectAsStateWithLifecycle()
     val scheduleNowMillis by viewModel.scheduleTickerState.collectAsStateWithLifecycle()
     val activeQuotaState by viewModel.activeQuotaState.collectAsStateWithLifecycle()
     val activeQuota = (activeQuotaState as? UiState.Success)?.data
@@ -708,12 +709,35 @@ private fun AuthenticatedApp(
                         isBusy = isBusy,
                         nowMillis = scheduleNowMillis,
                         tasksState = tasksState,
+                        dailyTaskTemplates = dailyTaskTemplates,
                         evidencesState = evidencesState,
                         teamUsers = teamUsers,
                         currentUserProfile = userProfile,
                         activeQuota = activeQuota,
                         onCreateTask = { assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess ->
                             viewModel.createTask(assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess)
+                        },
+                        onSaveDailyTaskTemplate = { existingId, title, desc, priority, daysOfWeek, targetBranches, dueTime, deadlineLabel, dueDayOffset, onSuccess ->
+                            viewModel.saveDailyTaskTemplate(
+                                existingTemplateId = existingId,
+                                title = title,
+                                description = desc,
+                                priority = priority,
+                                daysOfWeek = daysOfWeek,
+                                targetBranches = targetBranches,
+                                dueTime = dueTime,
+                                deadlineLabel = deadlineLabel,
+                                dueDayOffset = dueDayOffset,
+                                onSuccess = onSuccess
+                            )
+                        },
+                        onDeleteDailyTaskTemplate = { template, task, removeBranchOnly, onSuccess ->
+                            viewModel.deleteDailyTaskTemplatePermanently(
+                                template = template,
+                                task = task,
+                                removeBranchOnly = removeBranchOnly,
+                                onSuccess = onSuccess
+                            )
                         },
                         onCompleteTaskWithEvidenceFiles = { task, files, onSuccess ->
                             viewModel.completeTaskWithEvidenceFiles(task, files, onSuccess)

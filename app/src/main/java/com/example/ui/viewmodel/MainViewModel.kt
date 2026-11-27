@@ -11,6 +11,7 @@ import com.example.data.model.BranchSalesSummary
 import com.example.data.model.ChartSeries
 import com.example.data.model.ClosingAttachmentDraft
 import com.example.data.model.DailySalesEntry
+import com.example.data.model.DailyTaskTemplate
 import com.example.data.model.MetricProgress
 import com.example.data.model.ProjectionPace
 import com.example.data.model.SalesMetricType
@@ -179,6 +180,18 @@ class MainViewModel(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
             initialValue = UiState.Loading
+        )
+
+    val dailyTaskTemplatesState: StateFlow<List<DailyTaskTemplate>> = repository
+        .observeDailyTaskTemplates(currentUserId)
+        .catch { error ->
+            unwrapFirestoreOrThrow(error, "observeDailyTaskTemplates")
+            emit(emptyList())
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+            initialValue = emptyList()
         )
 
     val evidencesState: StateFlow<UiState<List<TaskEvidence>>> = isAdminState
@@ -427,13 +440,24 @@ class MainViewModel(
             isAdminState.collect { isAdmin ->
                 if (isAdmin) {
                     repository.ensureDefaultQuotaForAdminIfMissing()
+                    repository.ensureDefaultDailyTemplatesIfEmpty()
                 }
             }
         }
         viewModelScope.launch(safeExceptionHandler) {
-            combine(isRoleResolved, isAdminState, currentUserProfile) { resolved, isAdmin, profile ->
-                Triple(resolved, isAdmin, profile)
-            }.collect { (resolved, isAdmin, profile) ->
+            combine(
+                isRoleResolved,
+                isAdminState,
+                currentUserProfile,
+                dailyTaskTemplatesState
+            ) { resolved, isAdmin, profile, templates ->
+                listOf(resolved, isAdmin, profile, templates)
+            }.collect { values ->
+                val resolved = values[0] as Boolean
+                val isAdmin = values[1] as Boolean
+                val profile = values[2] as UserProfile?
+                @Suppress("UNCHECKED_CAST")
+                val templates = values[3] as List<DailyTaskTemplate>
                 if (!resolved) return@collect
                 if (isAdmin || bootstrappedAdmin || profile?.parsedRole == UserRole.ADMIN) {
                     if (_selectedBranch.value.isBlank()) {
@@ -447,7 +471,8 @@ class MainViewModel(
                         _selectedBranch.value = branch
                     }
                     preferences.saveLastBranch(currentUserId, branch)
-                    syncScheduledChecklistIfNeeded(branch)
+                    val templateSignature = templates.joinToString("|") { "${it.id}:${it.daysOfWeek.joinToString(",")}:${it.targetBranches.joinToString(",")}" }
+                    syncScheduledChecklistIfNeeded(branch, templateSignature)
                     syncDailyClosingResetIfNeeded(branch)
                 }
             }
@@ -466,23 +491,23 @@ class MainViewModel(
         val branch = currentUserProfile.value?.branchName?.takeIf { it.isNotBlank() }
             ?: _selectedBranch.value.takeIf { it in BranchOptions.ALL_BRANCHES }
             ?: return
-        syncScheduledChecklistIfNeeded(branch)
+        syncScheduledChecklistIfNeeded(branch, forceRefresh = true)
         syncDailyClosingResetIfNeeded(branch, nowMillis)
     }
 
-    private fun syncScheduledChecklistIfNeeded(branchLabel: String) {
+    private fun syncScheduledChecklistIfNeeded(
+        branchLabel: String,
+        templateSignature: String = "",
+        forceRefresh: Boolean = false
+    ) {
         if (isAdminState.value || bootstrappedAdmin || currentUserProfile.value?.parsedRole == UserRole.ADMIN) {
             return
         }
         val today = DateAndFormatters.todayIso()
-        val todayKey = "${today}_$currentUserId"
-        if (lastAutoSyncedDayKey == todayKey) return
-        lastAutoSyncedDayKey = todayKey
+        val syncKey = "${today}_${currentUserId}_${branchLabel}_$templateSignature"
+        if (!forceRefresh && lastAutoSyncedDayKey == syncKey) return
+        lastAutoSyncedDayKey = syncKey
         viewModelScope.launch(safeExceptionHandler) {
-            val alreadySyncedDate = preferences.getLastScheduledSyncDate(currentUserId)
-            if (alreadySyncedDate == today) {
-                return@launch
-            }
             val result = repository.syncScheduledTasksForCurrentUser(branchLabel)
             if (result.isSuccess) {
                 preferences.markScheduledSyncDoneToday(currentUserId, today)
@@ -791,6 +816,79 @@ class MainViewModel(
         }
     }
 
+    fun saveDailyTaskTemplate(
+        existingTemplateId: String? = null,
+        title: String,
+        description: String,
+        priority: TaskPriority,
+        daysOfWeek: List<String>,
+        targetBranches: List<String>,
+        dueTime: String? = "23:59",
+        deadlineLabel: String? = null,
+        dueDayOffset: Long = 0L,
+        onSuccess: () -> Unit
+    ) {
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val result = repository.saveDailyTaskTemplate(
+                existingTemplateId = existingTemplateId,
+                title = title,
+                description = description,
+                priority = priority,
+                daysOfWeek = daysOfWeek,
+                targetBranches = targetBranches,
+                dueTime = dueTime,
+                deadlineLabel = deadlineLabel,
+                dueDayOffset = dueDayOffset,
+                syncTodayInstances = true
+            )
+            _isBusy.value = false
+            result.fold(
+                onSuccess = { saved ->
+                    _actionMessage.value = if (existingTemplateId.isNullOrBlank()) {
+                        "Plantilla diaria \"${saved.title}\" creada y programada (${saved.formatDaysSummaryEs()})."
+                    } else {
+                        "Plantilla diaria \"${saved.title}\" actualizada definitivamente."
+                    }
+                    onSuccess()
+                },
+                onFailure = { err ->
+                    _actionMessage.value = err.localizedMessage ?: "No se pudo guardar la plantilla diaria."
+                }
+            )
+        }
+    }
+
+    fun deleteDailyTaskTemplatePermanently(
+        template: DailyTaskTemplate? = null,
+        task: AssignedTask? = null,
+        removeBranchOnly: Boolean = false,
+        onSuccess: () -> Unit
+    ) {
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val result = repository.deleteDailyTaskTemplatePermanently(
+                template = template,
+                task = task,
+                removeBranchOnly = removeBranchOnly
+            )
+            _isBusy.value = false
+            result.fold(
+                onSuccess = { count ->
+                    _actionMessage.value = if (removeBranchOnly) {
+                        "Tarea diaria quitada de ${task?.assigneeName ?: "la sucursal"}."
+                    } else {
+                        "Plantilla diaria eliminada definitivamente ($count instancia(s) de hoy quitadas)."
+                    }
+                    onSuccess()
+                },
+                onFailure = { err ->
+                    _actionMessage.value = err.localizedMessage ?: "No se pudo eliminar la plantilla diaria."
+                }
+            )
+        }
+    }
+
     fun updateDailyTask(
         task: AssignedTask,
         title: String,
@@ -834,27 +932,12 @@ class MainViewModel(
         deleteAllBranchesSameDay: Boolean,
         onSuccess: () -> Unit
     ) {
-        viewModelScope.launch(safeExceptionHandler) {
-            _isBusy.value = true
-            val result = repository.deleteDailyTask(
-                task = task,
-                deleteAllBranchesSameDay = deleteAllBranchesSameDay
-            )
-            _isBusy.value = false
-            result.fold(
-                onSuccess = { count ->
-                    _actionMessage.value = if (deleteAllBranchesSameDay) {
-                        "Tarea diaria eliminada en $count sucursal(es)."
-                    } else {
-                        "Tarea diaria eliminada."
-                    }
-                    onSuccess()
-                },
-                onFailure = { err ->
-                    _actionMessage.value = err.localizedMessage ?: "No se pudo eliminar la tarea diaria."
-                }
-            )
-        }
+        deleteDailyTaskTemplatePermanently(
+            template = null,
+            task = task,
+            removeBranchOnly = !deleteAllBranchesSameDay,
+            onSuccess = onSuccess
+        )
     }
 
     fun toggleUserAdminRole(targetUser: UserProfile, makeAdmin: Boolean) {

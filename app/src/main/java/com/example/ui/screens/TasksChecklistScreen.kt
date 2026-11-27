@@ -12,6 +12,8 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -38,6 +40,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.EventRepeat
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
@@ -88,7 +91,9 @@ import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.model.AssignedTask
 import com.example.data.model.BiweeklyQuota
+import com.example.data.model.BranchOptions
 import com.example.data.model.BranchTaskSummary
+import com.example.data.model.DailyTaskTemplate
 import com.example.data.model.DayTaskGroup
 import com.example.data.model.TaskEvidence
 import com.example.data.model.TaskEvidenceAttachmentFile
@@ -98,8 +103,10 @@ import com.example.data.model.TaskType
 import com.example.data.model.UiState
 import com.example.data.model.UserProfile
 import com.example.data.model.UserRole
+import com.example.data.model.WeekdayOption
 import com.example.data.model.buildBranchTaskSummaries
 import com.example.data.model.buildDayTaskGroups
+import com.example.data.repository.ScheduledTasksCatalog
 import com.example.ui.theme.BrandNavy
 import com.example.ui.theme.BrandRed
 import com.example.ui.theme.BrandRedSoft
@@ -124,7 +131,8 @@ private enum class TaskFilter(val label: String) {
 
 private enum class AdminTaskViewMode(val label: String) {
     BY_BRANCH("Por Sucursal"),
-    DETAILED_LIST("Lista Detallada")
+    DETAILED_LIST("Lista Detallada"),
+    TEMPLATES("Plantillas")
 }
 
 @Composable
@@ -133,6 +141,7 @@ fun TasksChecklistScreen(
     isBusy: Boolean,
     nowMillis: Long,
     tasksState: UiState<List<AssignedTask>>,
+    dailyTaskTemplates: List<DailyTaskTemplate> = emptyList(),
     evidencesState: UiState<List<TaskEvidence>>,
     teamUsers: List<UserProfile>,
     currentUserProfile: UserProfile?,
@@ -148,6 +157,24 @@ fun TasksChecklistScreen(
         deadlineLabel: String?,
         onSuccess: () -> Unit
     ) -> Unit,
+    onSaveDailyTaskTemplate: (
+        existingTemplateId: String?,
+        title: String,
+        description: String,
+        priority: TaskPriority,
+        daysOfWeek: List<String>,
+        targetBranches: List<String>,
+        dueTime: String?,
+        deadlineLabel: String?,
+        dueDayOffset: Long,
+        onSuccess: () -> Unit
+    ) -> Unit = { _, _, _, _, _, _, _, _, _, onSuccess -> onSuccess() },
+    onDeleteDailyTaskTemplate: (
+        template: DailyTaskTemplate?,
+        task: AssignedTask?,
+        removeBranchOnly: Boolean,
+        onSuccess: () -> Unit
+    ) -> Unit = { _, _, _, onSuccess -> onSuccess() },
     onCompleteTaskWithEvidenceFiles: (
         task: AssignedTask,
         files: List<EncodedAttachment>,
@@ -175,9 +202,12 @@ fun TasksChecklistScreen(
     var selectedFilter by remember { mutableStateOf(TaskFilter.ALL) }
     var taskToDocumentId by rememberSaveable { mutableStateOf<String?>(null) }
     var showCreateTaskDialog by remember { mutableStateOf(false) }
+    var createDialogInitialType by remember { mutableStateOf(TaskType.EXTRAORDINARY) }
     var evidencePreviewForAdmin by remember { mutableStateOf<TaskEvidence?>(null) }
     var dailyTaskToEdit by remember { mutableStateOf<AssignedTask?>(null) }
     var dailyTaskToDelete by remember { mutableStateOf<AssignedTask?>(null) }
+    var templateToEdit by remember { mutableStateOf<DailyTaskTemplate?>(null) }
+    var templateToDelete by remember { mutableStateOf<DailyTaskTemplate?>(null) }
     val expandedDayState = remember { mutableStateMapOf<String, Boolean>() }
 
     val taskToDocument = remember(taskToDocumentId, tasksState) {
@@ -196,12 +226,19 @@ fun TasksChecklistScreen(
         floatingActionButton = {
             if (isAdmin) {
                 FloatingActionButton(
-                    onClick = { showCreateTaskDialog = true },
+                    onClick = {
+                        createDialogInitialType = if (adminViewMode == AdminTaskViewMode.TEMPLATES) {
+                            TaskType.DAILY
+                        } else {
+                            TaskType.EXTRAORDINARY
+                        }
+                        showCreateTaskDialog = true
+                    },
                     containerColor = BrandRed,
                     contentColor = Color.White,
                     modifier = Modifier.testTag("create_task_fab")
                 ) {
-                    Icon(Icons.Filled.Add, contentDescription = "Crear nueva tarea extraordinaria")
+                    Icon(Icons.Filled.Add, contentDescription = "Crear nueva tarea o plantilla")
                 }
             }
         }
@@ -215,6 +252,7 @@ fun TasksChecklistScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
                         .padding(horizontal = 16.dp, vertical = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -222,7 +260,14 @@ fun TasksChecklistScreen(
                         FilterChip(
                             selected = adminViewMode == mode,
                             onClick = { adminViewMode = mode },
-                            label = { Text(mode.label, style = MaterialTheme.typography.labelMedium) },
+                            label = {
+                                val text = if (mode == AdminTaskViewMode.TEMPLATES && dailyTaskTemplates.isNotEmpty()) {
+                                    "${mode.label} (${dailyTaskTemplates.size})"
+                                } else {
+                                    mode.label
+                                }
+                                Text(text, style = MaterialTheme.typography.labelMedium)
+                            },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
                                 selectedLabelColor = BrandNavy
@@ -255,89 +300,107 @@ fun TasksChecklistScreen(
                 }
             }
 
-            when (tasksState) {
-                is UiState.Loading -> {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator(color = BrandNavy)
-                    }
-                }
-
-                is UiState.Error -> {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(24.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = tasksState.message,
-                            color = BrandRed,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-                }
-
-                is UiState.Success -> {
-                    if (isAdmin && adminViewMode == AdminTaskViewMode.BY_BRANCH) {
-                        val summaries = remember(teamUsers, tasksState.data) {
-                            buildBranchTaskSummaries(teamUsers, tasksState.data)
+            if (isAdmin && adminViewMode == AdminTaskViewMode.TEMPLATES) {
+                AdminDailyTemplatesView(
+                    templates = dailyTaskTemplates,
+                    onCreateTemplate = {
+                        createDialogInitialType = TaskType.DAILY
+                        showCreateTaskDialog = true
+                    },
+                    onEditTemplate = { tpl -> templateToEdit = tpl },
+                    onDeleteTemplate = { tpl -> templateToDelete = tpl }
+                )
+            } else {
+                when (tasksState) {
+                    is UiState.Loading -> {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(color = BrandNavy)
                         }
-                        AdminBranchesChecklistView(
-                            summaries = summaries,
-                            teamUsers = teamUsers,
-                            activeQuota = activeQuota,
-                            isBusy = isBusy,
-                            nowMillis = nowMillis,
-                            evidencesMap = evidencesMap,
-                            onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev },
-                            onConfirmBranchResetForQuota = onConfirmBranchResetForQuota,
-                            onEditDailyTask = { task -> dailyTaskToEdit = task },
-                            onDeleteDailyTask = { task -> dailyTaskToDelete = task }
-                        )
-                    } else {
-                        val filtered = remember(tasksState.data, selectedFilter) {
-                            when (selectedFilter) {
-                                TaskFilter.ALL -> tasksState.data
-                                TaskFilter.PENDING -> tasksState.data.filter { it.parsedStatus == TaskStatus.PENDING }
-                                TaskFilter.EXTRAORDINARY -> tasksState.data.filter { it.parsedType == TaskType.EXTRAORDINARY }
-                                TaskFilter.COMPLETED -> tasksState.data.filter { it.parsedStatus == TaskStatus.COMPLETED }
+                    }
+
+                    is UiState.Error -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(24.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = tasksState.message,
+                                color = BrandRed,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
+
+                    is UiState.Success -> {
+                        if (isAdmin && adminViewMode == AdminTaskViewMode.BY_BRANCH) {
+                            val summaries = remember(teamUsers, tasksState.data) {
+                                buildBranchTaskSummaries(teamUsers, tasksState.data)
                             }
-                        }
-
-                        if (filtered.isEmpty()) {
-                            EmptyTasksState(isAdmin = isAdmin, onCreateTask = { showCreateTaskDialog = true })
+                            AdminBranchesChecklistView(
+                                summaries = summaries,
+                                teamUsers = teamUsers,
+                                activeQuota = activeQuota,
+                                isBusy = isBusy,
+                                nowMillis = nowMillis,
+                                evidencesMap = evidencesMap,
+                                onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev },
+                                onConfirmBranchResetForQuota = onConfirmBranchResetForQuota,
+                                onEditDailyTask = { task -> dailyTaskToEdit = task },
+                                onDeleteDailyTask = { task -> dailyTaskToDelete = task }
+                            )
                         } else {
-                            val dayGroups = remember(filtered) { buildDayTaskGroups(filtered) }
+                            val filtered = remember(tasksState.data, selectedFilter) {
+                                when (selectedFilter) {
+                                    TaskFilter.ALL -> tasksState.data
+                                    TaskFilter.PENDING -> tasksState.data.filter { it.parsedStatus == TaskStatus.PENDING }
+                                    TaskFilter.EXTRAORDINARY -> tasksState.data.filter { it.parsedType == TaskType.EXTRAORDINARY }
+                                    TaskFilter.COMPLETED -> tasksState.data.filter { it.parsedStatus == TaskStatus.COMPLETED }
+                                }
+                            }
 
-                            LazyColumn(
-                                modifier = Modifier.fillMaxSize(),
-                                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 88.dp),
-                                verticalArrangement = Arrangement.spacedBy(12.dp)
-                            ) {
-                                items(dayGroups, key = { it.dateIso }) { group ->
-                                    val isExpanded = expandedDayState[group.dateIso] ?: group.isToday
-                                    DayTaskGroupCard(
-                                        group = group,
-                                        isExpanded = isExpanded,
-                                        onToggleExpand = {
-                                            expandedDayState[group.dateIso] = !isExpanded
-                                        }
-                                    ) {
-                                        group.tasks.forEach { task ->
-                                            TaskCardItem(
-                                                task = task,
-                                                nowMillis = nowMillis,
-                                                isAdmin = isAdmin,
-                                                linkedEvidence = if (isAdmin) evidencesMap[task.id] else null,
-                                                onDocumentClick = {
-                                                    if (task.parsedStatus == TaskStatus.PENDING) {
-                                                        taskToDocumentId = task.id
-                                                    }
-                                                },
-                                                onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev },
-                                                onEditDailyTask = { dailyTaskToEdit = task },
-                                                onDeleteDailyTask = { dailyTaskToDelete = task }
-                                            )
+                            if (filtered.isEmpty()) {
+                                EmptyTasksState(
+                                    isAdmin = isAdmin,
+                                    onCreateTask = {
+                                        createDialogInitialType = TaskType.EXTRAORDINARY
+                                        showCreateTaskDialog = true
+                                    }
+                                )
+                            } else {
+                                val dayGroups = remember(filtered) { buildDayTaskGroups(filtered) }
+
+                                LazyColumn(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 88.dp),
+                                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    items(dayGroups, key = { it.dateIso }) { group ->
+                                        val isExpanded = expandedDayState[group.dateIso] ?: group.isToday
+                                        DayTaskGroupCard(
+                                            group = group,
+                                            isExpanded = isExpanded,
+                                            onToggleExpand = {
+                                                expandedDayState[group.dateIso] = !isExpanded
+                                            }
+                                        ) {
+                                            group.tasks.forEach { task ->
+                                                TaskCardItem(
+                                                    task = task,
+                                                    nowMillis = nowMillis,
+                                                    isAdmin = isAdmin,
+                                                    linkedEvidence = if (isAdmin) evidencesMap[task.id] else null,
+                                                    onDocumentClick = {
+                                                        if (task.parsedStatus == TaskStatus.PENDING) {
+                                                            taskToDocumentId = task.id
+                                                        }
+                                                    },
+                                                    onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev },
+                                                    onEditDailyTask = { dailyTaskToEdit = task },
+                                                    onDeleteDailyTask = { dailyTaskToDelete = task }
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -368,10 +431,26 @@ fun TasksChecklistScreen(
         }
         CreateTaskDialog(
             teamUsers = availableUsers,
+            initialTaskType = createDialogInitialType,
             isBusy = isBusy,
             onDismiss = { showCreateTaskDialog = false },
-            onCreate = { assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel ->
-                onCreateTask(assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel) {
+            onCreateExtraordinary = { assignees, title, desc, priority, dueDate, dueTime, deadlineLabel ->
+                onCreateTask(assignees, title, desc, TaskType.EXTRAORDINARY, priority, dueDate, dueTime, deadlineLabel) {
+                    showCreateTaskDialog = false
+                }
+            },
+            onSaveDailyTemplate = { title, desc, priority, daysOfWeek, targetBranches, dueTime, deadlineLabel, dueDayOffset ->
+                onSaveDailyTaskTemplate(
+                    null,
+                    title,
+                    desc,
+                    priority,
+                    daysOfWeek,
+                    targetBranches,
+                    dueTime,
+                    deadlineLabel,
+                    dueDayOffset
+                ) {
                     showCreateTaskDialog = false
                 }
             }
@@ -388,33 +467,282 @@ fun TasksChecklistScreen(
         }
     }
 
-    dailyTaskToEdit?.let { task ->
-        if (isAdmin) {
-            EditDailyTaskDialog(
-                task = task,
-                isBusy = isBusy,
-                onDismiss = { if (!isBusy) dailyTaskToEdit = null },
-                onConfirmEdit = { title, desc, priority, dueTime, deadlineLabel, applyAllBranches ->
-                    onUpdateDailyTask(task, title, desc, priority, dueTime, deadlineLabel, applyAllBranches) {
-                        dailyTaskToEdit = null
-                    }
+    val editingTask = dailyTaskToEdit
+    val editingTemplate = templateToEdit
+    if (isAdmin && (editingTask != null || editingTemplate != null)) {
+        val linkedTemplate = editingTemplate ?: editingTask?.let { findTemplateForTask(it, dailyTaskTemplates) }
+        EditDailyTaskDialog(
+            task = editingTask,
+            template = linkedTemplate,
+            isBusy = isBusy,
+            onDismiss = {
+                if (!isBusy) {
+                    dailyTaskToEdit = null
+                    templateToEdit = null
                 }
-            )
-        }
+            },
+            onConfirmTemplateEdit = { existingTemplateId, title, desc, priority, daysOfWeek, targetBranches, dueTime, deadlineLabel, dueDayOffset ->
+                onSaveDailyTaskTemplate(
+                    existingTemplateId,
+                    title,
+                    desc,
+                    priority,
+                    daysOfWeek,
+                    targetBranches,
+                    dueTime,
+                    deadlineLabel,
+                    dueDayOffset
+                ) {
+                    dailyTaskToEdit = null
+                    templateToEdit = null
+                }
+            },
+            onConfirmSingleTaskEdit = { task, title, desc, priority, dueTime, deadlineLabel ->
+                onUpdateDailyTask(task, title, desc, priority, dueTime, deadlineLabel, false) {
+                    dailyTaskToEdit = null
+                    templateToEdit = null
+                }
+            }
+        )
     }
 
-    dailyTaskToDelete?.let { task ->
-        if (isAdmin) {
-            DeleteDailyTaskDialog(
-                task = task,
-                isBusy = isBusy,
-                onDismiss = { if (!isBusy) dailyTaskToDelete = null },
-                onConfirmDelete = { deleteAllBranches ->
-                    onDeleteDailyTask(task, deleteAllBranches) {
-                        dailyTaskToDelete = null
+    val deletingTask = dailyTaskToDelete
+    val deletingTemplate = templateToDelete
+    if (isAdmin && (deletingTask != null || deletingTemplate != null)) {
+        val linkedTemplate = deletingTemplate ?: deletingTask?.let { findTemplateForTask(it, dailyTaskTemplates) }
+        DeleteDailyTaskDialog(
+            task = deletingTask,
+            template = linkedTemplate,
+            isBusy = isBusy,
+            onDismiss = {
+                if (!isBusy) {
+                    dailyTaskToDelete = null
+                    templateToDelete = null
+                }
+            },
+            onConfirmDelete = { removeBranchOnly ->
+                onDeleteDailyTaskTemplate(linkedTemplate, deletingTask, removeBranchOnly) {
+                    dailyTaskToDelete = null
+                    templateToDelete = null
+                }
+            }
+        )
+    }
+}
+
+private fun findTemplateForTask(
+    task: AssignedTask,
+    templates: List<DailyTaskTemplate>
+): DailyTaskTemplate? {
+    if (!task.templateId.isNullOrBlank()) {
+        templates.firstOrNull { it.id == task.templateId }?.let { return it }
+    }
+    val slug = DateAndFormatters.extractScheduledSlug(task.id)
+    if (!slug.isNullOrBlank()) {
+        templates.firstOrNull {
+            it.slug == slug || it.id == ScheduledTasksCatalog.templateDocIdForSlug(slug)
+        }?.let { return it }
+    }
+    return templates.firstOrNull {
+        it.title.trim().equals(task.title.trim(), ignoreCase = true)
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AdminDailyTemplatesView(
+    templates: List<DailyTaskTemplate>,
+    onCreateTemplate: () -> Unit,
+    onEditTemplate: (DailyTaskTemplate) -> Unit,
+    onDeleteTemplate: (DailyTaskTemplate) -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 88.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item {
+            Card(
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Plantillas Recurrentes",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = BrandNavy
+                            )
+                            Text(
+                                text = "Se generan automáticamente cada día según los días de la semana y sucursales activos. Nunca se asignan a cuentas de administrador.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    Button(
+                        onClick = onCreateTemplate,
+                        colors = ButtonDefaults.buttonColors(containerColor = BrandNavy),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.testTag("create_daily_template_button")
+                    ) {
+                        Icon(Icons.Filled.EventRepeat, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Nueva Plantilla Diaria")
                     }
                 }
-            )
+            }
+        }
+
+        if (templates.isEmpty()) {
+            item {
+                Card(
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = "No hay plantillas diarias activas",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = BrandNavy
+                        )
+                        Text(
+                            text = "Crea una plantilla recurrente para elegir los días de la semana y las sucursales asignadas.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        } else {
+            items(templates, key = { it.id }) { tpl ->
+                Card(
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("template_card_${tpl.id}")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.Top
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = tpl.title,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = BrandNavy
+                                )
+                                if (tpl.description.isNotBlank()) {
+                                    Text(
+                                        text = tpl.description,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            Surface(
+                                color = if (tpl.parsedPriority == TaskPriority.URGENT) BrandRedSoft else MaterialTheme.colorScheme.primaryContainer,
+                                shape = RoundedCornerShape(50)
+                            ) {
+                                Text(
+                                    text = tpl.parsedPriority.labelEs,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (tpl.parsedPriority == TaskPriority.URGENT) BrandRed else BrandNavy,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                )
+                            }
+                        }
+
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text(
+                                    text = "Días: ${tpl.formatDaysSummaryEs()}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = BrandNavy,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text(
+                                    text = tpl.formatBranchesSummaryEs(),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
+                            if (!tpl.deadlineLabel.isNullOrBlank() || !tpl.dueTime.isNullOrBlank()) {
+                                Surface(
+                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text(
+                                        text = tpl.deadlineLabel ?: "Límite ${tpl.dueTime}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(
+                                onClick = { onEditTemplate(tpl) },
+                                modifier = Modifier.testTag("edit_template_${tpl.id}")
+                            ) {
+                                Icon(Icons.Filled.Edit, contentDescription = null, tint = BrandNavy, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Editar", color = BrandNavy)
+                            }
+                            TextButton(
+                                onClick = { onDeleteTemplate(tpl) },
+                                modifier = Modifier.testTag("delete_template_${tpl.id}")
+                            ) {
+                                Icon(Icons.Filled.Delete, contentDescription = null, tint = BrandRed, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Eliminar", color = BrandRed)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1675,24 +2003,172 @@ private enum class DeadlinePreset(
     TOMORROW_1130("Mañana 11:30 a.m.", "11:30", "Límite: Día siguiente 11:30 a.m.", 1)
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun WeekdayMultiSelector(
+    selectedDays: List<String>,
+    onDaysChanged: (List<String>) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Días de la semana activos", style = MaterialTheme.typography.labelMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(
+                    onClick = { onDaysChanged(WeekdayOption.MON_TO_SAT_CODES) },
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text("Lun–Sáb", style = MaterialTheme.typography.labelSmall)
+                }
+                TextButton(
+                    onClick = {
+                        if (selectedDays.size == WeekdayOption.entries.size) {
+                            onDaysChanged(emptyList())
+                        } else {
+                            onDaysChanged(WeekdayOption.ALL_CODES)
+                        }
+                    },
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        if (selectedDays.size == WeekdayOption.entries.size) "Ninguno" else "Todos",
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+        }
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            WeekdayOption.entries.forEach { day ->
+                val isSelected = day.code in selectedDays
+                FilterChip(
+                    selected = isSelected,
+                    onClick = {
+                        val updated = if (isSelected) {
+                            selectedDays - day.code
+                        } else {
+                            (selectedDays + day.code).distinct()
+                        }
+                        onDaysChanged(updated)
+                    },
+                    label = { Text(day.labelEs, style = MaterialTheme.typography.labelSmall) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = BrandNavy,
+                        selectedLabelColor = Color.White
+                    ),
+                    modifier = Modifier.testTag("weekday_chip_${day.code.lowercase()}")
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TemplateBranchMultiSelector(
+    allBranchesSelected: Boolean,
+    selectedBranches: List<String>,
+    onAllBranchesToggle: (Boolean) -> Unit,
+    onSelectedBranchesChange: (List<String>) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("Sucursales asignadas", style = MaterialTheme.typography.labelMedium)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = allBranchesSelected,
+                onClick = { onAllBranchesToggle(true) },
+                label = { Text(BranchOptions.ALL_BRANCHES_OPTION, style = MaterialTheme.typography.labelSmall) },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = BrandNavy,
+                    selectedLabelColor = Color.White
+                ),
+                modifier = Modifier.testTag("template_branches_all")
+            )
+            FilterChip(
+                selected = !allBranchesSelected,
+                onClick = { onAllBranchesToggle(false) },
+                label = { Text("Específicas", style = MaterialTheme.typography.labelSmall) },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = BrandNavy,
+                    selectedLabelColor = Color.White
+                ),
+                modifier = Modifier.testTag("template_branches_specific")
+            )
+        }
+        if (!allBranchesSelected) {
+            BranchOptions.ALL_BRANCHES.forEach { branch ->
+                val checked = branch in selectedBranches
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            val updated = if (checked) selectedBranches - branch else (selectedBranches + branch).distinct()
+                            onSelectedBranchesChange(updated)
+                        },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Checkbox(
+                        checked = checked,
+                        onCheckedChange = { isChecked ->
+                            val updated = if (isChecked) (selectedBranches + branch).distinct() else selectedBranches - branch
+                            onSelectedBranchesChange(updated)
+                        }
+                    )
+                    Text(text = branch, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
+        Text(
+            text = "Las tareas recurrentes nunca se asignan a cuentas de Administrador.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
 @Composable
 private fun CreateTaskDialog(
     teamUsers: List<UserProfile>,
+    initialTaskType: TaskType = TaskType.EXTRAORDINARY,
     isBusy: Boolean,
     onDismiss: () -> Unit,
-    onCreate: (List<UserProfile>, String, String, TaskType, TaskPriority, String, String?, String?) -> Unit
+    onCreateExtraordinary: (List<UserProfile>, String, String, TaskPriority, String, String?, String?) -> Unit,
+    onSaveDailyTemplate: (
+        title: String,
+        description: String,
+        priority: TaskPriority,
+        daysOfWeek: List<String>,
+        targetBranches: List<String>,
+        dueTime: String?,
+        deadlineLabel: String?,
+        dueDayOffset: Long
+    ) -> Unit
 ) {
     var title by remember { mutableStateOf("") }
     var description by remember { mutableStateOf("") }
-    var taskType by remember { mutableStateOf(TaskType.EXTRAORDINARY) }
-    var priority by remember { mutableStateOf(TaskPriority.URGENT) }
+    var taskType by remember(initialTaskType) { mutableStateOf(initialTaskType) }
+    var priority by remember { mutableStateOf(TaskPriority.NORMAL) }
     var deadlinePreset by remember { mutableStateOf(DeadlinePreset.TODAY_CLOSE) }
+    var customDueTime by remember { mutableStateOf("23:59") }
+
+    // For Daily recurring templates
+    var selectedDays by remember { mutableStateOf(WeekdayOption.ALL_CODES) }
+    var allBranchesSelected by remember { mutableStateOf(true) }
+    var selectedBranches by remember { mutableStateOf(BranchOptions.ALL_BRANCHES) }
+
+    // For Extraordinary tasks
     val selectedUids = remember { mutableStateListOf<String>() }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = { if (!isBusy) onDismiss() },
-        title = { Text("Nueva Tarea Asignada") },
+        title = {
+            Text(if (taskType == TaskType.DAILY) "Nueva Plantilla Diaria" else "Nueva Tarea Extraordinaria")
+        },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
@@ -1719,12 +2195,17 @@ private fun CreateTaskDialog(
                     TaskType.entries.forEach { type ->
                         FilterChip(
                             selected = taskType == type,
-                            onClick = { taskType = type },
+                            onClick = {
+                                taskType = type
+                                if (type == TaskType.EXTRAORDINARY) priority = TaskPriority.URGENT
+                                errorMsg = null
+                            },
                             label = { Text(type.labelEs) },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = if (type == TaskType.EXTRAORDINARY) BrandRed else BrandNavy,
                                 selectedLabelColor = Color.White
-                            )
+                            ),
+                            modifier = Modifier.testTag("create_task_type_${type.name.lowercase()}")
                         )
                     }
                 }
@@ -1753,53 +2234,83 @@ private fun CreateTaskDialog(
                     DeadlinePreset.entries.forEach { preset ->
                         FilterChip(
                             selected = deadlinePreset == preset,
-                            onClick = { deadlinePreset = preset },
+                            onClick = {
+                                deadlinePreset = preset
+                                customDueTime = preset.dueTime
+                            },
                             label = { Text(preset.chipLabel) }
                         )
                     }
                 }
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Asignar a sucursales", style = MaterialTheme.typography.labelMedium)
-                    TextButton(onClick = {
-                        if (selectedUids.size == teamUsers.size) {
-                            selectedUids.clear()
-                        } else {
-                            selectedUids.clear()
-                            selectedUids.addAll(teamUsers.map { it.userId })
-                        }
-                    }) {
-                        Text(if (selectedUids.size == teamUsers.size) "Ninguna" else "Todas")
-                    }
-                }
+                if (taskType == TaskType.DAILY) {
+                    OutlinedTextField(
+                        value = customDueTime,
+                        onValueChange = { customDueTime = it.take(5) },
+                        label = { Text("Hora límite (HH:mm)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
 
-                teamUsers.forEach { user ->
-                    val checked = user.userId in selectedUids
+                    WeekdayMultiSelector(
+                        selectedDays = selectedDays,
+                        onDaysChanged = { selectedDays = it }
+                    )
+
+                    TemplateBranchMultiSelector(
+                        allBranchesSelected = allBranchesSelected,
+                        selectedBranches = selectedBranches,
+                        onAllBranchesToggle = { isAll ->
+                            allBranchesSelected = isAll
+                            if (isAll) {
+                                selectedBranches = BranchOptions.ALL_BRANCHES
+                            }
+                        },
+                        onSelectedBranchesChange = { selectedBranches = it }
+                    )
+                } else {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Checkbox(
-                            checked = checked,
-                            onCheckedChange = { isChecked ->
-                                if (isChecked) selectedUids.add(user.userId)
-                                else selectedUids.remove(user.userId)
+                        Text("Asignar a sucursales", style = MaterialTheme.typography.labelMedium)
+                        TextButton(onClick = {
+                            if (selectedUids.size == teamUsers.size) {
+                                selectedUids.clear()
+                            } else {
+                                selectedUids.clear()
+                                selectedUids.addAll(teamUsers.map { it.userId })
                             }
-                        )
-                        Column {
-                            Text(
-                                text = user.effectiveBranchLabel,
-                                style = MaterialTheme.typography.bodyMedium
+                        }) {
+                            Text(if (selectedUids.size == teamUsers.size) "Ninguna" else "Todas")
+                        }
+                    }
+
+                    teamUsers.forEach { user ->
+                        val checked = user.userId in selectedUids
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = checked,
+                                onCheckedChange = { isChecked ->
+                                    if (isChecked) selectedUids.add(user.userId)
+                                    else selectedUids.remove(user.userId)
+                                }
                             )
-                            Text(
-                                text = "${user.parsedRole.labelEs} · ${user.email}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            Column {
+                                Text(
+                                    text = user.effectiveBranchLabel,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(
+                                    text = "${user.parsedRole.labelEs} · ${user.email}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     }
                 }
@@ -1813,20 +2324,53 @@ private fun CreateTaskDialog(
             Button(
                 enabled = !isBusy,
                 onClick = {
-                    val chosen = teamUsers.filter { it.userId in selectedUids }
-                    when {
-                        title.trim().length < 3 -> errorMsg = "Escribe un título de al menos 3 caracteres."
-                        chosen.isEmpty() -> errorMsg = "Selecciona al menos un usuario o sucursal."
-                        else -> {
+                    val cleanTitle = title.trim()
+                    if (cleanTitle.length < 3) {
+                        errorMsg = "Escribe un título de al menos 3 caracteres."
+                        return@Button
+                    }
+                    if (taskType == TaskType.DAILY) {
+                        val cleanTime = customDueTime.trim()
+                        val branchesPayload = if (allBranchesSelected) {
+                            listOf(BranchOptions.ALL_BRANCHES_OPTION)
+                        } else {
+                            selectedBranches
+                        }
+                        when {
+                            selectedDays.isEmpty() ->
+                                errorMsg = "Selecciona al menos un día de la semana."
+                            branchesPayload.isEmpty() ->
+                                errorMsg = "Selecciona al menos una sucursal."
+                            cleanTime.isNotEmpty() && !Regex("""^([01][0-9]|2[0-3]):[0-5][0-9]$""").matches(cleanTime) ->
+                                errorMsg = "Usa formato de 24 horas HH:mm (ej. 17:59 o 23:59)."
+                            else -> {
+                                errorMsg = null
+                                onSaveDailyTemplate(
+                                    cleanTitle,
+                                    description.trim(),
+                                    priority,
+                                    selectedDays,
+                                    branchesPayload,
+                                    cleanTime.ifEmpty { null },
+                                    deadlinePreset.deadlineLabel,
+                                    deadlinePreset.daysOffset.toLong()
+                                )
+                            }
+                        }
+                    } else {
+                        val chosen = teamUsers.filter { it.userId in selectedUids }
+                        if (chosen.isEmpty()) {
+                            errorMsg = "Selecciona al menos un usuario o sucursal."
+                        } else {
+                            errorMsg = null
                             val dueIso = DateAndFormatters.addDaysIso(
                                 DateAndFormatters.todayIso(),
                                 deadlinePreset.daysOffset
                             )
-                            onCreate(
+                            onCreateExtraordinary(
                                 chosen,
-                                title.trim(),
+                                cleanTitle,
                                 description.trim(),
-                                taskType,
                                 priority,
                                 dueIso,
                                 deadlinePreset.dueTime,
@@ -1840,7 +2384,13 @@ private fun CreateTaskDialog(
                 ),
                 modifier = Modifier.testTag("confirm_create_task_button")
             ) {
-                Text(if (isBusy) "Creando..." else "Asignar Tarea")
+                Text(
+                    when {
+                        isBusy -> "Guardando..."
+                        taskType == TaskType.DAILY -> "Guardar Plantilla"
+                        else -> "Asignar Tarea"
+                    }
+                )
             }
         },
         dismissButton = {
@@ -1853,33 +2403,65 @@ private fun CreateTaskDialog(
 
 @Composable
 private fun EditDailyTaskDialog(
-    task: AssignedTask,
+    task: AssignedTask?,
+    template: DailyTaskTemplate?,
     isBusy: Boolean,
     onDismiss: () -> Unit,
-    onConfirmEdit: (
+    onConfirmTemplateEdit: (
+        existingTemplateId: String?,
+        title: String,
+        description: String,
+        priority: TaskPriority,
+        daysOfWeek: List<String>,
+        targetBranches: List<String>,
+        dueTime: String?,
+        deadlineLabel: String?,
+        dueDayOffset: Long
+    ) -> Unit,
+    onConfirmSingleTaskEdit: (
+        task: AssignedTask,
         title: String,
         description: String,
         priority: TaskPriority,
         dueTime: String?,
-        deadlineLabel: String?,
-        applyToAllBranchesSameDay: Boolean
+        deadlineLabel: String?
     ) -> Unit
 ) {
-    var title by remember(task.id) { mutableStateOf(task.title) }
-    var description by remember(task.id) { mutableStateOf(task.description) }
-    var priority by remember(task.id) { mutableStateOf(task.parsedPriority) }
-    var dueTime by remember(task.id) { mutableStateOf(task.dueTime ?: "23:59") }
-    var deadlineLabel by remember(task.id) { mutableStateOf(task.deadlineLabel ?: "") }
-    var applyAllBranches by remember(task.id) { mutableStateOf(false) }
-    var errorMsg by remember { mutableStateOf<String?>(null) }
+    val dialogKey = template?.id ?: task?.id ?: "new"
+    var title by remember(dialogKey) { mutableStateOf(template?.title ?: task?.title ?: "") }
+    var description by remember(dialogKey) { mutableStateOf(template?.description ?: task?.description ?: "") }
+    var priority by remember(dialogKey) { mutableStateOf(template?.parsedPriority ?: task?.parsedPriority ?: TaskPriority.NORMAL) }
+    var dueTime by remember(dialogKey) { mutableStateOf(template?.dueTime ?: task?.dueTime ?: "23:59") }
+    var deadlineLabel by remember(dialogKey) { mutableStateOf(template?.deadlineLabel ?: task?.deadlineLabel ?: "") }
+    val dueDayOffset = template?.dueDayOffset ?: 0L
 
-    val dayHeader = remember(task.id) {
-        DateAndFormatters.formatDayGroupHeader(DateAndFormatters.extractTaskDayIso(task))
+    val initialDays = remember(dialogKey) {
+        template?.daysOfWeek?.takeIf { it.isNotEmpty() }
+            ?: task?.let { listOf(DateAndFormatters.weekdayCodeForIso(DateAndFormatters.extractTaskDayIso(it))) }
+            ?: WeekdayOption.ALL_CODES
     }
+    var selectedDays by remember(dialogKey) { mutableStateOf(initialDays) }
+
+    val initialAllBranches = remember(dialogKey) {
+        template?.includesAllBranches ?: (task == null)
+    }
+    var allBranchesSelected by remember(dialogKey) { mutableStateOf(initialAllBranches) }
+    val initialBranches = remember(dialogKey) {
+        when {
+            template != null && !template.includesAllBranches -> template.targetBranches
+            task != null && task.assigneeName in BranchOptions.ALL_BRANCHES -> listOf(task.assigneeName)
+            else -> BranchOptions.ALL_BRANCHES
+        }
+    }
+    var selectedBranches by remember(dialogKey) { mutableStateOf(initialBranches) }
+    var editAsDefinitiveTemplate by remember(dialogKey) { mutableStateOf(true) }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Editar Tarea Diaria") },
+        title = {
+            Text(if (template != null || editAsDefinitiveTemplate) "Editar Plantilla Diaria" else "Editar Tarea de Hoy")
+        },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
@@ -1930,19 +2512,40 @@ private fun EditDailyTaskDialog(
                     }
                 }
 
-                Text("Alcance de la edición", style = MaterialTheme.typography.labelMedium)
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    FilterChip(
-                        selected = !applyAllBranches,
-                        onClick = { applyAllBranches = false },
-                        label = { Text("Solo esta sucursal (${task.assigneeName})") },
-                        modifier = Modifier.testTag("edit_scope_single_branch")
+                if (task != null) {
+                    Text("Modo de edición", style = MaterialTheme.typography.labelMedium)
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(
+                            selected = editAsDefinitiveTemplate,
+                            onClick = { editAsDefinitiveTemplate = true },
+                            label = { Text("Plantilla recurrente definitiva (días y sucursales)") },
+                            modifier = Modifier.testTag("edit_scope_all_branches")
+                        )
+                        FilterChip(
+                            selected = !editAsDefinitiveTemplate,
+                            onClick = { editAsDefinitiveTemplate = false },
+                            label = { Text("Solo esta instancia (${task.assigneeName})") },
+                            modifier = Modifier.testTag("edit_scope_single_branch")
+                        )
+                    }
+                }
+
+                if (editAsDefinitiveTemplate || task == null) {
+                    WeekdayMultiSelector(
+                        selectedDays = selectedDays,
+                        onDaysChanged = { selectedDays = it }
                     )
-                    FilterChip(
-                        selected = applyAllBranches,
-                        onClick = { applyAllBranches = true },
-                        label = { Text("Todas las sucursales ($dayHeader)") },
-                        modifier = Modifier.testTag("edit_scope_all_branches")
+
+                    TemplateBranchMultiSelector(
+                        allBranchesSelected = allBranchesSelected,
+                        selectedBranches = selectedBranches,
+                        onAllBranchesToggle = { isAll ->
+                            allBranchesSelected = isAll
+                            if (isAll) {
+                                selectedBranches = BranchOptions.ALL_BRANCHES
+                            }
+                        },
+                        onSelectedBranchesChange = { selectedBranches = it }
                     )
                 }
 
@@ -1961,21 +2564,44 @@ private fun EditDailyTaskDialog(
                 onClick = {
                     val cleanTitle = title.trim()
                     val cleanTime = dueTime.trim()
+                    val branchesPayload = if (allBranchesSelected) {
+                        listOf(BranchOptions.ALL_BRANCHES_OPTION)
+                    } else {
+                        selectedBranches
+                    }
                     when {
                         cleanTitle.length < 3 ->
                             errorMsg = "El título debe tener al menos 3 caracteres."
                         cleanTime.isNotEmpty() && !Regex("""^([01][0-9]|2[0-3]):[0-5][0-9]$""").matches(cleanTime) ->
                             errorMsg = "Usa formato de 24 horas HH:mm (ej. 17:59 o 23:59)."
+                        (editAsDefinitiveTemplate || task == null) && selectedDays.isEmpty() ->
+                            errorMsg = "Selecciona al menos un día de la semana."
+                        (editAsDefinitiveTemplate || task == null) && branchesPayload.isEmpty() ->
+                            errorMsg = "Selecciona al menos una sucursal."
                         else -> {
                             errorMsg = null
-                            onConfirmEdit(
-                                cleanTitle,
-                                description.trim(),
-                                priority,
-                                cleanTime.ifEmpty { null },
-                                deadlineLabel.trim().ifEmpty { null },
-                                applyAllBranches
-                            )
+                            if (editAsDefinitiveTemplate || task == null) {
+                                onConfirmTemplateEdit(
+                                    template?.id ?: task?.templateId,
+                                    cleanTitle,
+                                    description.trim(),
+                                    priority,
+                                    selectedDays,
+                                    branchesPayload,
+                                    cleanTime.ifEmpty { null },
+                                    deadlineLabel.trim().ifEmpty { null },
+                                    dueDayOffset
+                                )
+                            } else {
+                                onConfirmSingleTaskEdit(
+                                    task,
+                                    cleanTitle,
+                                    description.trim(),
+                                    priority,
+                                    cleanTime.ifEmpty { null },
+                                    deadlineLabel.trim().ifEmpty { null }
+                                )
+                            }
                         }
                     }
                 },
@@ -1995,15 +2621,14 @@ private fun EditDailyTaskDialog(
 
 @Composable
 private fun DeleteDailyTaskDialog(
-    task: AssignedTask,
+    task: AssignedTask?,
+    template: DailyTaskTemplate?,
     isBusy: Boolean,
     onDismiss: () -> Unit,
-    onConfirmDelete: (deleteAllBranchesSameDay: Boolean) -> Unit
+    onConfirmDelete: (removeBranchOnly: Boolean) -> Unit
 ) {
-    var deleteAllBranches by remember(task.id) { mutableStateOf(false) }
-    val dayHeader = remember(task.id) {
-        DateAndFormatters.formatDayGroupHeader(DateAndFormatters.extractTaskDayIso(task))
-    }
+    var removeBranchOnly by remember(task?.id, template?.id) { mutableStateOf(false) }
+    val targetTitle = template?.title ?: task?.title ?: "Tarea diaria"
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -2011,39 +2636,45 @@ private fun DeleteDailyTaskDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "¿Deseas eliminar \"${task.title}\"?",
+                    text = "¿Deseas eliminar \"$targetTitle\"?",
                     style = MaterialTheme.typography.titleSmall,
                     color = BrandNavy
                 )
                 Text(
-                    text = "Elige si deseas quitarla únicamente en ${task.assigneeName} o en todas las sucursales del día ($dayHeader).",
+                    text = if (task != null) {
+                        "Puedes eliminar la plantilla recurrente de forma definitiva (desactiva la plantilla y borra las instancias de hoy para que no vuelva a generarse) o quitarla únicamente de ${task.assigneeName}."
+                    } else {
+                        "Se desactivará su plantilla recurrente en Firestore y se eliminarán las instancias de hoy para que jamás vuelva a generarse en los días siguientes."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    FilterChip(
-                        selected = !deleteAllBranches,
-                        onClick = { deleteAllBranches = false },
-                        label = { Text("Solo ${task.assigneeName}") },
-                        modifier = Modifier.testTag("delete_scope_single_branch")
-                    )
-                    FilterChip(
-                        selected = deleteAllBranches,
-                        onClick = { deleteAllBranches = true },
-                        label = { Text("Todas las sucursales ($dayHeader)") },
-                        modifier = Modifier.testTag("delete_scope_all_branches")
-                    )
+                if (task != null) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(
+                            selected = !removeBranchOnly,
+                            onClick = { removeBranchOnly = false },
+                            label = { Text("Eliminar definitivamente (plantilla + hoy)") },
+                            modifier = Modifier.testTag("delete_scope_all_branches")
+                        )
+                        FilterChip(
+                            selected = removeBranchOnly,
+                            onClick = { removeBranchOnly = true },
+                            label = { Text("Quitar solo de ${task.assigneeName}") },
+                            modifier = Modifier.testTag("delete_scope_single_branch")
+                        )
+                    }
                 }
             }
         },
         confirmButton = {
             Button(
                 enabled = !isBusy,
-                onClick = { onConfirmDelete(deleteAllBranches) },
+                onClick = { onConfirmDelete(removeBranchOnly) },
                 colors = ButtonDefaults.buttonColors(containerColor = BrandRed),
                 modifier = Modifier.testTag("confirm_delete_daily_task_button")
             ) {
-                Text(if (isBusy) "Eliminando..." else "Eliminar")
+                Text(if (isBusy) "Eliminando..." else "Eliminar definitivamente")
             }
         },
         dismissButton = {

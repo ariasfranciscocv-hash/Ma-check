@@ -152,4 +152,179 @@ object ScheduledTasksCatalog {
         @Suppress("UNUSED_PARAMETER") nowMillis: Long = System.currentTimeMillis()
     ): List<Pair<String, ScheduledTaskSpec>> =
         tasksForDate(todayIso).map { spec -> todayIso to spec }
+
+    fun templateDocIdForSlug(slug: String): String {
+        val safe = sanitizeSlug(slug)
+        return "tpl_$safe".take(120)
+    }
+
+    fun sanitizeSlug(raw: String): String =
+        raw.lowercase()
+            .replace("á", "a")
+            .replace("é", "e")
+            .replace("í", "i")
+            .replace("ó", "o")
+            .replace("ú", "u")
+            .replace("ñ", "n")
+            .replace(Regex("[^a-z0-9]+"), "_")
+            .trim('_')
+            .take(50)
+            .ifBlank { "tarea_diaria" }
+
+    fun defaultTemplates(createdBy: String = "system"): List<com.example.data.model.DailyTaskTemplate> {
+        val allDays = com.example.data.model.WeekdayOption.ALL_CODES
+        val monToSat = com.example.data.model.WeekdayOption.MON_TO_SAT_CODES
+        val allBranches = listOf(com.example.data.model.BranchOptions.ALL_BRANCHES_OPTION)
+
+        return listOf(
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug("apertura_piso"),
+                slug = "apertura_piso",
+                title = "Apertura de piso y encendido de exhibición",
+                description = "Verificar iluminación, limpieza de pasillos y etiquetas de precio visibles.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = allDays,
+                targetBranches = allBranches,
+                dueTime = "23:59",
+                deadlineLabel = "Límite: Hoy al cierre",
+                dueDayOffset = 0L,
+                active = true,
+                createdBy = createdBy
+            ),
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug("revision_exhibicion"),
+                slug = "revision_exhibicion",
+                title = "Revisión de exhibición destacada",
+                description = "Confirmar disponibilidad de modelos promocionales y estado general de salas.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = allDays,
+                targetBranches = allBranches,
+                dueTime = "23:59",
+                deadlineLabel = "Límite: Hoy al cierre",
+                dueDayOffset = 0L,
+                active = true,
+                createdBy = createdBy
+            ),
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug("cierre_caja_credito"),
+                slug = "cierre_caja_credito",
+                title = "Cierre de caja y orden en módulo de crédito",
+                description = "Resguardar papelería y dejar el área de atención lista para el siguiente turno.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = allDays,
+                targetBranches = allBranches,
+                dueTime = "23:59",
+                deadlineLabel = "Límite: Hoy al cierre",
+                dueDayOffset = 0L,
+                active = true,
+                createdBy = createdBy
+            ),
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug(DAILY_SALES_CLOSING_SLUG),
+                slug = DAILY_SALES_CLOSING_SLUG,
+                title = DAILY_SALES_CLOSING_TITLE,
+                description = "Capturar el cierre de operaciones con las 5 métricas del día y adjuntar respaldo.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = allDays,
+                targetBranches = allBranches,
+                dueTime = "23:59",
+                deadlineLabel = "Jornada: Desde 8:00 a.m. al cierre",
+                dueDayOffset = 0L,
+                active = true,
+                createdBy = createdBy
+            ),
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug("avance_ventas_1400"),
+                slug = "avance_ventas_1400",
+                title = "Actualización de avance de ventas (2:00 p.m.)",
+                description = "Actualizar el avance de ventas de las 2:00 p.m. y documentar con evidencia fotográfica.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = monToSat,
+                targetBranches = allBranches,
+                dueTime = "17:59",
+                deadlineLabel = "Horario: 2:00 p.m. – 5:59 p.m.",
+                dueDayOffset = 0L,
+                active = true,
+                createdBy = createdBy
+            ),
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug("avance_ventas_1800"),
+                slug = "avance_ventas_1800",
+                title = "Actualización de avance de ventas (6:00 p.m.)",
+                description = "Actualizar el avance de ventas de las 6:00 p.m. y documentar con evidencia fotográfica.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = monToSat,
+                targetBranches = allBranches,
+                dueTime = "23:59",
+                deadlineLabel = "Horario: 6:00 p.m. – cierre",
+                dueDayOffset = 0L,
+                active = true,
+                createdBy = createdBy
+            ),
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug("inventario"),
+                slug = "inventario",
+                title = "Inventario",
+                description = "Realizar conteo y validación de inventario de viernes. Se debe completar a más tardar el día siguiente al cierre.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = listOf(com.example.data.model.WeekdayOption.FRIDAY.code),
+                targetBranches = allBranches,
+                dueTime = "23:59",
+                deadlineLabel = "Límite: Día siguiente al cierre",
+                dueDayOffset = 1L,
+                active = true,
+                createdBy = createdBy
+            ),
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug("checklist_domingos"),
+                slug = "checklist_domingos",
+                title = "Checklist domingos",
+                description = "Completar checklist operativo dominical de sucursal y adjuntar evidencia fotográfica.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = listOf(com.example.data.model.WeekdayOption.SUNDAY.code),
+                targetBranches = allBranches,
+                dueTime = "23:59",
+                deadlineLabel = "Límite: Hoy al cierre",
+                dueDayOffset = 0L,
+                active = true,
+                createdBy = createdBy
+            ),
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug("checklist_cajas"),
+                slug = "checklist_cajas",
+                title = "Checklist cajas",
+                description = "Revisar orden, cortes y documentación en área de cajas de domingo con foto de respaldo.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = listOf(com.example.data.model.WeekdayOption.SUNDAY.code),
+                targetBranches = allBranches,
+                dueTime = "23:59",
+                deadlineLabel = "Límite: Hoy al cierre",
+                dueDayOffset = 0L,
+                active = true,
+                createdBy = createdBy
+            ),
+            com.example.data.model.DailyTaskTemplate(
+                id = templateDocIdForSlug("examenes"),
+                slug = "examenes",
+                title = "Exámenes",
+                description = "Completar exámenes de domingo y subir fotografía comprobante. Límite máximo: día siguiente hasta las 11:30 a.m.",
+                priority = com.example.data.model.TaskPriority.NORMAL.name,
+                daysOfWeek = listOf(com.example.data.model.WeekdayOption.SUNDAY.code),
+                targetBranches = allBranches,
+                dueTime = "11:30",
+                deadlineLabel = "Límite: Día siguiente 11:30 a.m.",
+                dueDayOffset = 1L,
+                active = true,
+                createdBy = createdBy
+            )
+        )
+    }
+
+    fun templatesMatching(
+        templates: List<com.example.data.model.DailyTaskTemplate>,
+        dateIso: String,
+        branchName: String?
+    ): List<com.example.data.model.DailyTaskTemplate> =
+        templates.filter { it.appliesTo(dateIso, branchName) }
 }
+

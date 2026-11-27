@@ -239,6 +239,49 @@ class ScheduledTasksTest {
         assertFalse(DateAndFormatters.shouldAutoResetDailyClosing("2026-11-26", "2026-11-26", evening2130))
     }
 
+    @Test
+    fun `daily task templates filter accurately by weekday and branch without duplicates`() {
+        val tplFriSatBranch87 = com.example.data.model.DailyTaskTemplate(
+            id = "tpl_promo_fin_semana",
+            slug = "promo_fin_semana",
+            title = "Montaje de promoción fin de semana",
+            description = "Colocar precios promocionales",
+            priority = com.example.data.model.TaskPriority.URGENT.name,
+            daysOfWeek = listOf(
+                com.example.data.model.WeekdayOption.FRIDAY.code,
+                com.example.data.model.WeekdayOption.SATURDAY.code
+            ),
+            targetBranches = listOf("Sucursal 87", "Sucursal 109"),
+            dueTime = "18:00",
+            deadlineLabel = "Viernes y Sábado",
+            active = true
+        )
+
+        // 2026-11-27 is Friday, 2026-11-28 is Saturday, 2026-11-29 is Sunday, 2026-11-26 is Thursday
+        assertEquals("FRI", DateAndFormatters.weekdayCodeForIso("2026-11-27"))
+        assertEquals("SAT", DateAndFormatters.weekdayCodeForIso("2026-11-28"))
+        assertEquals("SUN", DateAndFormatters.weekdayCodeForIso("2026-11-29"))
+
+        assertTrue(tplFriSatBranch87.appliesTo("2026-11-27", "Sucursal 87"))
+        assertTrue(tplFriSatBranch87.appliesTo("2026-11-28", "Sucursal 109"))
+        assertFalse(tplFriSatBranch87.appliesTo("2026-11-27", "Sucursal 110"))
+        assertFalse(tplFriSatBranch87.appliesTo("2026-11-29", "Sucursal 87"))
+        assertFalse(tplFriSatBranch87.appliesTo("2026-11-26", "Sucursal 87"))
+
+        // Deactivated template must never match any day or branch
+        val deletedTpl = tplFriSatBranch87.copy(active = false)
+        assertFalse(deletedTpl.appliesTo("2026-11-27", "Sucursal 87"))
+
+        // Default templates match expected days for All Branches
+        val defaults = ScheduledTasksCatalog.defaultTemplates("admin_uid")
+        val fridayMatches = ScheduledTasksCatalog.templatesMatching(defaults, "2026-11-27", "Sucursal 112")
+        val sundayMatches = ScheduledTasksCatalog.templatesMatching(defaults, "2026-11-29", "Sucursal 112")
+        assertTrue(fridayMatches.any { it.slug == "inventario" })
+        assertFalse(fridayMatches.any { it.slug == "examenes" })
+        assertTrue(sundayMatches.any { it.slug == "examenes" })
+        assertFalse(sundayMatches.any { it.slug == "avance_ventas_1400" })
+    }
+
     private fun millisOf(year: Int, month: Int, day: Int, hour: Int, minute: Int): Long =
         Calendar.getInstance().apply {
             set(year, month, day, hour, minute, 0)

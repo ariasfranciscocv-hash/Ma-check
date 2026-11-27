@@ -26,6 +26,32 @@ enum class TaskType(val labelEs: String) {
     }
 }
 
+enum class WeekdayOption(
+    val code: String,
+    val labelEs: String,
+    val shortLabelEs: String,
+    val calendarDay: Int
+) {
+    MONDAY("MON", "Lunes", "Lun", java.util.Calendar.MONDAY),
+    TUESDAY("TUE", "Martes", "Mar", java.util.Calendar.TUESDAY),
+    WEDNESDAY("WED", "Miércoles", "Mié", java.util.Calendar.WEDNESDAY),
+    THURSDAY("THU", "Jueves", "Jue", java.util.Calendar.THURSDAY),
+    FRIDAY("FRI", "Viernes", "Vie", java.util.Calendar.FRIDAY),
+    SATURDAY("SAT", "Sábado", "Sáb", java.util.Calendar.SATURDAY),
+    SUNDAY("SUN", "Domingo", "Dom", java.util.Calendar.SUNDAY);
+
+    companion object {
+        val ALL_CODES: List<String> = entries.map { it.code }
+        val MON_TO_SAT_CODES: List<String> = entries.filter { it != SUNDAY }.map { it.code }
+
+        fun fromCode(raw: String?): WeekdayOption? =
+            entries.firstOrNull { it.code.equals(raw?.trim(), ignoreCase = true) }
+
+        fun fromCalendarDay(calendarDay: Int): WeekdayOption? =
+            entries.firstOrNull { it.calendarDay == calendarDay }
+    }
+}
+
 enum class TaskPriority(val labelEs: String) {
     NORMAL("Normal"),
     URGENT("Urgente");
@@ -108,6 +134,7 @@ data class AssignedTask(
     val status: String = TaskStatus.PENDING.name,
     val hasPhotoEvidence: Boolean = false,
     val evidenceId: String? = null,
+    val templateId: String? = null,
     val completedAt: Timestamp? = null,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
@@ -115,6 +142,68 @@ data class AssignedTask(
     val parsedType: TaskType get() = TaskType.fromRaw(taskType)
     val parsedPriority: TaskPriority get() = TaskPriority.fromRaw(priority)
     val parsedStatus: TaskStatus get() = TaskStatus.fromRaw(status)
+}
+
+@Keep
+@IgnoreExtraProperties
+data class DailyTaskTemplate(
+    @DocumentId val id: String = "",
+    val slug: String = "",
+    val title: String = "",
+    val description: String = "",
+    val priority: String = TaskPriority.NORMAL.name,
+    val daysOfWeek: List<String> = WeekdayOption.ALL_CODES,
+    val targetBranches: List<String> = listOf(BranchOptions.ALL_BRANCHES_OPTION),
+    val dueTime: String? = "23:59",
+    val deadlineLabel: String? = null,
+    val dueDayOffset: Long = 0L,
+    val active: Boolean = true,
+    val createdBy: String = "",
+    @ServerTimestamp val createdAt: Timestamp? = null,
+    @ServerTimestamp val updatedAt: Timestamp? = null
+) {
+    val parsedPriority: TaskPriority get() = TaskPriority.fromRaw(priority)
+
+    val parsedWeekdays: List<WeekdayOption>
+        get() = daysOfWeek.mapNotNull { WeekdayOption.fromCode(it) }.distinct()
+
+    val includesAllBranches: Boolean
+        get() = targetBranches.isEmpty() ||
+            BranchOptions.ALL_BRANCHES_OPTION in targetBranches ||
+            BranchOptions.ALL_BRANCHES.all { it in targetBranches }
+
+    fun appliesToDate(dateIso: String): Boolean {
+        if (!active) return false
+        val code = com.example.utils.DateAndFormatters.weekdayCodeForIso(dateIso)
+        return daysOfWeek.any { it.equals(code, ignoreCase = true) }
+    }
+
+    fun appliesToBranch(branchName: String?): Boolean {
+        if (!active) return false
+        if (includesAllBranches) return true
+        if (branchName.isNullOrBlank()) return false
+        return targetBranches.any { it.equals(branchName.trim(), ignoreCase = true) }
+    }
+
+    fun appliesTo(dateIso: String, branchName: String?): Boolean =
+        active && appliesToDate(dateIso) && appliesToBranch(branchName)
+
+    fun formatDaysSummaryEs(): String {
+        val parsed = parsedWeekdays
+        return when {
+            parsed.size == WeekdayOption.entries.size -> "Todos los días"
+            parsed.size == 6 && WeekdayOption.SUNDAY !in parsed -> "Lunes a Sábado"
+            parsed.isEmpty() -> "Sin días activos"
+            else -> parsed.joinToString(", ") { it.shortLabelEs }
+        }
+    }
+
+    fun formatBranchesSummaryEs(): String = when {
+        includesAllBranches -> BranchOptions.ALL_BRANCHES_OPTION
+        targetBranches.isEmpty() -> "Sin sucursales"
+        targetBranches.size == 1 -> targetBranches.first()
+        else -> targetBranches.joinToString(", ") { it.removePrefix("Sucursal ").let { n -> "Suc. $n" } }
+    }
 }
 
 @Keep

@@ -141,6 +141,9 @@ object DateAndFormatters {
         return Calendar.getInstance().apply { time = parsed }.get(Calendar.DAY_OF_WEEK)
     }
 
+    fun weekdayCodeForIso(iso: String): String =
+        com.example.data.model.WeekdayOption.fromCalendarDay(dayOfWeekForIso(iso))?.code ?: "MON"
+
     fun isWithinOpeningOrWorkdayHours(nowMillis: Long = System.currentTimeMillis()): Boolean {
         val hour = Calendar.getInstance().apply { timeInMillis = nowMillis }.get(Calendar.HOUR_OF_DAY)
         return hour in OPENING_HOUR_OF_DAY..23
@@ -155,7 +158,7 @@ object DateAndFormatters {
         return lastClosingDateIso.isNullOrBlank() || lastClosingDateIso != todayIso
     }
 
-    private val scheduledIdDateRegex = Regex("""^sched_.+_(\d{4}-\d{2}-\d{2})_([a-z0-9_]+)$""")
+    private val scheduledIdDateRegex = Regex("""^sched_.+_(\d{4}-\d{2}-\d{2})_([a-zA-Z0-9_\-]+)$""")
 
     private fun parseDateTimeMillis(
         dateIso: String,

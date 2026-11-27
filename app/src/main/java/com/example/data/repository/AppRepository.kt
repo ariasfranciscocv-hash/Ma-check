@@ -10,6 +10,7 @@ import com.example.data.model.BranchOptions
 import com.example.data.model.ClosingAttachmentDraft
 import com.example.data.model.DailyClosingSaveResult
 import com.example.data.model.DailySalesEntry
+import com.example.data.model.DailyTaskTemplate
 import com.example.data.model.TaskEvidence
 import com.example.data.model.TaskEvidenceAttachmentFile
 import com.example.data.model.TaskNotification
@@ -18,6 +19,7 @@ import com.example.data.model.TaskStatus
 import com.example.data.model.TaskType
 import com.example.data.model.UserProfile
 import com.example.data.model.UserRole
+import com.example.data.model.WeekdayOption
 import com.example.utils.DateAndFormatters
 import com.example.utils.EncodedAttachment
 import com.example.utils.ImageCompressor
@@ -327,8 +329,18 @@ class AppRepository(
             require(cleanTitle.length in 3..120) { "El título debe tener entre 3 y 120 caracteres." }
             require(assignees.isNotEmpty()) { "Selecciona al menos un usuario asignado." }
 
+            val eligibleAssignees = assignees.filter { candidate ->
+                candidate.userId.isNotBlank() &&
+                    candidate.parsedRole != UserRole.ADMIN &&
+                    !candidate.email.trim().equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) &&
+                    !isAssigneeAdminAccount(candidate.userId)
+            }
+            require(eligibleAssignees.isNotEmpty()) {
+                "Selecciona al menos una sucursal válida (no administradora)."
+            }
+
             val batch = db.batch()
-            assignees.forEach { assignee ->
+            eligibleAssignees.forEach { assignee ->
                 val taskRef = db.collection("tasks").document()
                 val safeName = assignee.effectiveBranchLabel.trim().ifBlank { "Sucursal" }.take(80)
                 val taskPayload = buildMap<String, Any> {
@@ -368,7 +380,7 @@ class AppRepository(
                 }
             }
             batch.commit().await()
-            Result.success(assignees.size)
+            Result.success(eligibleAssignees.size)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -388,13 +400,502 @@ class AppRepository(
         val userSnap = db.collection("users").document(assigneeId).get().await()
         if (userSnap.getString("role") == UserRole.ADMIN.name) return true
         val userEmail = userSnap.getString("email")
-        if (userEmail == BOOTSTRAPPED_ADMIN_EMAIL) return true
+        if (userEmail?.trim()?.equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) == true) return true
         val adminSnap = db.collection("admins").document(assigneeId).get().await()
         return adminSnap.exists()
     }
 
+    fun observeDailyTaskTemplates(uid: String): Flow<List<DailyTaskTemplate>> = flow {
+        if (uid.isBlank()) {
+            emit(emptyList())
+            return@flow
+        }
+        val path = "daily_task_templates"
+        try {
+            emitAll(
+                db.collection(path)
+                    .whereEqualTo("active", true)
+                    .snapshots()
+                    .map { snapshot ->
+                        snapshot
+                            .toObjects(DailyTaskTemplate::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                            .sortedBy { it.title.lowercase() }
+                    }
+                    .catch { error ->
+                        handleFlowError(error, OperationType.LIST, path, uid)
+                        throw error
+                    }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFlowError(e, OperationType.LIST, path, uid)
+            throw e
+        }
+    }
+
+    suspend fun ensureDefaultDailyTemplatesIfEmpty(): Result<Unit> {
+        val path = "daily_task_templates"
+        return try {
+            val adminUid = requireUserId()
+            val anyExisting = db.collection(path)
+                .limit(1)
+                .get()
+                .await()
+            if (anyExisting.isEmpty) {
+                val defaults = ScheduledTasksCatalog.defaultTemplates(createdBy = adminUid)
+                val batch = db.batch()
+                defaults.forEach { tpl ->
+                    val docRef = db.collection(path).document(tpl.id)
+                    batch.set(
+                        docRef,
+                        buildTemplatePayload(
+                            slug = tpl.slug,
+                            title = tpl.title,
+                            description = tpl.description,
+                            priority = tpl.parsedPriority,
+                            daysOfWeek = tpl.daysOfWeek,
+                            targetBranches = tpl.targetBranches,
+                            dueTime = tpl.dueTime,
+                            deadlineLabel = tpl.deadlineLabel,
+                            dueDayOffset = tpl.dueDayOffset,
+                            active = true,
+                            createdBy = adminUid,
+                            includeCreatedAt = true
+                        )
+                    )
+                }
+                batch.commit().await()
+            }
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.WRITE, path)
+            Result.failure(e)
+        }
+    }
+
+    private fun buildTemplatePayload(
+        slug: String,
+        title: String,
+        description: String,
+        priority: TaskPriority,
+        daysOfWeek: List<String>,
+        targetBranches: List<String>,
+        dueTime: String?,
+        deadlineLabel: String?,
+        dueDayOffset: Long,
+        active: Boolean,
+        createdBy: String?,
+        includeCreatedAt: Boolean
+    ): Map<String, Any> = buildMap {
+        put("slug", slug)
+        put("title", title)
+        put("description", description)
+        put("priority", priority.name)
+        put("daysOfWeek", daysOfWeek)
+        put("targetBranches", targetBranches)
+        if (!dueTime.isNullOrBlank()) {
+            put("dueTime", dueTime.take(5))
+        }
+        if (!deadlineLabel.isNullOrBlank()) {
+            put("deadlineLabel", deadlineLabel.take(80))
+        }
+        put("dueDayOffset", dueDayOffset.coerceIn(0L, 1L))
+        put("active", active)
+        if (createdBy != null) {
+            put("createdBy", createdBy)
+        }
+        if (includeCreatedAt) {
+            put("createdAt", FieldValue.serverTimestamp())
+        }
+        put("updatedAt", FieldValue.serverTimestamp())
+    }
+
+    suspend fun saveDailyTaskTemplate(
+        existingTemplateId: String? = null,
+        title: String,
+        description: String,
+        priority: TaskPriority,
+        daysOfWeek: List<String>,
+        targetBranches: List<String>,
+        dueTime: String? = "23:59",
+        deadlineLabel: String? = null,
+        dueDayOffset: Long = 0L,
+        syncTodayInstances: Boolean = true
+    ): Result<DailyTaskTemplate> {
+        val path = "daily_task_templates"
+        return try {
+            val adminUid = requireUserId()
+            val cleanTitle = title.trim()
+            val cleanDesc = description.trim().take(500)
+            require(cleanTitle.length in 3..120) {
+                "El título debe tener entre 3 y 120 caracteres."
+            }
+            val normalizedDays = daysOfWeek
+                .mapNotNull { WeekdayOption.fromCode(it)?.code }
+                .distinct()
+            require(normalizedDays.isNotEmpty()) {
+                "Selecciona al menos un día de la semana."
+            }
+            val normalizedBranches = when {
+                BranchOptions.ALL_BRANCHES_OPTION in targetBranches ->
+                    listOf(BranchOptions.ALL_BRANCHES_OPTION)
+                else -> targetBranches.filter { it in BranchOptions.ALL_BRANCHES }.distinct()
+            }
+            require(normalizedBranches.isNotEmpty()) {
+                "Selecciona al menos una sucursal."
+            }
+
+            val cleanDueTime = dueTime?.trim()?.takeIf { it.isNotEmpty() }
+            if (cleanDueTime != null) {
+                require(Regex("""^([01][0-9]|2[0-3]):[0-5][0-9]$""").matches(cleanDueTime)) {
+                    "La hora límite debe tener formato HH:mm (00:00 a 23:59)."
+                }
+            }
+            val cleanLabel = deadlineLabel?.trim()?.take(80)?.takeIf { it.isNotEmpty() }
+            val safeOffset = dueDayOffset.coerceIn(0L, 1L)
+
+            val existingDoc = if (!existingTemplateId.isNullOrBlank()) {
+                db.collection(path).document(existingTemplateId).get().await()
+            } else {
+                null
+            }
+            val existingSlug = existingDoc?.getString("slug")?.takeIf { it.isNotBlank() }
+            val baseSlug = existingSlug ?: ScheduledTasksCatalog.sanitizeSlug(cleanTitle)
+            val templateId = if (existingDoc != null && existingDoc.exists()) {
+                existingDoc.id
+            } else {
+                val suffix = java.util.UUID.randomUUID().toString().replace("-", "").take(6)
+                "tpl_${baseSlug}_$suffix".take(100)
+            }
+            val finalSlug = existingSlug ?: templateId.removePrefix("tpl_").take(60)
+            val templateRef = db.collection(path).document(templateId)
+
+            val savedTemplate = DailyTaskTemplate(
+                id = templateId,
+                slug = finalSlug,
+                title = cleanTitle,
+                description = cleanDesc,
+                priority = priority.name,
+                daysOfWeek = normalizedDays,
+                targetBranches = normalizedBranches,
+                dueTime = cleanDueTime,
+                deadlineLabel = cleanLabel,
+                dueDayOffset = safeOffset,
+                active = true,
+                createdBy = existingDoc?.getString("createdBy") ?: adminUid
+            )
+
+            if (existingDoc != null && existingDoc.exists()) {
+                val updateMap = buildMap<String, Any> {
+                    put("slug", finalSlug)
+                    put("title", cleanTitle)
+                    put("description", cleanDesc)
+                    put("priority", priority.name)
+                    put("daysOfWeek", normalizedDays)
+                    put("targetBranches", normalizedBranches)
+                    if (cleanDueTime != null) put("dueTime", cleanDueTime) else put("dueTime", FieldValue.delete())
+                    if (cleanLabel != null) put("deadlineLabel", cleanLabel) else put("deadlineLabel", FieldValue.delete())
+                    put("dueDayOffset", safeOffset)
+                    put("active", true)
+                    put("updatedAt", FieldValue.serverTimestamp())
+                }
+                templateRef.update(updateMap).await()
+            } else {
+                templateRef.set(
+                    buildTemplatePayload(
+                        slug = finalSlug,
+                        title = cleanTitle,
+                        description = cleanDesc,
+                        priority = priority,
+                        daysOfWeek = normalizedDays,
+                        targetBranches = normalizedBranches,
+                        dueTime = cleanDueTime,
+                        deadlineLabel = cleanLabel,
+                        dueDayOffset = safeOffset,
+                        active = true,
+                        createdBy = adminUid,
+                        includeCreatedAt = true
+                    )
+                ).await()
+            }
+
+            if (syncTodayInstances) {
+                syncTemplateAcrossEmployeesForToday(
+                    template = savedTemplate,
+                    previousTitle = existingDoc?.getString("title"),
+                    actorUid = adminUid
+                )
+            }
+
+            Result.success(savedTemplate)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.WRITE, path)
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun syncTemplateAcrossEmployeesForToday(
+        template: DailyTaskTemplate,
+        previousTitle: String?,
+        actorUid: String
+    ) {
+        val today = DateAndFormatters.todayIso()
+        val dueIso = DateAndFormatters.addDaysIso(today, template.dueDayOffset.toInt())
+        val usersSnap = db.collection("users").get().await()
+        val employees = usersSnap
+            .toObjects(UserProfile::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            .filter { user ->
+                user.userId.isNotBlank() &&
+                    user.parsedRole != UserRole.ADMIN &&
+                    !user.email.trim().equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true)
+            }
+        if (employees.isEmpty()) return
+
+        val dailyTasksSnap = db.collection("tasks")
+            .whereEqualTo("taskType", TaskType.DAILY.name)
+            .get()
+            .await()
+
+        val dailyTasks = dailyTasksSnap.documents.mapNotNull { doc ->
+            doc.toObject(AssignedTask::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+        }
+        val todayTasksByAssignee = dailyTasks
+            .filter { DateAndFormatters.extractTaskDayIso(it) == today }
+            .groupBy { it.assigneeId }
+
+        val writes = mutableListOf<Pair<com.google.firebase.firestore.DocumentReference, Map<String, Any>?>>()
+
+        for (emp in employees) {
+            if (isAssigneeAdminAccount(emp.userId)) continue
+            val branch = emp.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+            val userTodayTasks = todayTasksByAssignee[emp.userId].orEmpty()
+            val deterministicId = "sched_${emp.userId}_${today}_${template.slug}".take(120)
+            val matchingTasks = userTodayTasks.filter { candidate ->
+                candidate.id == deterministicId ||
+                    candidate.templateId == template.id ||
+                    DateAndFormatters.extractScheduledSlug(candidate.id) == template.slug ||
+                    (!previousTitle.isNullOrBlank() && candidate.title.trim().equals(previousTitle.trim(), ignoreCase = true)) ||
+                    candidate.title.trim().equals(template.title.trim(), ignoreCase = true)
+            }
+
+            if (template.appliesTo(today, branch)) {
+                if (matchingTasks.isEmpty()) {
+                    if (!branch.isNullOrBlank()) {
+                        val ref = db.collection("tasks").document(deterministicId)
+                        writes.add(
+                            ref to buildMap {
+                                put("assigneeId", emp.userId)
+                                put("assigneeName", emp.effectiveBranchLabel.ifBlank { branch }.take(80))
+                                put("createdBy", actorUid)
+                                put("title", template.title)
+                                put("description", template.description)
+                                put("taskType", TaskType.DAILY.name)
+                                put("priority", template.parsedPriority.name)
+                                put("dueDate", dueIso)
+                                template.dueTime?.takeIf { it.isNotBlank() }?.let { put("dueTime", it.take(5)) }
+                                template.deadlineLabel?.takeIf { it.isNotBlank() }?.let { put("deadlineLabel", it.take(80)) }
+                                put("templateId", template.id)
+                                put("status", TaskStatus.PENDING.name)
+                                put("hasPhotoEvidence", false)
+                                put("createdAt", FieldValue.serverTimestamp())
+                                put("updatedAt", FieldValue.serverTimestamp())
+                            }
+                        )
+                    }
+                } else {
+                    matchingTasks.forEach { existingTask ->
+                        val ref = db.collection("tasks").document(existingTask.id)
+                        writes.add(
+                            ref to buildMap {
+                                put("title", template.title)
+                                put("description", template.description)
+                                put("priority", template.parsedPriority.name)
+                                put("dueDate", dueIso)
+                                put("templateId", template.id)
+                                if (!template.dueTime.isNullOrBlank()) put("dueTime", template.dueTime.take(5))
+                                else put("dueTime", FieldValue.delete())
+                                if (!template.deadlineLabel.isNullOrBlank()) put("deadlineLabel", template.deadlineLabel.take(80))
+                                else put("deadlineLabel", FieldValue.delete())
+                                put("updatedAt", FieldValue.serverTimestamp())
+                            }
+                        )
+                    }
+                }
+            } else {
+                matchingTasks
+                    .filter { it.parsedStatus == TaskStatus.PENDING }
+                    .forEach { pendingTask ->
+                        writes.add(db.collection("tasks").document(pendingTask.id) to null)
+                    }
+            }
+        }
+
+        writes.chunked(380).forEach { chunk ->
+            val batch = db.batch()
+            chunk.forEach { (ref, payload) ->
+                if (payload == null) {
+                    batch.delete(ref)
+                } else if (payload.containsKey("createdAt")) {
+                    batch.set(ref, payload)
+                } else {
+                    batch.update(ref, payload)
+                }
+            }
+            batch.commit().await()
+        }
+    }
+
+    suspend fun deleteDailyTaskTemplatePermanently(
+        template: DailyTaskTemplate? = null,
+        task: AssignedTask? = null,
+        removeBranchOnly: Boolean = false
+    ): Result<Int> {
+        val path = "daily_task_templates"
+        return try {
+            requireUserId()
+            val today = DateAndFormatters.todayIso()
+            val targetDay = task?.let { DateAndFormatters.extractTaskDayIso(it) } ?: today
+
+            val resolvedTemplate = template ?: resolveTemplateForTask(task)
+
+            if (removeBranchOnly && task != null) {
+                val branchToRemove = task.assigneeName.trim()
+                if (resolvedTemplate != null && branchToRemove in BranchOptions.ALL_BRANCHES) {
+                    val remainingBranches = if (resolvedTemplate.includesAllBranches) {
+                        BranchOptions.ALL_BRANCHES.filter { it != branchToRemove }
+                    } else {
+                        resolvedTemplate.targetBranches.filter { !it.equals(branchToRemove, ignoreCase = true) }
+                    }
+                    val tplRef = db.collection(path).document(resolvedTemplate.id)
+                    if (remainingBranches.isEmpty()) {
+                        tplRef.update(
+                            mapOf(
+                                "active" to false,
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                        ).await()
+                    } else {
+                        tplRef.update(
+                            mapOf(
+                                "targetBranches" to remainingBranches,
+                                "updatedAt" to FieldValue.serverTimestamp()
+                            )
+                        ).await()
+                    }
+                }
+                db.collection("tasks").document(task.id).delete().await()
+                return Result.success(1)
+            }
+
+            // Definitive permanent deletion: deactivate template(s) in Firestore + delete today's matching tasks
+            val templatesToDeactivate = buildList {
+                if (resolvedTemplate != null) add(resolvedTemplate.id)
+                val taskTplId = task?.templateId?.takeIf { it.isNotBlank() }
+                if (taskTplId != null && taskTplId !in this) add(taskTplId)
+                val slug = task?.let { DateAndFormatters.extractScheduledSlug(it.id) }
+                if (!slug.isNullOrBlank()) {
+                    val canonicalId = ScheduledTasksCatalog.templateDocIdForSlug(slug)
+                    if (canonicalId !in this) add(canonicalId)
+                }
+            }
+
+            templatesToDeactivate.forEach { tplId ->
+                val tplRef = db.collection(path).document(tplId)
+                val snap = tplRef.get().await()
+                if (snap.exists()) {
+                    tplRef.update(
+                        mapOf(
+                            "active" to false,
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    ).await()
+                }
+            }
+
+            // Delete matching daily tasks for today/targetDay so none remain in active views
+            val dailyDocs = db.collection("tasks")
+                .whereEqualTo("taskType", TaskType.DAILY.name)
+                .get()
+                .await()
+                .documents
+
+            val titleNeedle = (resolvedTemplate?.title ?: task?.title)?.trim()
+            val slugNeedle = resolvedTemplate?.slug?.takeIf { it.isNotBlank() }
+                ?: task?.let { DateAndFormatters.extractScheduledSlug(it.id) }
+            val tplIdSet = templatesToDeactivate.toSet()
+
+            val refsToDelete = dailyDocs.mapNotNull { doc ->
+                val candidate = doc.toObject(AssignedTask::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                    ?: return@mapNotNull null
+                val candidateDay = DateAndFormatters.extractTaskDayIso(candidate)
+                val matchesDay = candidateDay == today || candidateDay == targetDay
+                if (!matchesDay) return@mapNotNull null
+
+                val candidateSlug = DateAndFormatters.extractScheduledSlug(candidate.id)
+                val matches = (task != null && candidate.id == task.id) ||
+                    (candidate.templateId != null && candidate.templateId in tplIdSet) ||
+                    (slugNeedle != null && candidateSlug == slugNeedle) ||
+                    (!titleNeedle.isNullOrBlank() && candidate.title.trim().equals(titleNeedle, ignoreCase = true))
+
+                if (matches) doc.reference else null
+            }.distinctBy { it.path }
+
+            refsToDelete.chunked(380).forEach { chunk ->
+                val batch = db.batch()
+                chunk.forEach { ref -> batch.delete(ref) }
+                batch.commit().await()
+            }
+
+            Result.success(refsToDelete.size)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.DELETE, path)
+            Result.failure(e)
+        }
+    }
+
+    private suspend fun resolveTemplateForTask(task: AssignedTask?): DailyTaskTemplate? {
+        if (task == null) return null
+        val path = "daily_task_templates"
+        val directId = task.templateId?.takeIf { it.isNotBlank() }
+        if (directId != null) {
+            val snap = db.collection(path).document(directId).get().await()
+            if (snap.exists()) {
+                return snap.toObject(DailyTaskTemplate::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            }
+        }
+        val slug = DateAndFormatters.extractScheduledSlug(task.id)
+        if (!slug.isNullOrBlank()) {
+            val bySlugId = ScheduledTasksCatalog.templateDocIdForSlug(slug)
+            val snap = db.collection(path).document(bySlugId).get().await()
+            if (snap.exists()) {
+                return snap.toObject(DailyTaskTemplate::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            }
+        }
+        val activeSnap = db.collection(path)
+            .whereEqualTo("active", true)
+            .get()
+            .await()
+        val activeTemplates = activeSnap.toObjects(
+            DailyTaskTemplate::class.java,
+            DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
+        )
+        return activeTemplates.firstOrNull {
+            (!slug.isNullOrBlank() && it.slug == slug) ||
+                it.title.trim().equals(task.title.trim(), ignoreCase = true)
+        }
+    }
+
     suspend fun seedDailyChecklistForUser(targetUser: UserProfile): Result<Int> {
-        if (targetUser.parsedRole == UserRole.ADMIN) {
+        if (targetUser.parsedRole == UserRole.ADMIN ||
+            targetUser.email.trim().equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true)
+        ) {
             return Result.failure(
                 IllegalStateException("Las cuentas de administrador no reciben tareas programadas.")
             )
@@ -402,7 +903,7 @@ class AppRepository(
         return syncScheduledTasksForAssignee(
             assigneeId = targetUser.userId,
             assigneeName = targetUser.effectiveBranchLabel,
-            skipIfAlreadyGeneratedToday = false
+            branchName = targetUser.branchName
         )
     }
 
@@ -415,15 +916,14 @@ class AppRepository(
         return syncScheduledTasksForAssignee(
             assigneeId = currentUser.uid,
             assigneeName = branchLabel,
-            skipIfAlreadyGeneratedToday = true
+            branchName = branchLabel.takeIf { it in BranchOptions.ALL_BRANCHES }
         )
     }
 
     /**
      * Checks on login / app resume whether today is a new day compared to the branch's
      * last recorded closing and current time is within opening/workday hours (>= 08:00).
-     * Resets/initializes the branch's "Cierre de venta diaria" task to PENDING for today
-     * without ever deleting or modifying historical sales closings in Firestore.
+     * Respects recurring template configuration for Cierre de venta diaria (active status, weekday, branch).
      */
     suspend fun resetDailyClosingTaskOnNewDayIfNeeded(
         branchLabel: String,
@@ -443,6 +943,25 @@ class AppRepository(
             }
 
             val today = DateAndFormatters.todayIso()
+
+            // Respect admin template state: if the daily closing template was deactivated or doesn't apply today/branch, skip.
+            val activeTemplates = db.collection("daily_task_templates")
+                .whereEqualTo("active", true)
+                .get()
+                .await()
+                .toObjects(DailyTaskTemplate::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+
+            val closingTemplate = activeTemplates.firstOrNull {
+                it.slug == ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG ||
+                    it.title.trim().equals(ScheduledTasksCatalog.DAILY_SALES_CLOSING_TITLE, ignoreCase = true)
+            } ?: return Result.success(false)
+
+            val effectiveBranch = branchLabel.takeIf { it in BranchOptions.ALL_BRANCHES }
+                ?: db.collection("users").document(uid).get().await().getString("branchName")
+            if (!closingTemplate.appliesTo(today, effectiveBranch)) {
+                return Result.success(false)
+            }
+
             val lastClosingDate = try {
                 db.collection("sales_entries")
                     .whereEqualTo("userId", uid)
@@ -475,57 +994,41 @@ class AppRepository(
             }
 
             val closingDocs = userTasksSnap.documents.filter { doc ->
-                doc.getString("title") == ScheduledTasksCatalog.DAILY_SALES_CLOSING_TITLE ||
-                    doc.id.endsWith("_${ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG}")
+                doc.getString("templateId") == closingTemplate.id ||
+                    doc.getString("title") == closingTemplate.title ||
+                    doc.id.endsWith("_${closingTemplate.slug}")
             }
 
             val alreadyHasTodayClosingTask = closingDocs.any { doc ->
                 doc.getString("dueDate") == today ||
-                    doc.id == "sched_${uid}_${today}_${ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG}"
+                    doc.id == "sched_${uid}_${today}_${closingTemplate.slug}"
             }
             if (alreadyHasTodayClosingTask) {
                 return Result.success(false)
             }
 
-            val reusableClosingDoc = closingDocs
-                .filter { !it.id.startsWith("sched_") && (it.getString("dueDate") ?: "") < today }
-                .maxByOrNull { it.getString("dueDate") ?: "" }
-
-            val safeName = branchLabel.trim().ifBlank { "Sucursal" }.take(80)
-            if (reusableClosingDoc != null) {
-                db.collection("tasks").document(reusableClosingDoc.id).update(
-                    mapOf(
-                        "dueDate" to today,
-                        "dueTime" to "23:59",
-                        "deadlineLabel" to "Jornada: Desde 8:00 a.m. al cierre",
-                        "status" to TaskStatus.PENDING.name,
-                        "hasPhotoEvidence" to false,
-                        "evidenceId" to FieldValue.delete(),
-                        "completedAt" to FieldValue.delete(),
-                        "updatedAt" to FieldValue.serverTimestamp()
-                    )
-                ).await()
-            } else {
-                val deterministicId = "sched_${uid}_${today}_${ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG}"
-                db.collection("tasks").document(deterministicId).set(
-                    mapOf(
-                        "assigneeId" to uid,
-                        "assigneeName" to safeName,
-                        "createdBy" to uid,
-                        "title" to ScheduledTasksCatalog.DAILY_SALES_CLOSING_TITLE,
-                        "description" to "Capturar el cierre de operaciones con las 5 métricas del día y adjuntar respaldo.",
-                        "taskType" to TaskType.DAILY.name,
-                        "priority" to TaskPriority.NORMAL.name,
-                        "dueDate" to today,
-                        "dueTime" to "23:59",
-                        "deadlineLabel" to "Jornada: Desde 8:00 a.m. al cierre",
-                        "status" to TaskStatus.PENDING.name,
-                        "hasPhotoEvidence" to false,
-                        "createdAt" to FieldValue.serverTimestamp(),
-                        "updatedAt" to FieldValue.serverTimestamp()
-                    )
-                ).await()
-            }
+            val safeName = branchLabel.trim().ifBlank { effectiveBranch ?: "Sucursal" }.take(80)
+            val deterministicId = "sched_${uid}_${today}_${closingTemplate.slug}".take(120)
+            val dueIso = DateAndFormatters.addDaysIso(today, closingTemplate.dueDayOffset.toInt())
+            db.collection("tasks").document(deterministicId).set(
+                buildMap {
+                    put("assigneeId", uid)
+                    put("assigneeName", safeName)
+                    put("createdBy", uid)
+                    put("title", closingTemplate.title)
+                    put("description", closingTemplate.description)
+                    put("taskType", TaskType.DAILY.name)
+                    put("priority", closingTemplate.parsedPriority.name)
+                    put("dueDate", dueIso)
+                    closingTemplate.dueTime?.takeIf { it.isNotBlank() }?.let { put("dueTime", it.take(5)) }
+                    closingTemplate.deadlineLabel?.takeIf { it.isNotBlank() }?.let { put("deadlineLabel", it.take(80)) }
+                    put("templateId", closingTemplate.id)
+                    put("status", TaskStatus.PENDING.name)
+                    put("hasPhotoEvidence", false)
+                    put("createdAt", FieldValue.serverTimestamp())
+                    put("updatedAt", FieldValue.serverTimestamp())
+                }
+            ).await()
 
             Result.success(true)
         } catch (e: CancellationException) {
@@ -539,7 +1042,7 @@ class AppRepository(
     private suspend fun syncScheduledTasksForAssignee(
         assigneeId: String,
         assigneeName: String,
-        skipIfAlreadyGeneratedToday: Boolean
+        branchName: String? = null
     ): Result<Int> {
         return try {
             val actorUid = requireUserId()
@@ -547,8 +1050,27 @@ class AppRepository(
                 return Result.success(0)
             }
 
+            val resolvedBranch = branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                ?: db.collection("users").document(assigneeId).get().await().getString("branchName")
+
             val today = DateAndFormatters.todayIso()
-            val expected = ScheduledTasksCatalog.tasksToEnsureOnDate(today)
+
+            // Simple single-field query: no composite index required.
+            val activeTemplates = db.collection("daily_task_templates")
+                .whereEqualTo("active", true)
+                .get()
+                .await()
+                .toObjects(DailyTaskTemplate::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+
+            val expectedTemplates = ScheduledTasksCatalog.templatesMatching(
+                templates = activeTemplates,
+                dateIso = today,
+                branchName = resolvedBranch
+            )
+
+            if (expectedTemplates.isEmpty()) {
+                return Result.success(0)
+            }
 
             val existingDocs = db.collection("tasks")
                 .whereEqualTo("assigneeId", assigneeId)
@@ -556,16 +1078,22 @@ class AppRepository(
                 .await()
                 .documents
 
-            val todayPrefix = "sched_${assigneeId}_${today}_"
-            if (skipIfAlreadyGeneratedToday && existingDocs.any { it.id.startsWith(todayPrefix) }) {
-                return Result.success(0)
-            }
-
             val existingIds = existingDocs.map { it.id }.toSet()
-            val safeName = assigneeName.trim().ifBlank { "Sucursal" }.take(80)
-            val missing = expected.filter { (assignedDate, spec) ->
-                val deterministicId = "sched_${assigneeId}_${assignedDate}_${spec.slug}"
-                deterministicId !in existingIds
+            val todayExistingTasks = existingDocs.mapNotNull { doc ->
+                val obj = doc.toObject(AssignedTask::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                    ?: return@mapNotNull null
+                if (DateAndFormatters.extractTaskDayIso(obj) == today) obj else null
+            }
+            val existingTemplateIdsToday = todayExistingTasks.mapNotNull { it.templateId }.toSet()
+            val existingSlugsToday = todayExistingTasks.mapNotNull { DateAndFormatters.extractScheduledSlug(it.id) }.toSet()
+
+            val safeName = assigneeName.trim().ifBlank { resolvedBranch ?: "Sucursal" }.take(80)
+            val missing = expectedTemplates.filter { tpl ->
+                val slugKey = tpl.slug.ifBlank { ScheduledTasksCatalog.sanitizeSlug(tpl.title) }
+                val deterministicId = "sched_${assigneeId}_${today}_$slugKey".take(120)
+                deterministicId !in existingIds &&
+                    tpl.id !in existingTemplateIdsToday &&
+                    slugKey !in existingSlugsToday
             }
 
             if (missing.isEmpty()) {
@@ -573,27 +1101,30 @@ class AppRepository(
             }
 
             val batch = db.batch()
-            missing.forEach { (assignedDate, spec) ->
-                val deterministicId = "sched_${assigneeId}_${assignedDate}_${spec.slug}"
+            missing.forEach { tpl ->
+                val slugKey = tpl.slug.ifBlank { ScheduledTasksCatalog.sanitizeSlug(tpl.title) }
+                val deterministicId = "sched_${assigneeId}_${today}_$slugKey".take(120)
+                val dueIso = DateAndFormatters.addDaysIso(today, tpl.dueDayOffset.toInt())
                 val ref = db.collection("tasks").document(deterministicId)
                 batch.set(
                     ref,
-                    mapOf(
-                        "assigneeId" to assigneeId,
-                        "assigneeName" to safeName,
-                        "createdBy" to actorUid,
-                        "title" to spec.title,
-                        "description" to spec.description,
-                        "taskType" to TaskType.DAILY.name,
-                        "priority" to TaskPriority.NORMAL.name,
-                        "dueDate" to spec.dueDateIso,
-                        "dueTime" to spec.dueTime,
-                        "deadlineLabel" to spec.deadlineLabel,
-                        "status" to TaskStatus.PENDING.name,
-                        "hasPhotoEvidence" to false,
-                        "createdAt" to FieldValue.serverTimestamp(),
-                        "updatedAt" to FieldValue.serverTimestamp()
-                    )
+                    buildMap {
+                        put("assigneeId", assigneeId)
+                        put("assigneeName", safeName)
+                        put("createdBy", actorUid)
+                        put("title", tpl.title)
+                        put("description", tpl.description)
+                        put("taskType", TaskType.DAILY.name)
+                        put("priority", tpl.parsedPriority.name)
+                        put("dueDate", dueIso)
+                        tpl.dueTime?.takeIf { it.isNotBlank() }?.let { put("dueTime", it.take(5)) }
+                        tpl.deadlineLabel?.takeIf { it.isNotBlank() }?.let { put("deadlineLabel", it.take(80)) }
+                        put("templateId", tpl.id)
+                        put("status", TaskStatus.PENDING.name)
+                        put("hasPhotoEvidence", false)
+                        put("createdAt", FieldValue.serverTimestamp())
+                        put("updatedAt", FieldValue.serverTimestamp())
+                    }
                 )
             }
             batch.commit().await()
@@ -615,14 +1146,20 @@ class AppRepository(
             val adminUid = requireUserId()
             require(quotaId.isNotBlank()) { "No hay una meta quincenal activa." }
             val eligibleUsers = branchUsers.filter {
-                it.userId.isNotBlank() && it.parsedRole != UserRole.ADMIN
+                it.userId.isNotBlank() &&
+                    it.parsedRole != UserRole.ADMIN &&
+                    !it.email.trim().equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true)
             }
             require(eligibleUsers.isNotEmpty()) {
                 "No hay cuentas de sucursal no administradoras en $branchName para confirmar el reinicio."
             }
 
             val today = DateAndFormatters.todayIso()
-            val expectedToday = ScheduledTasksCatalog.tasksToEnsureOnDate(today)
+            val activeTemplates = db.collection("daily_task_templates")
+                .whereEqualTo("active", true)
+                .get()
+                .await()
+                .toObjects(DailyTaskTemplate::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
             var recreatedTotal = 0
 
             for (user in eligibleUsers) {
@@ -651,28 +1188,38 @@ class AppRepository(
                     )
                 )
 
+                val effectiveBranch = user.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                    ?: branchName.takeIf { it in BranchOptions.ALL_BRANCHES }
+                val expectedToday = ScheduledTasksCatalog.templatesMatching(
+                    templates = activeTemplates,
+                    dateIso = today,
+                    branchName = effectiveBranch
+                )
                 val safeName = branchName.trim().ifBlank { user.effectiveBranchLabel }.take(80)
-                expectedToday.forEach { (assignedDate, spec) ->
-                    val deterministicId = "sched_${user.userId}_${assignedDate}_${spec.slug}"
+                expectedToday.forEach { tpl ->
+                    val slugKey = tpl.slug.ifBlank { ScheduledTasksCatalog.sanitizeSlug(tpl.title) }
+                    val deterministicId = "sched_${user.userId}_${today}_$slugKey".take(120)
+                    val dueIso = DateAndFormatters.addDaysIso(today, tpl.dueDayOffset.toInt())
                     val taskRef = db.collection("tasks").document(deterministicId)
                     createBatch.set(
                         taskRef,
-                        mapOf(
-                            "assigneeId" to user.userId,
-                            "assigneeName" to safeName,
-                            "createdBy" to adminUid,
-                            "title" to spec.title,
-                            "description" to spec.description,
-                            "taskType" to TaskType.DAILY.name,
-                            "priority" to TaskPriority.NORMAL.name,
-                            "dueDate" to spec.dueDateIso,
-                            "dueTime" to spec.dueTime,
-                            "deadlineLabel" to spec.deadlineLabel,
-                            "status" to TaskStatus.PENDING.name,
-                            "hasPhotoEvidence" to false,
-                            "createdAt" to FieldValue.serverTimestamp(),
-                            "updatedAt" to FieldValue.serverTimestamp()
-                        )
+                        buildMap {
+                            put("assigneeId", user.userId)
+                            put("assigneeName", safeName)
+                            put("createdBy", adminUid)
+                            put("title", tpl.title)
+                            put("description", tpl.description)
+                            put("taskType", TaskType.DAILY.name)
+                            put("priority", tpl.parsedPriority.name)
+                            put("dueDate", dueIso)
+                            tpl.dueTime?.takeIf { it.isNotBlank() }?.let { put("dueTime", it.take(5)) }
+                            tpl.deadlineLabel?.takeIf { it.isNotBlank() }?.let { put("deadlineLabel", it.take(80)) }
+                            put("templateId", tpl.id)
+                            put("status", TaskStatus.PENDING.name)
+                            put("hasPhotoEvidence", false)
+                            put("createdAt", FieldValue.serverTimestamp())
+                            put("updatedAt", FieldValue.serverTimestamp())
+                        }
                     )
                     recreatedTotal++
                 }
@@ -764,38 +1311,11 @@ class AppRepository(
         task: AssignedTask,
         deleteAllBranchesSameDay: Boolean
     ): Result<Int> {
-        val path = if (deleteAllBranchesSameDay) "tasks" else "tasks/${task.id}"
-        return try {
-            requireUserId()
-            require(task.id.isNotBlank()) { "ID de tarea inválido." }
-
-            if (!deleteAllBranchesSameDay) {
-                db.collection("tasks").document(task.id).delete().await()
-                return Result.success(1)
-            }
-
-            // Single-field equality query requires no composite index; day/slug matching runs in memory.
-            val dailyDocs = db.collection("tasks")
-                .whereEqualTo("taskType", TaskType.DAILY.name)
-                .get()
-                .await()
-                .documents
-
-            val matchingRefs = findMatchingDailyTaskRefs(dailyDocs, task)
-                .ifEmpty { listOf(db.collection("tasks").document(task.id)) }
-
-            matchingRefs.chunked(380).forEach { chunk ->
-                val batch = db.batch()
-                chunk.forEach { ref -> batch.delete(ref) }
-                batch.commit().await()
-            }
-            Result.success(matchingRefs.size)
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            handleFirestoreError(e, OperationType.DELETE, path)
-            Result.failure(e)
-        }
+        return deleteDailyTaskTemplatePermanently(
+            template = null,
+            task = task,
+            removeBranchOnly = !deleteAllBranchesSameDay
+        )
     }
 
     private fun findMatchingDailyTaskRefs(
@@ -811,6 +1331,7 @@ class AppRepository(
         val targetSlug = DateAndFormatters.extractScheduledSlug(targetTask.id)
         val candidateSlug = DateAndFormatters.extractScheduledSlug(candidate.id)
         val sameTask = candidate.id == targetTask.id ||
+            (!targetTask.templateId.isNullOrBlank() && candidate.templateId == targetTask.templateId) ||
             (targetSlug != null && candidateSlug == targetSlug) ||
             (candidate.title.trim().equals(targetTask.title.trim(), ignoreCase = true) &&
                 candidate.dueDate == targetTask.dueDate)

@@ -212,7 +212,7 @@ object ImageCompressor {
         }.getOrNull()
     }
 
-        fun compressUriToBase64(context: Context, uri: Uri): Result<String> = runCatching {
+           fun compressUriToBase64(context: Context, uri: Uri): Result<String> = runCatching {
         val resolver = context.contentResolver
         val transformedBitmap: Bitmap = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
             val source = android.graphics.ImageDecoder.createSource(resolver, uri)

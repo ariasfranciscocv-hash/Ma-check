@@ -57,8 +57,8 @@ class AppRepository(
     companion object {
         private const val BOOTSTRAPPED_ADMIN_EMAIL = "arias.francisco.cv@gmail.com"
 
-        fun isBootstrappedAdmin(email: String?, emailVerified: Boolean): Boolean =
-            email?.trim()?.equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) == true && emailVerified
+                fun isBootstrappedAdmin(email: String?, emailVerified: Boolean): Boolean =
+            email?.trim()?.equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) == true
     }
 
     suspend fun syncCurrentUserProfile(
@@ -94,10 +94,11 @@ class AppRepository(
                     put("updatedAt", FieldValue.serverTimestamp())
                 }
                 userRef.set(payload).await()
-            } else {
+           } else {
                 val updateMap = buildMap<String, Any> {
                     put("displayName", safeName)
                     if (safePhoto != null) put("photoUrl", safePhoto)
+                    if (bootstrapped) put("role", UserRole.ADMIN.name)
                     put("updatedAt", FieldValue.serverTimestamp())
                 }
                 userRef.update(updateMap).await()

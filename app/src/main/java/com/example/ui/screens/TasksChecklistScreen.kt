@@ -95,6 +95,7 @@ import com.example.data.model.BranchOptions
 import com.example.data.model.BranchTaskSummary
 import com.example.data.model.DailyTaskTemplate
 import com.example.data.model.DayTaskGroup
+import com.example.data.model.EmployeeIdentity
 import com.example.data.model.TaskEvidence
 import com.example.data.model.TaskEvidenceAttachmentFile
 import com.example.data.model.TaskPriority
@@ -145,6 +146,7 @@ fun TasksChecklistScreen(
     evidencesState: UiState<List<TaskEvidence>>,
     teamUsers: List<UserProfile>,
     currentUserProfile: UserProfile?,
+    employeeIdentity: EmployeeIdentity? = null,
     activeQuota: BiweeklyQuota?,
     onCreateTask: (
         assignees: List<UserProfile>,
@@ -178,6 +180,7 @@ fun TasksChecklistScreen(
     onCompleteTaskWithEvidenceFiles: (
         task: AssignedTask,
         files: List<EncodedAttachment>,
+        onError: (String) -> Unit,
         onSuccess: () -> Unit
     ) -> Unit,
     onConfirmBranchResetForQuota: (branchName: String, branchUsers: List<UserProfile>) -> Unit,
@@ -208,17 +211,45 @@ fun TasksChecklistScreen(
     var dailyTaskToDelete by remember { mutableStateOf<AssignedTask?>(null) }
     var templateToEdit by remember { mutableStateOf<DailyTaskTemplate?>(null) }
     var templateToDelete by remember { mutableStateOf<DailyTaskTemplate?>(null) }
+    var branchConflictMessage by remember { mutableStateOf<String?>(null) }
     val expandedDayState = remember { mutableStateMapOf<String, Boolean>() }
 
-    val taskToDocument = remember(taskToDocumentId, tasksState) {
+    val visibleTasksState = remember(tasksState, isAdmin) {
+        when (tasksState) {
+            is UiState.Success -> {
+                UiState.Success(
+                    ScheduledTasksCatalog.filterTasksForRole(tasksState.data, isAdmin)
+                )
+            }
+            else -> tasksState
+        }
+    }
+
+    val visibleDailyTemplates = remember(dailyTaskTemplates, isAdmin) {
+        ScheduledTasksCatalog.filterTemplatesForRole(dailyTaskTemplates, isAdmin)
+    }
+
+    val taskToDocument = remember(taskToDocumentId, visibleTasksState, isAdmin) {
         val targetId = taskToDocumentId ?: return@remember null
-        (tasksState as? UiState.Success)?.data
-            ?.firstOrNull { it.id == targetId && it.parsedStatus == TaskStatus.PENDING }
+        (visibleTasksState as? UiState.Success)?.data
+            ?.firstOrNull {
+                it.id == targetId &&
+                    it.parsedStatus == TaskStatus.PENDING &&
+                    !(isAdmin && isDailySalesClosingTask(it))
+            }
     }
 
     val evidencesMap = remember(evidencesState, isAdmin) {
         if (!isAdmin) emptyMap()
-        else (evidencesState as? UiState.Success)?.data?.associateBy { it.taskId } ?: emptyMap()
+        else {
+            val list = (evidencesState as? UiState.Success)?.data.orEmpty()
+            buildMap {
+                list.forEach { ev ->
+                    if (ev.taskId.isNotBlank()) put(ev.taskId, ev)
+                    if (ev.id.isNotBlank()) put(ev.id, ev)
+                }
+            }
+        }
     }
 
     Scaffold(
@@ -261,8 +292,8 @@ fun TasksChecklistScreen(
                             selected = adminViewMode == mode,
                             onClick = { adminViewMode = mode },
                             label = {
-                                val text = if (mode == AdminTaskViewMode.TEMPLATES && dailyTaskTemplates.isNotEmpty()) {
-                                    "${mode.label} (${dailyTaskTemplates.size})"
+                                val text = if (mode == AdminTaskViewMode.TEMPLATES && visibleDailyTemplates.isNotEmpty()) {
+                                    "${mode.label} (${visibleDailyTemplates.size})"
                                 } else {
                                     mode.label
                                 }
@@ -302,7 +333,7 @@ fun TasksChecklistScreen(
 
             if (isAdmin && adminViewMode == AdminTaskViewMode.TEMPLATES) {
                 AdminDailyTemplatesView(
-                    templates = dailyTaskTemplates,
+                    templates = visibleDailyTemplates,
                     onCreateTemplate = {
                         createDialogInitialType = TaskType.DAILY
                         showCreateTaskDialog = true
@@ -311,7 +342,7 @@ fun TasksChecklistScreen(
                     onDeleteTemplate = { tpl -> templateToDelete = tpl }
                 )
             } else {
-                when (tasksState) {
+                when (visibleTasksState) {
                     is UiState.Loading -> {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             CircularProgressIndicator(color = BrandNavy)
@@ -326,7 +357,7 @@ fun TasksChecklistScreen(
                             contentAlignment = Alignment.Center
                         ) {
                             Text(
-                                text = tasksState.message,
+                                text = visibleTasksState.message,
                                 color = BrandRed,
                                 style = MaterialTheme.typography.bodyMedium
                             )
@@ -335,8 +366,8 @@ fun TasksChecklistScreen(
 
                     is UiState.Success -> {
                         if (isAdmin && adminViewMode == AdminTaskViewMode.BY_BRANCH) {
-                            val summaries = remember(teamUsers, tasksState.data) {
-                                buildBranchTaskSummaries(teamUsers, tasksState.data)
+                            val summaries = remember(teamUsers, visibleTasksState.data) {
+                                buildBranchTaskSummaries(teamUsers, visibleTasksState.data)
                             }
                             AdminBranchesChecklistView(
                                 summaries = summaries,
@@ -351,12 +382,12 @@ fun TasksChecklistScreen(
                                 onDeleteDailyTask = { task -> dailyTaskToDelete = task }
                             )
                         } else {
-                            val filtered = remember(tasksState.data, selectedFilter) {
+                            val filtered = remember(visibleTasksState.data, selectedFilter) {
                                 when (selectedFilter) {
-                                    TaskFilter.ALL -> tasksState.data
-                                    TaskFilter.PENDING -> tasksState.data.filter { it.parsedStatus == TaskStatus.PENDING }
-                                    TaskFilter.EXTRAORDINARY -> tasksState.data.filter { it.parsedType == TaskType.EXTRAORDINARY }
-                                    TaskFilter.COMPLETED -> tasksState.data.filter { it.parsedStatus == TaskStatus.COMPLETED }
+                                    TaskFilter.ALL -> visibleTasksState.data
+                                    TaskFilter.PENDING -> visibleTasksState.data.filter { it.parsedStatus == TaskStatus.PENDING }
+                                    TaskFilter.EXTRAORDINARY -> visibleTasksState.data.filter { it.parsedType == TaskType.EXTRAORDINARY }
+                                    TaskFilter.COMPLETED -> visibleTasksState.data.filter { it.parsedStatus == TaskStatus.COMPLETED }
                                 }
                             }
 
@@ -386,13 +417,18 @@ fun TasksChecklistScreen(
                                             }
                                         ) {
                                             group.tasks.forEach { task ->
+                                                val linkedEv = if (isAdmin) {
+                                                    evidencesMap[task.id] ?: task.evidenceId?.let { evidencesMap[it] }
+                                                } else null
                                                 TaskCardItem(
                                                     task = task,
                                                     nowMillis = nowMillis,
                                                     isAdmin = isAdmin,
-                                                    linkedEvidence = if (isAdmin) evidencesMap[task.id] else null,
+                                                    linkedEvidence = linkedEv,
                                                     onDocumentClick = {
-                                                        if (task.parsedStatus == TaskStatus.PENDING) {
+                                                        if (task.parsedStatus == TaskStatus.PENDING &&
+                                                            !(isAdmin && isDailySalesClosingTask(task))
+                                                        ) {
                                                             taskToDocumentId = task.id
                                                         }
                                                     },
@@ -415,11 +451,36 @@ fun TasksChecklistScreen(
     taskToDocument?.let { task ->
         TaskDocumentationDialog(
             task = task,
+            employeeIdentity = employeeIdentity,
             isBusy = isBusy,
             onDismiss = { taskToDocumentId = null },
             onSubmitFiles = { files ->
-                onCompleteTaskWithEvidenceFiles(task, files) {
-                    taskToDocumentId = null
+                onCompleteTaskWithEvidenceFiles(
+                    task,
+                    files,
+                    { errMsg ->
+                        taskToDocumentId = null
+                        branchConflictMessage = errMsg
+                    },
+                    {
+                        taskToDocumentId = null
+                    }
+                )
+            }
+        )
+    }
+
+    branchConflictMessage?.let { conflictMsg ->
+        AlertDialog(
+            onDismissRequest = { branchConflictMessage = null },
+            title = { Text("Tarea bloqueada por sucursal", color = BrandRed) },
+            text = { Text(conflictMsg) },
+            confirmButton = {
+                Button(
+                    onClick = { branchConflictMessage = null },
+                    colors = ButtonDefaults.buttonColors(containerColor = BrandNavy)
+                ) {
+                    Text("Entendido")
                 }
             }
         )
@@ -529,6 +590,9 @@ fun TasksChecklistScreen(
         )
     }
 }
+
+private fun isDailySalesClosingTask(task: AssignedTask): Boolean =
+    ScheduledTasksCatalog.isDailySalesClosingTask(task)
 
 private fun findTemplateForTask(
     task: AssignedTask,
@@ -1210,10 +1274,11 @@ private fun BranchChecklistCard(
                                             verticalArrangement = Arrangement.spacedBy(6.dp)
                                         ) {
                                             dayGroup.tasks.forEach { task ->
+                                                val linkedEv = evidencesMap[task.id] ?: task.evidenceId?.let { evidencesMap[it] }
                                                 BranchTaskStatusRow(
                                                     task = task,
                                                     nowMillis = nowMillis,
-                                                    linkedEvidence = evidencesMap[task.id],
+                                                    linkedEvidence = linkedEv,
                                                     onViewAdminEvidence = onViewAdminEvidence,
                                                     onEditDailyTask = { onEditDailyTask(task) },
                                                     onDeleteDailyTask = { onDeleteDailyTask(task) }
@@ -1296,6 +1361,15 @@ private fun BranchTaskStatusRow(
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    val completedByLabel = task.formattedCompletedByLabel ?: linkedEvidence?.formattedUploaderLabel
+                    if (isDone && !completedByLabel.isNullOrBlank()) {
+                        Text(
+                            text = "Realizada por: $completedByLabel",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SuccessGreen,
+                            modifier = Modifier.testTag("branch_task_completed_by_${task.id}")
+                        )
+                    }
                 }
 
                 Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1562,28 +1636,32 @@ private fun TaskCardItem(
             }
 
             if (!isCompleted) {
-                Button(
-                    onClick = onDocumentClick,
-                    enabled = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp)
-                        .testTag("document_task_button_${task.id}"),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = BrandNavy,
-                        contentColor = Color.White
-                    )
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.UploadFile,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Subir Evidencia (hasta 5 archivos)")
+                if (!(isAdmin && isDailySalesClosingTask(task))) {
+                    Button(
+                        onClick = onDocumentClick,
+                        enabled = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("document_task_button_${task.id}"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = BrandNavy,
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.UploadFile,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Subir Evidencia (hasta 5 archivos)")
+                    }
                 }
             } else {
+                val completedByLabel = task.formattedCompletedByLabel
+                    ?: linkedEvidence?.formattedUploaderLabel
                 Surface(
                     color = MaterialTheme.colorScheme.surface,
                     shape = RoundedCornerShape(12.dp),
@@ -1600,25 +1678,35 @@ private fun TaskCardItem(
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.weight(1f)
                         ) {
                             Icon(
                                 imageVector = Icons.Filled.Lock,
                                 contentDescription = null,
-                                tint = BrandNavy,
+                                tint = SuccessGreen,
                                 modifier = Modifier.size(16.dp)
                             )
-                            Text(
-                                text = if (isAdmin) {
-                                    val count = linkedEvidence?.resolvedFileCount ?: 1
-                                    "Bloqueada · $count archivo(s) adjunto(s)"
-                                } else {
-                                    "Completada y bloqueada · No admite más archivos"
-                                },
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                if (!completedByLabel.isNullOrBlank()) {
+                                    Text(
+                                        text = "Realizada por $completedByLabel",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = BrandNavy,
+                                        modifier = Modifier.testTag("task_completed_by_${task.id}")
+                                    )
+                                }
+                                Text(
+                                    text = if (isAdmin) {
+                                        val count = linkedEvidence?.resolvedFileCount ?: 1
+                                        "Bloqueada · $count archivo(s) adjunto(s)"
+                                    } else {
+                                        "Completada en sucursal · Bloqueada contra sobrescritura"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                         if (isAdmin && linkedEvidence != null) {
                             TextButton(onClick = { onViewAdminEvidence(linkedEvidence) }) {
@@ -1680,6 +1768,7 @@ private fun TaskCardItem(
 @Composable
 private fun TaskDocumentationDialog(
     task: AssignedTask,
+    employeeIdentity: EmployeeIdentity? = null,
     isBusy: Boolean,
     onDismiss: () -> Unit,
     onSubmitFiles: (List<EncodedAttachment>) -> Unit
@@ -1774,6 +1863,13 @@ private fun TaskDocumentationDialog(
                     style = MaterialTheme.typography.titleSmall,
                     color = BrandNavy
                 )
+                if (employeeIdentity != null && employeeIdentity.hasIdentityCore) {
+                    Text(
+                        text = "Responsable: ${employeeIdentity.formattedMovementAuthor}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = BrandNavy
+                    )
+                }
                 Surface(
                     color = BrandRedSoft,
                     shape = RoundedCornerShape(12.dp),

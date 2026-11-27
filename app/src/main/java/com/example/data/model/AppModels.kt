@@ -119,6 +119,125 @@ data class UserProfile(
 
 @Keep
 @IgnoreExtraProperties
+data class EmployeeIdentity(
+    @DocumentId val id: String = "",
+    val userId: String = "",
+    val email: String = "",
+    val fullName: String = "",
+    val payrollNumber: String = "",
+    val payrollKey: String = "",
+    val branchName: String? = null,
+    val active: Boolean = true,
+    @ServerTimestamp val createdAt: Timestamp? = null,
+    @ServerTimestamp val updatedAt: Timestamp? = null
+) {
+    val hasIdentityCore: Boolean
+        get() = userId.isNotBlank() && fullName.isNotBlank() && payrollNumber.isNotBlank()
+
+    val hasAssignedBranch: Boolean
+        get() = !branchName.isNullOrBlank() && branchName in BranchOptions.ALL_BRANCHES
+
+    val isComplete: Boolean
+        get() = active && hasIdentityCore && hasAssignedBranch
+
+    val requiresBranchOnlyReassignment: Boolean
+        get() = active && hasIdentityCore && !hasAssignedBranch
+
+    val displayPayroll: String
+        get() = EmployeeIdentityValidation.formatPayrollForDisplay(payrollNumber)
+
+    val formattedTopBarTag: String
+        get() = when {
+            displayPayroll.isNotBlank() && !branchName.isNullOrBlank() ->
+                "Nómina: $displayPayroll | $branchName"
+            displayPayroll.isNotBlank() ->
+                "Nómina: $displayPayroll"
+            !branchName.isNullOrBlank() ->
+                branchName
+            else -> "Sin asignar"
+        }
+
+    val formattedMovementAuthor: String
+        get() = when {
+            displayPayroll.isNotBlank() && fullName.isNotBlank() ->
+                "Nómina $displayPayroll · $fullName"
+            fullName.isNotBlank() -> fullName
+            else -> branchName ?: "Sucursal"
+        }
+}
+
+object EmployeeIdentityValidation {
+    const val PAYROLL_PREFIX = "E"
+    const val PAYROLL_DIGITS_LENGTH = 6
+    private val rawValidPayrollRegex = Regex("^(?:[Ee])?[0-9]{6}$")
+    private val digitsOnlyRegex = Regex("^[0-9]{6}$")
+    private val fullPayrollRegex = Regex("^E[0-9]{6}$")
+
+    fun filterPayrollDigits(raw: String): String =
+        raw.filter { it in '0'..'9' }.take(PAYROLL_DIGITS_LENGTH)
+
+    fun extractPayrollDigits(raw: String): String {
+        val trimmed = raw.trim().removePrefix("#").trim()
+        val withoutPrefix = if (trimmed.startsWith("e", ignoreCase = true)) {
+            trimmed.drop(1)
+        } else {
+            trimmed
+        }
+        return filterPayrollDigits(withoutPrefix)
+    }
+
+    fun formatFullPayrollFromDigits(digits: String): String {
+        val cleanDigits = filterPayrollDigits(digits)
+        return if (cleanDigits.isEmpty()) "" else "$PAYROLL_PREFIX$cleanDigits"
+    }
+
+    fun cleanPayrollInput(raw: String): String {
+        val trimmed = raw.trim().removePrefix("#").trim()
+        return when {
+            digitsOnlyRegex.matches(trimmed) -> "$PAYROLL_PREFIX$trimmed"
+            trimmed.length == PAYROLL_DIGITS_LENGTH + 1 &&
+                trimmed.startsWith("e", ignoreCase = true) &&
+                digitsOnlyRegex.matches(trimmed.drop(1)) -> "$PAYROLL_PREFIX${trimmed.drop(1)}"
+            else -> trimmed
+        }
+    }
+
+    fun formatPayrollForDisplay(raw: String?): String {
+        val trimmed = raw?.trim()?.removePrefix("#")?.trim().orEmpty()
+        if (trimmed.isEmpty()) return ""
+        return when {
+            digitsOnlyRegex.matches(trimmed) -> "$PAYROLL_PREFIX$trimmed"
+            fullPayrollRegex.matches(trimmed.uppercase()) -> trimmed.uppercase()
+            else -> trimmed
+        }
+    }
+
+    fun normalizePayrollKey(raw: String): String =
+        cleanPayrollInput(raw).uppercase()
+
+    fun validateFullRegistration(
+        fullName: String,
+        payrollNumberRaw: String,
+        branchName: String
+    ): String? {
+        val cleanName = fullName.trim()
+        val trimmedPayroll = payrollNumberRaw.trim().removePrefix("#").trim()
+        return when {
+            cleanName.length < 3 -> "Ingresa tu nombre completo (mínimo 3 caracteres)."
+            cleanName.length > 80 -> "El nombre completo no puede superar 80 caracteres."
+            trimmedPayroll.isEmpty() ->
+                "El número de Nómina es obligatorio (6 dígitos después de la E)."
+            !rawValidPayrollRegex.matches(trimmedPayroll) ->
+                "La Nómina debe tener exactamente 6 dígitos numéricos después de la E (ej. E019753)."
+            branchName !in BranchOptions.ALL_BRANCHES ->
+                "Selecciona una sucursal asignada válida."
+            else -> null
+        }
+    }
+}
+
+@Keep
+@IgnoreExtraProperties
 data class AssignedTask(
     @DocumentId val id: String = "",
     val assigneeId: String = "",
@@ -135,6 +254,9 @@ data class AssignedTask(
     val hasPhotoEvidence: Boolean = false,
     val evidenceId: String? = null,
     val templateId: String? = null,
+    val completedByUid: String? = null,
+    val completedByPayroll: String? = null,
+    val completedByName: String? = null,
     val completedAt: Timestamp? = null,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
@@ -142,6 +264,288 @@ data class AssignedTask(
     val parsedType: TaskType get() = TaskType.fromRaw(taskType)
     val parsedPriority: TaskPriority get() = TaskPriority.fromRaw(priority)
     val parsedStatus: TaskStatus get() = TaskStatus.fromRaw(status)
+
+    val formattedCompletedByLabel: String?
+        get() {
+            val displayPayroll = EmployeeIdentityValidation.formatPayrollForDisplay(completedByPayroll)
+            return when {
+                displayPayroll.isNotBlank() && !completedByName.isNullOrBlank() ->
+                    "Nómina $displayPayroll · $completedByName"
+                displayPayroll.isNotBlank() ->
+                    "Nómina $displayPayroll"
+                !completedByName.isNullOrBlank() ->
+                    completedByName
+                else -> null
+            }
+        }
+}
+
+@Keep
+@IgnoreExtraProperties
+data class BranchTaskCompletion(
+    @DocumentId val id: String = "",
+    val lockId: String = "",
+    val branchName: String = "",
+    val dayIso: String = "",
+    val periodId: String = "",
+    val taskKey: String = "",
+    val taskTitle: String = "",
+    val templateId: String? = null,
+    val taskId: String = "",
+    val evidenceId: String = "",
+    val completedByUid: String = "",
+    val completedByPayroll: String = "",
+    val completedByName: String = "",
+    @ServerTimestamp val completedAt: Timestamp? = null
+) {
+    val formattedCompletedByLabel: String
+        get() {
+            val displayPayroll = EmployeeIdentityValidation.formatPayrollForDisplay(completedByPayroll)
+            return when {
+                displayPayroll.isNotBlank() && completedByName.isNotBlank() ->
+                    "Nómina $displayPayroll · $completedByName"
+                displayPayroll.isNotBlank() ->
+                    "Nómina $displayPayroll"
+                completedByName.isNotBlank() ->
+                    completedByName
+                else -> branchName
+            }
+        }
+}
+
+data class EmployeeBranchParticipationStats(
+    val branchName: String,
+    val periodTitle: String,
+    val periodStartIso: String,
+    val periodEndIso: String,
+    val totalBranchTasks: Int,
+    val completedByMyPayroll: Int,
+    val completedByOtherPayrolls: Int,
+    val pendingTasks: Int,
+    val myParticipationPercent: Float
+) {
+    val totalCompletedByBranch: Int get() = completedByMyPayroll + completedByOtherPayrolls
+}
+
+object BranchTaskLockHelper {
+
+    fun sanitizeIdPart(raw: String): String =
+        raw.lowercase()
+            .replace("á", "a")
+            .replace("é", "e")
+            .replace("í", "i")
+            .replace("ó", "o")
+            .replace("ú", "u")
+            .replace("ü", "u")
+            .replace("ñ", "n")
+            .replace(Regex("[^a-z0-9]+"), "_")
+            .trim('_')
+            .take(56)
+
+    fun extractTaskKeyForBranchLock(task: AssignedTask): String {
+        val slug = com.example.utils.DateAndFormatters.extractScheduledSlug(task.id)
+            ?.let(::sanitizeIdPart)
+            ?.takeIf { it.isNotBlank() }
+        if (slug != null) return "d_$slug"
+
+        val tpl = task.templateId?.trim()?.removePrefix("tpl_")
+            ?.let(::sanitizeIdPart)
+            ?.takeIf { it.isNotBlank() }
+        if (tpl != null) return "d_$tpl"
+
+        val cleanTitle = sanitizeIdPart(task.title).ifBlank { "tarea" }
+        return if (task.parsedType == TaskType.DAILY) {
+            "d_$cleanTitle"
+        } else {
+            val datePart = task.dueDate.trim().replace("-", "").take(12).ifBlank { "nodate" }
+            "e_${cleanTitle}_$datePart"
+        }
+    }
+
+    fun buildLockId(branchName: String, dayIso: String, taskKey: String): String {
+        val branchSlug = sanitizeIdPart(branchName).ifBlank { "sucursal" }
+        val cleanDay = dayIso.trim().take(10).ifBlank { "nodate" }
+        val cleanKey = sanitizeIdPart(taskKey).ifBlank { "tarea" }
+        return "lock_${branchSlug}_${cleanDay}_$cleanKey".take(128)
+    }
+
+    fun buildLockIdForTask(branchName: String, task: AssignedTask): String {
+        val dayIso = com.example.utils.DateAndFormatters.extractTaskDayIso(task)
+        val taskKey = extractTaskKeyForBranchLock(task)
+        return buildLockId(branchName, dayIso, taskKey)
+    }
+
+    fun resolveTaskBranch(
+        task: AssignedTask,
+        uidToBranch: Map<String, String>
+    ): String? {
+        uidToBranch[task.assigneeId]?.takeIf { it in BranchOptions.ALL_BRANCHES }?.let { return it }
+        return task.assigneeName.trim().takeIf { it in BranchOptions.ALL_BRANCHES }
+    }
+
+    fun mergeTasksWithBranchCompletions(
+        tasks: List<AssignedTask>,
+        completions: List<BranchTaskCompletion>,
+        isAdmin: Boolean,
+        employeeBranch: String?,
+        teamUsers: List<UserProfile>
+    ): List<AssignedTask> {
+        val uidToBranch = teamUsers
+            .mapNotNull { user ->
+                val branch = user.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                if (branch != null) user.userId to branch else null
+            }
+            .toMap()
+
+        val completionsByLockId = completions.associateBy { c ->
+            c.lockId.ifBlank {
+                c.id.ifBlank { buildLockId(c.branchName, c.dayIso, c.taskKey) }
+            }
+        }
+
+        val enriched = tasks.map { task ->
+            val branch = if (!isAdmin) {
+                employeeBranch?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                    ?: resolveTaskBranch(task, uidToBranch)
+            } else {
+                resolveTaskBranch(task, uidToBranch)
+            }
+            if (branch == null) {
+                task
+            } else {
+                val lockId = buildLockIdForTask(branch, task)
+                val completion = completionsByLockId[lockId]
+                if (completion != null) {
+                    task.copy(
+                        status = TaskStatus.COMPLETED.name,
+                        hasPhotoEvidence = true,
+                        evidenceId = completion.evidenceId.ifBlank { task.evidenceId },
+                        completedByUid = completion.completedByUid.ifBlank { task.completedByUid },
+                        completedByPayroll = completion.completedByPayroll.ifBlank { task.completedByPayroll },
+                        completedByName = completion.completedByName.ifBlank { task.completedByName },
+                        completedAt = completion.completedAt ?: task.completedAt
+                    )
+                } else {
+                    task
+                }
+            }
+        }
+
+        if (!isAdmin) return enriched
+
+        // For admin views, collapse duplicate per-user copies of the same branch task on the same day,
+        // prioritizing the completed copy (with payroll/evidence metadata).
+        val seenKeys = LinkedHashMap<String, AssignedTask>()
+        val sortedForDedup = enriched.sortedWith(
+            compareByDescending<AssignedTask> { it.parsedStatus == TaskStatus.COMPLETED }
+                .thenByDescending { !it.completedByPayroll.isNullOrBlank() }
+                .thenByDescending { !it.evidenceId.isNullOrBlank() }
+        )
+        for (task in sortedForDedup) {
+            val branch = resolveTaskBranch(task, uidToBranch)
+            val dedupKey = if (branch != null) {
+                buildLockIdForTask(branch, task)
+            } else {
+                "uid_${task.id}"
+            }
+            if (dedupKey !in seenKeys) {
+                seenKeys[dedupKey] = task
+            }
+        }
+        return seenKeys.values.toList()
+    }
+
+    fun computeEmployeeBranchParticipationStats(
+        identity: EmployeeIdentity,
+        tasks: List<AssignedTask>,
+        completions: List<BranchTaskCompletion>,
+        activeQuota: BiweeklyQuota?,
+        todayIso: String = com.example.utils.DateAndFormatters.todayIso()
+    ): EmployeeBranchParticipationStats {
+        val branchName = identity.branchName?.takeIf { it.isNotBlank() } ?: "Sin sucursal"
+        val (periodStartIso, periodEndIso) = activeQuota
+            ?.takeIf { it.startDate.length == 10 && it.endDate.length == 10 && todayIso >= it.startDate }
+            ?.let { it.startDate to maxOf(it.endDate, todayIso) }
+            ?: com.example.utils.DateAndFormatters.biweeklyRangeForIso(todayIso)
+        val periodTitle = activeQuota?.title?.takeIf { it.isNotBlank() }
+            ?: com.example.utils.DateAndFormatters.defaultBiweeklyTitle()
+
+        data class BranchTaskSlot(
+            val completed: Boolean,
+            val completedByPayroll: String?,
+            val completedByUid: String?
+        )
+
+        val slots = LinkedHashMap<String, BranchTaskSlot>()
+
+        tasks.forEach { task ->
+            val dayIso = com.example.utils.DateAndFormatters.extractTaskDayIso(task)
+            if (dayIso in periodStartIso..periodEndIso) {
+                val taskKey = extractTaskKeyForBranchLock(task)
+                val slotKey = "${dayIso}|$taskKey"
+                val existing = slots[slotKey]
+                val isDone = task.parsedStatus == TaskStatus.COMPLETED
+                if (existing == null || (!existing.completed && isDone)) {
+                    slots[slotKey] = BranchTaskSlot(
+                        completed = isDone,
+                        completedByPayroll = task.completedByPayroll,
+                        completedByUid = task.completedByUid ?: if (isDone) task.assigneeId else null
+                    )
+                }
+            }
+        }
+
+        completions.forEach { comp ->
+            if (comp.branchName == branchName && comp.dayIso in periodStartIso..periodEndIso) {
+                val cleanKey = sanitizeIdPart(comp.taskKey).ifBlank { "tarea" }
+                val slotKey = "${comp.dayIso}|$cleanKey"
+                slots[slotKey] = BranchTaskSlot(
+                    completed = true,
+                    completedByPayroll = comp.completedByPayroll,
+                    completedByUid = comp.completedByUid
+                )
+            }
+        }
+
+        var myCompleted = 0
+        var othersCompleted = 0
+        var pending = 0
+        val myPayroll = EmployeeIdentityValidation.formatPayrollForDisplay(identity.payrollNumber)
+        val myUid = identity.userId.trim()
+
+        slots.values.forEach { slot ->
+            if (!slot.completed) {
+                pending++
+            } else {
+                val slotPayroll = EmployeeIdentityValidation.formatPayrollForDisplay(slot.completedByPayroll)
+                val matchesPayroll = myPayroll.isNotBlank() &&
+                    slotPayroll.equals(myPayroll, ignoreCase = true)
+                val matchesUidFallback = slotPayroll.isBlank() &&
+                    myUid.isNotBlank() &&
+                    slot.completedByUid == myUid
+                if (matchesPayroll || matchesUidFallback) {
+                    myCompleted++
+                } else {
+                    othersCompleted++
+                }
+            }
+        }
+
+        val total = slots.size
+        val pct = if (total > 0) (myCompleted.toFloat() * 100f / total.toFloat()) else 0f
+
+        return EmployeeBranchParticipationStats(
+            branchName = branchName,
+            periodTitle = periodTitle,
+            periodStartIso = periodStartIso,
+            periodEndIso = periodEndIso,
+            totalBranchTasks = total,
+            completedByMyPayroll = myCompleted,
+            completedByOtherPayrolls = othersCompleted,
+            pendingTasks = pending,
+            myParticipationPercent = pct
+        )
+    }
 }
 
 @Keep
@@ -217,9 +621,25 @@ data class TaskEvidence(
     val imageBase64: String = "",
     val fileCount: Long = 1L,
     val primaryFileName: String? = null,
+    val employeePayroll: String? = null,
+    val employeeName: String? = null,
+    val branchName: String? = null,
     @ServerTimestamp val capturedAt: Timestamp? = null
 ) {
     val resolvedFileCount: Int get() = fileCount.toInt().coerceIn(1, 5)
+
+    val formattedUploaderLabel: String
+        get() {
+            val displayPayroll = EmployeeIdentityValidation.formatPayrollForDisplay(employeePayroll)
+            return when {
+                displayPayroll.isNotBlank() && !employeeName.isNullOrBlank() -> {
+                    val branchPart = branchName?.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""
+                    "Nómina $displayPayroll · $employeeName$branchPart"
+                }
+                uploaderName.isNotBlank() -> uploaderName
+                else -> "Sucursal"
+            }
+        }
 }
 
 data class TaskEvidenceAttachmentFile(
@@ -296,9 +716,23 @@ data class DailySalesEntry(
     val attachmentBase64: String? = null,
     val attachmentChunkCount: Long = 0L,
     val attachmentSizeBytes: Long = 0L,
+    val employeePayroll: String? = null,
+    val employeeName: String? = null,
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
-)
+) {
+    val formattedAuthorLabel: String
+        get() {
+            val displayPayroll = EmployeeIdentityValidation.formatPayrollForDisplay(employeePayroll)
+            return when {
+                displayPayroll.isNotBlank() && !employeeName.isNullOrBlank() ->
+                    "Nómina $displayPayroll · $employeeName"
+                userName.isNotBlank() -> userName
+                !branchName.isNullOrBlank() -> branchName
+                else -> "Sucursal"
+            }
+        }
+}
 
 sealed interface ClosingAttachmentDraft {
     data object Unchanged : ClosingAttachmentDraft
@@ -328,6 +762,49 @@ data class MetricProgress(
     val dailyAverage: Double,
     val requiredDailyPace: Double,
     val pace: ProjectionPace
+) {
+    val remainingToTarget: Double
+        get() = (targetTotal - actualTotal).coerceAtLeast(0.0)
+
+    val surplusOverTarget: Double
+        get() = (actualTotal - targetTotal).coerceAtLeast(0.0)
+
+    val isTargetMet: Boolean
+        get() = targetTotal > 0.0 && actualTotal >= targetTotal
+}
+
+data class BranchWeightedOutcome(
+    val branchName: String,
+    val branchTarget: Double,
+    val actualTotal: Double,
+    val projectedTotal: Double,
+    val deltaVsBranchQuota: Double,
+    val projectedRatio: Float,
+    val pace: ProjectionPace,
+    val quotaWeightShare: Float
+)
+
+data class AdminWeightedProjection(
+    val metric: SalesMetricType,
+    val daysElapsed: Int,
+    val totalCycleDays: Int,
+    val remainingDays: Int,
+    val adminTarget: Double,
+    val sumOfBranchQuotas: Double,
+    val totalActual: Double,
+    val totalProjected: Double,
+    val weightedBranchProjectedRatio: Float,
+    val positiveBranchesCount: Int,
+    val moderateRiskBranchesCount: Int,
+    val behindBranchesCount: Int,
+    val positiveSurplusTotal: Double,
+    val negativeDeficitTotal: Double,
+    val branchNetBalance: Double,
+    val netBalanceVsAdminQuota: Double,
+    val adminProjectedRatio: Float,
+    val surplusCoversDeficit: Boolean,
+    val pace: ProjectionPace,
+    val branchOutcomes: List<BranchWeightedOutcome>
 )
 
 data class ChartSeries(
@@ -339,6 +816,65 @@ data class ChartSeries(
     val projectedCumulativeByDay: List<Double>
 )
 
+data class ActiveBiweeklyCycleInfo(
+    val periodId: String,
+    val title: String,
+    val startDate: String,
+    val endDate: String,
+    val effectiveUpperDateIso: String,
+    val totalDays: Int,
+    val daysElapsed: Int,
+    val remainingDays: Int,
+    val isCycleEnded: Boolean,
+    val generalQuota: BiweeklyQuota,
+    val activeQuotaIds: Set<String>
+)
+
+@Keep
+@IgnoreExtraProperties
+data class BiweeklyCycleBranchArchive(
+    val branchName: String = "",
+    val targetGlobalSales: Double = 0.0,
+    val actualGlobalSales: Double = 0.0,
+    val targetCreditSales: Double = 0.0,
+    val actualCreditSales: Double = 0.0,
+    val actualNewCustomers: Long = 0L,
+    val actualAppMaOperations: Long = 0L,
+    val actualNewCustomerRequests: Long = 0L,
+    val completionPercent: Long = 0L,
+    val hasCustomQuota: Boolean = false,
+    val entriesCount: Long = 0L
+)
+
+@Keep
+@IgnoreExtraProperties
+data class BiweeklyCycleArchive(
+    @DocumentId val id: String = "",
+    val archiveId: String = "",
+    val cyclePeriodId: String = "",
+    val title: String = "",
+    val startDate: String = "",
+    val endDate: String = "",
+    val closedOnDate: String = "",
+    val totalDays: Long = 15L,
+    val closedByUid: String = "",
+    val closedByEmail: String = "",
+    val adminTargetGlobalSales: Double = 0.0,
+    val adminActualGlobalSales: Double = 0.0,
+    val adminTargetCreditSales: Double = 0.0,
+    val adminActualCreditSales: Double = 0.0,
+    val adminTargetNewCustomers: Long = 0L,
+    val adminActualNewCustomers: Long = 0L,
+    val adminTargetAppMaOperations: Long = 0L,
+    val adminActualAppMaOperations: Long = 0L,
+    val adminTargetNewCustomerRequests: Long = 0L,
+    val adminActualNewCustomerRequests: Long = 0L,
+    val adminCompletionPercent: Long = 0L,
+    val entriesCount: Long = 0L,
+    val branchSummaries: List<BiweeklyCycleBranchArchive> = emptyList(),
+    @ServerTimestamp val closedAt: Timestamp? = null
+)
+
 data class SalesProjectionSummary(
     val quota: BiweeklyQuota,
     val daysElapsed: Int,
@@ -346,7 +882,10 @@ data class SalesProjectionSummary(
     val metrics: List<MetricProgress>,
     val entriesCount: Int,
     val todayEntry: DailySalesEntry?,
-    val recentEntries: List<DailySalesEntry> = emptyList()
+    val recentEntries: List<DailySalesEntry> = emptyList(),
+    val remainingDays: Int = (totalDays - daysElapsed).coerceAtLeast(0),
+    val weightedByMetric: Map<SalesMetricType, AdminWeightedProjection> = emptyMap(),
+    val isCycleEnded: Boolean = false
 )
 
 data class BranchSalesSummary(
@@ -361,8 +900,27 @@ data class BranchSalesSummary(
     val totalAppMaOps: Long,
     val totalNewRequests: Long,
     val progressRatio: Float,
-    val completionPercent: Int
-)
+    val completionPercent: Int,
+    val dailyAverage: Double = 0.0,
+    val projectedGlobalSales: Double = 0.0,
+    val projectedDelta: Double = 0.0,
+    val projectedRatio: Float = 0f,
+    val projectedPercent: Int = 0,
+    val pace: ProjectionPace = ProjectionPace.BEHIND,
+    val daysElapsed: Int = 1,
+    val remainingDays: Int = 0,
+    val totalCycleDays: Int = 15,
+    val requiredDailyPace: Double = 0.0
+) {
+    val remainingGlobalSales: Double
+        get() = (quota.targetGlobalSales - totalGlobalSales).coerceAtLeast(0.0)
+
+    val surplusGlobalSales: Double
+        get() = (totalGlobalSales - quota.targetGlobalSales).coerceAtLeast(0.0)
+
+    val isGlobalTargetMet: Boolean
+        get() = quota.targetGlobalSales > 0.0 && totalGlobalSales >= quota.targetGlobalSales
+}
 
 fun resolveQuotaForBranch(
     branchName: String,
@@ -407,10 +965,19 @@ fun buildBranchSalesSummaries(
     entries: List<DailySalesEntry>,
     teamUsers: List<UserProfile>,
     todayIso: String = com.example.utils.DateAndFormatters.todayIso(),
-    currentPeriodId: String = com.example.utils.DateAndFormatters.currentBiweeklyPeriodId()
+    currentPeriodId: String? = null
 ): List<BranchSalesSummary> {
     if (quotas.isEmpty()) return emptyList()
-    val (periodStartIso, periodEndIso) = com.example.utils.DateAndFormatters.biweeklyRangeForIso(todayIso)
+    val activeCycle = com.example.data.repository.ProjectionCalculator.resolveActiveCycleInfo(quotas, todayIso)
+    val effectivePeriodId = currentPeriodId?.takeIf { it.isNotBlank() } ?: activeCycle.periodId
+    val periodStartIso = activeCycle.startDate
+    val periodEndIso = activeCycle.endDate
+    val effectiveUpperIso = activeCycle.effectiveUpperDateIso
+    val totalCycleDays = activeCycle.totalDays
+    val daysElapsed = activeCycle.daysElapsed
+    val remainingDays = activeCycle.remainingDays
+    val activeQuotaIds = activeCycle.activeQuotaIds
+
     val uidToBranch = teamUsers
         .mapNotNull { user ->
             val branch = user.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
@@ -419,7 +986,7 @@ fun buildBranchSalesSummaries(
         .toMap()
 
     return branches.mapNotNull { branch ->
-        val (resolvedQuota, hasCustom) = resolveQuotaForBranch(branch, quotas, currentPeriodId)
+        val (resolvedQuota, hasCustom) = resolveQuotaForBranch(branch, quotas, effectivePeriodId)
         val quota = resolvedQuota ?: return@mapNotNull null
 
         val branchEntries = entries
@@ -429,8 +996,11 @@ fun buildBranchSalesSummaries(
                     ?: entry.userName.takeIf { it in BranchOptions.ALL_BRANCHES }
                     ?: entry.userName
                 val matchesBranch = resolvedBranch == branch
-                val inCalendarQuincena = entry.dateString >= periodStartIso && entry.dateString <= periodEndIso
-                matchesBranch && inCalendarQuincena
+                val inActiveCycleDates = entry.dateString >= periodStartIso && entry.dateString <= effectiveUpperIso
+                val matchesActiveQuota = activeQuotaIds.isEmpty() ||
+                    entry.quotaId.isBlank() ||
+                    entry.quotaId in activeQuotaIds
+                matchesBranch && inActiveCycleDates && matchesActiveQuota
             }
             .sortedWith(
                 compareByDescending<DailySalesEntry> { it.dateString }
@@ -450,6 +1020,28 @@ fun buildBranchSalesSummaries(
         val ratio = if (target > 0.0) (totalGlobal / target).toFloat().coerceAtLeast(0f) else 0f
         val pct = kotlin.math.round(ratio * 100f).toInt().coerceAtLeast(0)
 
+        val dailyAverage = totalGlobal / daysElapsed.toDouble()
+        val projectedGlobal = totalGlobal + dailyAverage * remainingDays.toDouble()
+        val projectedDelta = projectedGlobal - target
+        val projectedRatio = if (target > 0.0) {
+            (projectedGlobal / target).toFloat().coerceAtLeast(0f)
+        } else if (totalGlobal >= 0.0) {
+            1f
+        } else {
+            0f
+        }
+        val projectedPercent = kotlin.math.round(projectedRatio * 100f).toInt().coerceAtLeast(0)
+        val pace = when {
+            projectedRatio >= 0.9999f -> ProjectionPace.ON_TRACK
+            projectedRatio >= 0.80f -> ProjectionPace.MODERATE_RISK
+            else -> ProjectionPace.BEHIND
+        }
+        val requiredDailyPace = if (remainingDays > 0) {
+            (target - totalGlobal).coerceAtLeast(0.0) / remainingDays.toDouble()
+        } else {
+            (target - totalGlobal).coerceAtLeast(0.0)
+        }
+
         BranchSalesSummary(
             branchName = branch,
             quota = quota,
@@ -462,7 +1054,17 @@ fun buildBranchSalesSummaries(
             totalAppMaOps = totalAppMa,
             totalNewRequests = totalRequests,
             progressRatio = ratio,
-            completionPercent = pct
+            completionPercent = pct,
+            dailyAverage = dailyAverage,
+            projectedGlobalSales = projectedGlobal,
+            projectedDelta = projectedDelta,
+            projectedRatio = projectedRatio,
+            projectedPercent = projectedPercent,
+            pace = pace,
+            daysElapsed = daysElapsed,
+            remainingDays = remainingDays,
+            totalCycleDays = totalCycleDays,
+            requiredDailyPace = requiredDailyPace
         )
     }
 }

@@ -326,5 +326,35 @@ object ScheduledTasksCatalog {
         branchName: String?
     ): List<com.example.data.model.DailyTaskTemplate> =
         templates.filter { it.appliesTo(dateIso, branchName) }
+
+    fun isDailySalesClosingTask(task: com.example.data.model.AssignedTask): Boolean {
+        val slug = DateAndFormatters.extractScheduledSlug(task.id)
+        val closingTplId = templateDocIdForSlug(DAILY_SALES_CLOSING_SLUG)
+        return task.title.trim().equals(DAILY_SALES_CLOSING_TITLE, ignoreCase = true) ||
+            slug == DAILY_SALES_CLOSING_SLUG ||
+            task.id.contains("_${DAILY_SALES_CLOSING_SLUG}_") ||
+            task.id.endsWith("_${DAILY_SALES_CLOSING_SLUG}") ||
+            task.templateId == closingTplId
+    }
+
+    fun isDailySalesClosingTemplate(template: com.example.data.model.DailyTaskTemplate): Boolean {
+        val closingTplId = templateDocIdForSlug(DAILY_SALES_CLOSING_SLUG)
+        return template.slug == DAILY_SALES_CLOSING_SLUG ||
+            template.id == closingTplId ||
+            template.title.trim().equals(DAILY_SALES_CLOSING_TITLE, ignoreCase = true)
+    }
+
+    fun filterTasksForRole(
+        tasks: List<com.example.data.model.AssignedTask>,
+        isAdmin: Boolean
+    ): List<com.example.data.model.AssignedTask> =
+        if (isAdmin) tasks.filterNot(::isDailySalesClosingTask) else tasks
+
+    fun filterTemplatesForRole(
+        templates: List<com.example.data.model.DailyTaskTemplate>,
+        isAdmin: Boolean
+    ): List<com.example.data.model.DailyTaskTemplate> =
+        if (isAdmin) templates.filterNot(::isDailySalesClosingTemplate) else templates
 }
+
 

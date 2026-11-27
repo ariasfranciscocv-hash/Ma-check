@@ -4,29 +4,38 @@ import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.AppPreferences
+import com.example.data.model.ActiveBiweeklyCycleInfo
 import com.example.data.model.AssignedTask
+import com.example.data.model.BiweeklyCycleArchive
 import com.example.data.model.BiweeklyQuota
 import com.example.data.model.BranchOptions
 import com.example.data.model.BranchSalesSummary
+import com.example.data.model.BranchTaskCompletion
+import com.example.data.model.BranchTaskLockHelper
 import com.example.data.model.ChartSeries
 import com.example.data.model.ClosingAttachmentDraft
 import com.example.data.model.DailySalesEntry
 import com.example.data.model.DailyTaskTemplate
-import com.example.data.model.MetricProgress
-import com.example.data.model.ProjectionPace
+import com.example.data.model.EmployeeBranchParticipationStats
+import com.example.data.model.EmployeeIdentity
 import com.example.data.model.SalesMetricType
 import com.example.data.model.SalesProjectionSummary
 import com.example.data.model.TaskEvidence
 import com.example.data.model.TaskEvidenceAttachmentFile
 import com.example.data.model.TaskNotification
 import com.example.data.model.TaskPriority
+import com.example.data.model.TaskStatus
 import com.example.data.model.TaskType
 import com.example.data.model.UiState
 import com.example.data.model.UserProfile
 import com.example.data.model.UserRole
 import com.example.data.model.buildBranchSalesSummaries
-import com.example.data.model.resolveQuotaForBranch
 import com.example.data.repository.AppRepository
+import com.example.data.repository.BranchTaskAlreadyCompletedException
+import com.example.data.repository.EmployeeIdentityRepository
+import com.example.data.repository.ProjectionCalculator
+import com.example.data.repository.QuotaRepositoryExtensions
+import com.example.data.repository.ScheduledTasksCatalog
 import com.example.utils.AppCrashGuard
 import com.example.utils.DateAndFormatters
 import com.example.utils.EncodedAttachment
@@ -45,6 +54,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
@@ -57,7 +67,9 @@ class MainViewModel(
     val currentUserId: String,
     val currentUserName: String,
     val currentUserEmail: String?,
-    val isEmailVerified: Boolean
+    val isEmailVerified: Boolean,
+    private val quotaExtensions: QuotaRepositoryExtensions? = null,
+    private val identityRepository: EmployeeIdentityRepository? = null
 ) : ViewModel() {
 
     private val bootstrappedAdmin: Boolean = AppRepository.isBootstrappedAdmin(currentUserEmail, isEmailVerified)
@@ -87,6 +99,9 @@ class MainViewModel(
 
     private val _isRoleResolved = MutableStateFlow(bootstrappedAdmin)
     val isRoleResolved: StateFlow<Boolean> = _isRoleResolved.asStateFlow()
+
+    private val _isEmployeeIdentityResolved = MutableStateFlow(bootstrappedAdmin || identityRepository == null)
+    val isEmployeeIdentityResolved: StateFlow<Boolean> = _isEmployeeIdentityResolved.asStateFlow()
 
     private val _branchConfirmedThisSession = MutableStateFlow(bootstrappedAdmin)
     val branchConfirmedThisSession: StateFlow<Boolean> = _branchConfirmedThisSession.asStateFlow()
@@ -154,6 +169,46 @@ class MainViewModel(
             initialValue = emptyList()
         )
 
+    val currentEmployeeIdentity: StateFlow<EmployeeIdentity?> = combine(
+        isRoleResolved,
+        isAdminState
+    ) { resolved, isAdmin -> resolved to isAdmin }
+        .flatMapLatest { (resolved, isAdmin) ->
+            when {
+                !resolved -> flow { }
+                isAdmin || bootstrappedAdmin || identityRepository == null -> {
+                    _isEmployeeIdentityResolved.value = true
+                    flowOf(null)
+                }
+                else -> identityRepository.observeCurrentEmployeeIdentity(currentUserId)
+                    .onEach { _isEmployeeIdentityResolved.value = true }
+            }
+        }
+        .catch { error ->
+            unwrapFirestoreOrThrow(error, "observeCurrentEmployeeIdentity")
+            _isEmployeeIdentityResolved.value = true
+            emit(null)
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = null
+        )
+
+    val employeeIdentities: StateFlow<List<EmployeeIdentity>> = isAdminState
+        .flatMapLatest { isAdmin ->
+            identityRepository?.observeAllEmployeeIdentities(currentUserId, isAdmin) ?: flowOf(emptyList())
+        }
+        .catch { error ->
+            unwrapFirestoreOrThrow(error, "observeAllEmployeeIdentities")
+            emit(emptyList())
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+            initialValue = emptyList()
+        )
+
     val scheduleTickerState: StateFlow<Long> = flow {
         while (true) {
             emit(System.currentTimeMillis())
@@ -169,7 +224,7 @@ class MainViewModel(
         .map { DateAndFormatters.todayIso() }
         .distinctUntilChanged()
 
-    val tasksState: StateFlow<UiState<List<AssignedTask>>> = isAdminState
+    private val rawTasksState: StateFlow<UiState<List<AssignedTask>>> = isAdminState
         .flatMapLatest { isAdmin -> repository.observeTasks(currentUserId, isAdmin) }
         .map<List<AssignedTask>, UiState<List<AssignedTask>>> { UiState.Success(it) }
         .catch { error ->
@@ -182,8 +237,75 @@ class MainViewModel(
             initialValue = UiState.Loading
         )
 
-    val dailyTaskTemplatesState: StateFlow<List<DailyTaskTemplate>> = repository
-        .observeDailyTaskTemplates(currentUserId)
+    val branchTaskCompletionsState: StateFlow<List<BranchTaskCompletion>> = combine(
+        isAdminState,
+        currentEmployeeIdentity,
+        currentUserProfile,
+        selectedBranch
+    ) { isAdmin, identity, profile, selected ->
+        val branch = identity?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+            ?: profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+            ?: selected.takeIf { it in BranchOptions.ALL_BRANCHES }
+        isAdmin to branch
+    }
+        .distinctUntilChanged()
+        .flatMapLatest { (isAdmin, branch) ->
+            identityRepository?.observeBranchTaskCompletions(
+                uid = currentUserId,
+                isAdmin = isAdmin,
+                branchName = branch
+            ) ?: flowOf(emptyList())
+        }
+        .catch { error ->
+            unwrapFirestoreOrThrow(error, "observeBranchTaskCompletions")
+            emit(emptyList())
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+            initialValue = emptyList()
+        )
+
+    val tasksState: StateFlow<UiState<List<AssignedTask>>> = combine(
+        rawTasksState,
+        branchTaskCompletionsState,
+        isAdminState,
+        currentEmployeeIdentity,
+        teamUsers
+    ) { rawState, completions, isAdmin, identity, users ->
+        when (rawState) {
+            is UiState.Loading -> UiState.Loading
+            is UiState.Error -> UiState.Error(rawState.message)
+            is UiState.Success -> {
+                val merged = BranchTaskLockHelper.mergeTasksWithBranchCompletions(
+                    tasks = rawState.data,
+                    completions = completions,
+                    isAdmin = isAdmin,
+                    employeeBranch = identity?.branchName,
+                    teamUsers = users
+                ).let { list ->
+                    ScheduledTasksCatalog.filterTasksForRole(list, isAdmin)
+                }.sortedWith(
+                    compareBy<AssignedTask> { it.parsedStatus == TaskStatus.COMPLETED }
+                        .thenByDescending { it.parsedType == TaskType.EXTRAORDINARY }
+                        .thenByDescending { it.parsedPriority == TaskPriority.URGENT }
+                        .thenByDescending { it.createdAt ?: com.google.firebase.Timestamp(0, 0) }
+                )
+                UiState.Success(merged)
+            }
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+        initialValue = UiState.Loading
+    )
+
+    val dailyTaskTemplatesState: StateFlow<List<DailyTaskTemplate>> = combine(
+        repository.observeDailyTaskTemplates(currentUserId),
+        isAdminState
+    ) { templates, isAdmin ->
+        ScheduledTasksCatalog.filterTemplatesForRole(templates, isAdmin)
+    }
         .catch { error ->
             unwrapFirestoreOrThrow(error, "observeDailyTaskTemplates")
             emit(emptyList())
@@ -240,20 +362,49 @@ class MainViewModel(
             initialValue = UiState.Loading
         )
 
-    val activeQuotaState: StateFlow<UiState<BiweeklyQuota?>> = activeQuotasState
-        .map { state ->
-            when (state) {
-                is UiState.Loading -> UiState.Loading
-                is UiState.Error -> UiState.Error(state.message)
-                is UiState.Success -> {
-                    val generalQuota = resolveQuotaForBranch(
-                        branchName = BranchOptions.ALL_BRANCHES_OPTION,
-                        quotas = state.data
-                    ).first
-                    UiState.Success(generalQuota)
-                }
+    val activeCycleInfoState: StateFlow<ActiveBiweeklyCycleInfo> = combine(
+        activeQuotasState,
+        todayDateFlow
+    ) { quotasState, todayIso ->
+        val quotas = (quotasState as? UiState.Success)?.data ?: emptyList()
+        ProjectionCalculator.resolveActiveCycleInfo(quotas, todayIso)
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+        initialValue = ProjectionCalculator.resolveActiveCycleInfo(emptyList())
+    )
+
+    val cycleArchivesState: StateFlow<List<BiweeklyCycleArchive>> = isAdminState
+        .flatMapLatest { isAdmin ->
+            quotaExtensions?.observeCycleArchives(currentUserId, isAdmin) ?: flowOf(emptyList())
+        }
+        .catch { error ->
+            unwrapFirestoreOrThrow(error, "observeCycleArchives")
+            emit(emptyList())
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+            initialValue = emptyList()
+        )
+
+    val activeQuotaState: StateFlow<UiState<BiweeklyQuota?>> = combine(
+        activeQuotasState,
+        todayDateFlow
+    ) { state, todayIso ->
+        when (state) {
+            is UiState.Loading -> UiState.Loading
+            is UiState.Error -> UiState.Error(state.message)
+            is UiState.Success -> {
+                val activeCycle = ProjectionCalculator.resolveActiveCycleInfo(state.data, todayIso)
+                val generalQuota = ProjectionCalculator.resolveIndependentGeneralQuota(
+                    quotas = state.data,
+                    currentPeriodId = activeCycle.periodId
+                )
+                UiState.Success(generalQuota)
             }
         }
+    }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
@@ -273,12 +424,36 @@ class MainViewModel(
             initialValue = UiState.Loading
         )
 
+    val employeeParticipationStatsState: StateFlow<EmployeeBranchParticipationStats?> = combine(
+        currentEmployeeIdentity,
+        tasksState,
+        branchTaskCompletionsState,
+        activeQuotaState,
+        todayDateFlow
+    ) { identity, tasksUiState, completions, quotaUiState, todayIso ->
+        if (identity == null || !identity.hasIdentityCore) return@combine null
+        val tasksList = (tasksUiState as? UiState.Success)?.data ?: emptyList()
+        val quota = (quotaUiState as? UiState.Success)?.data
+        BranchTaskLockHelper.computeEmployeeBranchParticipationStats(
+            identity = identity,
+            tasks = tasksList,
+            completions = completions,
+            activeQuota = quota,
+            todayIso = todayIso
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+        initialValue = null
+    )
+
     val branchSalesSummariesState: StateFlow<List<BranchSalesSummary>> = combine(
         activeQuotasState,
         salesEntriesState,
         teamUsers,
         isAdminState,
         currentUserProfile,
+        currentEmployeeIdentity,
         todayDateFlow
     ) { values ->
         @Suppress("UNCHECKED_CAST")
@@ -289,14 +464,17 @@ class MainViewModel(
         val users = values[2] as List<UserProfile>
         val isAdmin = values[3] as Boolean
         val profile = values[4] as UserProfile?
-        val todayIso = values[5] as String
+        val identity = values[5] as EmployeeIdentity?
+        val todayIso = values[6] as String
 
         val quotas = (quotasState as? UiState.Success)?.data ?: return@combine emptyList()
         val rawEntries = (entriesState as? UiState.Success)?.data ?: emptyList()
         val branchesToShow = if (isAdmin) {
             BranchOptions.ALL_BRANCHES
         } else {
-            listOfNotNull(profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES })
+            val employeeBranch = identity?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                ?: profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+            listOfNotNull(employeeBranch)
         }
         buildBranchSalesSummaries(
             branches = branchesToShow,
@@ -304,12 +482,35 @@ class MainViewModel(
             entries = rawEntries,
             teamUsers = users,
             todayIso = todayIso,
-            currentPeriodId = DateAndFormatters.biweeklyPeriodIdForIso(todayIso)
+            currentPeriodId = null
         )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
         initialValue = emptyList()
+    )
+
+    val adminGeneralSummaryState: StateFlow<SalesProjectionSummary?> = combine(
+        activeQuotasState,
+        salesEntriesState,
+        isAdminState,
+        teamUsers,
+        todayDateFlow
+    ) { quotasState, entriesState, isAdmin, users, todayIso ->
+        if (!isAdmin) return@combine null
+        val quotas = (quotasState as? UiState.Success)?.data ?: emptyList()
+        val rawEntries = (entriesState as? UiState.Success)?.data ?: emptyList()
+        ProjectionCalculator.computeAdminGeneralIndicatorsSummary(
+            quotas = quotas,
+            allBranchEntries = rawEntries,
+            users = users,
+            uid = currentUserId,
+            todayIso = todayIso
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+        initialValue = null
     )
 
     val projectionSummaryState: StateFlow<UiState<SalesProjectionSummary?>> = combine(
@@ -319,6 +520,7 @@ class MainViewModel(
         isAdminState,
         teamUsers,
         currentUserProfile,
+        currentEmployeeIdentity,
         todayDateFlow
     ) { values ->
         @Suppress("UNCHECKED_CAST")
@@ -330,7 +532,8 @@ class MainViewModel(
         @Suppress("UNCHECKED_CAST")
         val users = values[4] as List<UserProfile>
         val profile = values[5] as UserProfile?
-        val todayIso = values[6] as String
+        val identity = values[6] as EmployeeIdentity?
+        val todayIso = values[7] as String
 
         when {
             quotasState is UiState.Error -> UiState.Error(quotasState.message)
@@ -342,19 +545,43 @@ class MainViewModel(
                 val targetBranch = if (isAdmin) {
                     branchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
                 } else {
-                    profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                    identity?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                        ?: profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
                         ?: branchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
                 }
-                val quota = resolveQuotaForBranch(
-                    branchName = targetBranch,
-                    quotas = quotas,
-                    currentPeriodId = DateAndFormatters.biweeklyPeriodIdForIso(todayIso)
-                ).first
-                if (quota == null) {
-                    UiState.Success(null)
+                if (isAdmin && targetBranch == BranchOptions.ALL_BRANCHES_OPTION) {
+                    UiState.Success(
+                        ProjectionCalculator.computeAdminGeneralIndicatorsSummary(
+                            quotas = quotas,
+                            allBranchEntries = rawEntries,
+                            users = users,
+                            uid = currentUserId,
+                            todayIso = todayIso
+                        )
+                    )
                 } else {
-                    val filteredEntries = filterEntriesForSelectedBranch(rawEntries, branchFilter, isAdmin, users)
-                    UiState.Success(computeProjectionSummary(quota, filteredEntries, currentUserId, users, todayIso))
+                    val activeCycle = ProjectionCalculator.resolveActiveCycleInfo(quotas, todayIso)
+                    val quota = ProjectionCalculator.resolveQuotaForDashboard(
+                        targetBranch = targetBranch,
+                        quotas = quotas,
+                        currentPeriodId = activeCycle.periodId
+                    )
+                    if (quota == null) {
+                        UiState.Success(null)
+                    } else {
+                        val filteredEntries = filterEntriesForSelectedBranch(rawEntries, branchFilter, isAdmin, users)
+                        UiState.Success(
+                            ProjectionCalculator.computeProjectionSummary(
+                                quota = quota,
+                                entries = filteredEntries,
+                                uid = currentUserId,
+                                users = users,
+                                todayIso = todayIso,
+                                closingBranchName = if (isAdmin) null else resolveClosingBranchName(),
+                                activeQuotaIds = activeCycle.activeQuotaIds
+                            )
+                        )
+                    }
                 }
             }
         }
@@ -372,6 +599,7 @@ class MainViewModel(
         isAdminState,
         teamUsers,
         currentUserProfile,
+        currentEmployeeIdentity,
         todayDateFlow
     ) { values ->
         @Suppress("UNCHECKED_CAST")
@@ -384,23 +612,37 @@ class MainViewModel(
         @Suppress("UNCHECKED_CAST")
         val users = values[5] as List<UserProfile>
         val profile = values[6] as UserProfile?
-        val todayIso = values[7] as String
+        val identity = values[7] as EmployeeIdentity?
+        val todayIso = values[8] as String
 
         val quotas = (quotasState as? UiState.Success)?.data ?: return@combine null
         val targetBranch = if (isAdmin) {
             branchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
         } else {
-            profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+            identity?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                ?: profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
                 ?: branchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
         }
-        val quota = resolveQuotaForBranch(
-            branchName = targetBranch,
+        val activeCycle = ProjectionCalculator.resolveActiveCycleInfo(quotas, todayIso)
+        val quota = ProjectionCalculator.resolveQuotaForDashboard(
+            targetBranch = targetBranch,
             quotas = quotas,
-            currentPeriodId = DateAndFormatters.biweeklyPeriodIdForIso(todayIso)
-        ).first ?: return@combine null
+            currentPeriodId = activeCycle.periodId
+        ) ?: if (isAdmin && targetBranch == BranchOptions.ALL_BRANCHES_OPTION) {
+            activeCycle.generalQuota
+        } else {
+            null
+        } ?: return@combine null
         val rawEntries = (entriesState as? UiState.Success)?.data ?: emptyList()
         val filteredEntries = filterEntriesForSelectedBranch(rawEntries, branchFilter, isAdmin, users)
-        buildChartSeries(quota, filteredEntries, metric, users, todayIso)
+        ProjectionCalculator.buildChartSeries(
+            quota = quota,
+            entries = filteredEntries,
+            metric = metric,
+            users = users,
+            todayIso = todayIso,
+            activeQuotaIds = activeCycle.activeQuotaIds
+        )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
@@ -449,31 +691,54 @@ class MainViewModel(
                 isRoleResolved,
                 isAdminState,
                 currentUserProfile,
-                dailyTaskTemplatesState
-            ) { resolved, isAdmin, profile, templates ->
-                listOf(resolved, isAdmin, profile, templates)
+                dailyTaskTemplatesState,
+                currentEmployeeIdentity,
+                isEmployeeIdentityResolved
+            ) { values ->
+                values
             }.collect { values ->
                 val resolved = values[0] as Boolean
                 val isAdmin = values[1] as Boolean
                 val profile = values[2] as UserProfile?
                 @Suppress("UNCHECKED_CAST")
                 val templates = values[3] as List<DailyTaskTemplate>
+                val identity = values[4] as EmployeeIdentity?
+                val identityResolved = values[5] as Boolean
                 if (!resolved) return@collect
                 if (isAdmin || bootstrappedAdmin || profile?.parsedRole == UserRole.ADMIN) {
                     if (_selectedBranch.value.isBlank()) {
                         _selectedBranch.value = BranchOptions.ALL_BRANCHES_OPTION
                     }
+                    _branchConfirmedThisSession.value = true
                     return@collect
                 }
-                val branch = profile?.branchName
-                if (!branch.isNullOrBlank()) {
-                    if (_selectedBranch.value.isBlank()) {
-                        _selectedBranch.value = branch
+                if (identityRepository != null) {
+                    if (!identityResolved) return@collect
+                    if (identity == null || !identity.isComplete) {
+                        _branchConfirmedThisSession.value = false
+                        if (identity?.requiresBranchOnlyReassignment == true) {
+                            _selectedBranch.value = ""
+                        }
+                        return@collect
                     }
+                    val branch = identity.branchName ?: return@collect
+                    _selectedBranch.value = branch
+                    _branchConfirmedThisSession.value = true
                     preferences.saveLastBranch(currentUserId, branch)
                     val templateSignature = templates.joinToString("|") { "${it.id}:${it.daysOfWeek.joinToString(",")}:${it.targetBranches.joinToString(",")}" }
                     syncScheduledChecklistIfNeeded(branch, templateSignature)
                     syncDailyClosingResetIfNeeded(branch)
+                } else {
+                    val branch = profile?.branchName
+                    if (!branch.isNullOrBlank()) {
+                        if (_selectedBranch.value.isBlank()) {
+                            _selectedBranch.value = branch
+                        }
+                        preferences.saveLastBranch(currentUserId, branch)
+                        val templateSignature = templates.joinToString("|") { "${it.id}:${it.daysOfWeek.joinToString(",")}:${it.targetBranches.joinToString(",")}" }
+                        syncScheduledChecklistIfNeeded(branch, templateSignature)
+                        syncDailyClosingResetIfNeeded(branch)
+                    }
                 }
             }
         }
@@ -488,9 +753,15 @@ class MainViewModel(
         if (isAdminState.value || bootstrappedAdmin || currentUserProfile.value?.parsedRole == UserRole.ADMIN) {
             return
         }
-        val branch = currentUserProfile.value?.branchName?.takeIf { it.isNotBlank() }
-            ?: _selectedBranch.value.takeIf { it in BranchOptions.ALL_BRANCHES }
-            ?: return
+        val branch = if (identityRepository != null) {
+            val identity = currentEmployeeIdentity.value
+            if (identity == null || !identity.isComplete) return
+            identity.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES } ?: return
+        } else {
+            currentUserProfile.value?.branchName?.takeIf { it.isNotBlank() }
+                ?: _selectedBranch.value.takeIf { it in BranchOptions.ALL_BRANCHES }
+                ?: return
+        }
         syncScheduledChecklistIfNeeded(branch, forceRefresh = true)
         syncDailyClosingResetIfNeeded(branch, nowMillis)
     }
@@ -593,7 +864,128 @@ class MainViewModel(
             }
             return
         }
+        val identity = currentEmployeeIdentity.value
+        if (identity != null && identity.isComplete) {
+            _actionMessage.value = "Tu ficha y sucursal están bloqueadas. Solo el administrador puede liberar tu sucursal."
+            return
+        }
         _branchConfirmedThisSession.value = false
+    }
+
+    fun registerEmployeeIdentity(
+        fullName: String,
+        payrollNumber: String,
+        branchName: String,
+        onError: (String) -> Unit = {},
+        onSuccess: () -> Unit = {}
+    ) {
+        val idRepo = identityRepository
+        if (idRepo == null) {
+            confirmBranchSelection(branchName)
+            onSuccess()
+            return
+        }
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val result = idRepo.registerEmployeeIdentity(
+                fullName = fullName,
+                payrollNumberRaw = payrollNumber,
+                branchName = branchName,
+                email = currentUserEmail
+            )
+            _isBusy.value = false
+            result.fold(
+                onSuccess = { saved ->
+                    _selectedBranch.value = branchName
+                    _branchConfirmedThisSession.value = true
+                    preferences.saveLastBranch(currentUserId, branchName)
+                    if (!isAdminState.value && !bootstrappedAdmin) {
+                        syncScheduledChecklistIfNeeded(branchName, forceRefresh = true)
+                        syncDailyClosingResetIfNeeded(branchName)
+                    }
+                    _actionMessage.value = "Ficha registrada: ${saved.formattedTopBarTag}"
+                    onSuccess()
+                },
+                onFailure = { err ->
+                    val msg = err.localizedMessage ?: "No se pudo guardar la ficha de identificación."
+                    onError(msg)
+                    _actionMessage.value = msg
+                }
+            )
+        }
+    }
+
+    fun assignBranchToReleasedIdentity(
+        branchName: String,
+        onError: (String) -> Unit = {},
+        onSuccess: () -> Unit = {}
+    ) {
+        val idRepo = identityRepository ?: return
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val result = idRepo.assignBranchToReleasedIdentity(branchName)
+            _isBusy.value = false
+            result.fold(
+                onSuccess = {
+                    _selectedBranch.value = branchName
+                    _branchConfirmedThisSession.value = true
+                    preferences.saveLastBranch(currentUserId, branchName)
+                    if (!isAdminState.value && !bootstrappedAdmin) {
+                        syncScheduledChecklistIfNeeded(branchName, forceRefresh = true)
+                        syncDailyClosingResetIfNeeded(branchName)
+                    }
+                    _actionMessage.value = "Sucursal asignada: $branchName"
+                    onSuccess()
+                },
+                onFailure = { err ->
+                    val msg = err.localizedMessage ?: "No se pudo actualizar la sucursal asignada."
+                    onError(msg)
+                    _actionMessage.value = msg
+                }
+            )
+        }
+    }
+
+    fun releaseEmployeeBranch(identity: EmployeeIdentity) {
+        if (!isCurrentAccountAdmin()) {
+            _actionMessage.value = "Solo el administrador puede liberar la sucursal de un empleado."
+            return
+        }
+        val idRepo = identityRepository ?: return
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val result = idRepo.releaseEmployeeBranchAsAdmin(identity)
+            _isBusy.value = false
+            result.fold(
+                onSuccess = {
+                    _actionMessage.value = "Sucursal liberada para ${identity.fullName} (Nómina ${identity.displayPayroll})."
+                },
+                onFailure = { err ->
+                    _actionMessage.value = err.localizedMessage ?: "No se pudo liberar la sucursal."
+                }
+            )
+        }
+    }
+
+    fun deleteEmployeeIdentityCompletely(identity: EmployeeIdentity) {
+        if (!isCurrentAccountAdmin()) {
+            _actionMessage.value = "Solo el administrador puede eliminar fichas de empleados."
+            return
+        }
+        val idRepo = identityRepository ?: return
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val result = idRepo.deleteEmployeeIdentityCompletelyAsAdmin(identity)
+            _isBusy.value = false
+            result.fold(
+                onSuccess = {
+                    _actionMessage.value = "Ficha de ${identity.fullName} (Nómina ${identity.displayPayroll}) eliminada por completo."
+                },
+                onFailure = { err ->
+                    _actionMessage.value = err.localizedMessage ?: "No se pudo eliminar la ficha."
+                }
+            )
+        }
     }
 
     fun dismissDailyBriefingForToday() {
@@ -619,6 +1011,7 @@ class MainViewModel(
     }
 
     fun updateClosingAttachmentDraft(draft: ClosingAttachmentDraft) {
+        if (isCurrentAccountAdmin()) return
         _closingAttachmentDraft.value = draft
     }
 
@@ -637,21 +1030,43 @@ class MainViewModel(
         attachmentDraft: ClosingAttachmentDraft = _closingAttachmentDraft.value,
         onSaved: () -> Unit = {}
     ) {
+        if (isCurrentAccountAdmin()) {
+            _actionMessage.value = "Las cuentas de administrador solo supervisan avances; solo las sucursales registran cierres diarios."
+            return
+        }
         viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
-            val result = repository.upsertDailySalesEntry(
-                quotaId = quotaId,
-                dateString = DateAndFormatters.todayIso(),
-                userName = resolveClosingUserLabel(),
-                branchName = resolveClosingBranchName(),
-                globalSales = globalSales,
-                creditSales = creditSales,
-                newCustomers = newCustomers,
-                appMaOperations = appMaOperations,
-                newCustomerRequests = newCustomerRequests,
-                notes = notes,
-                attachmentDraft = attachmentDraft
-            )
+            val identity = currentEmployeeIdentity.value
+            val idRepo = identityRepository
+            val result = if (identity != null && identity.isComplete && idRepo != null) {
+                idRepo.upsertDailySalesEntryWithIdentity(
+                    quotaId = quotaId,
+                    dateString = DateAndFormatters.todayIso(),
+                    identity = identity,
+                    branchName = resolveClosingBranchName(),
+                    globalSales = globalSales,
+                    creditSales = creditSales,
+                    newCustomers = newCustomers,
+                    appMaOperations = appMaOperations,
+                    newCustomerRequests = newCustomerRequests,
+                    notes = notes,
+                    attachmentDraft = attachmentDraft
+                )
+            } else {
+                repository.upsertDailySalesEntry(
+                    quotaId = quotaId,
+                    dateString = DateAndFormatters.todayIso(),
+                    userName = resolveClosingUserLabel(),
+                    branchName = resolveClosingBranchName(),
+                    globalSales = globalSales,
+                    creditSales = creditSales,
+                    newCustomers = newCustomers,
+                    appMaOperations = appMaOperations,
+                    newCustomerRequests = newCustomerRequests,
+                    notes = notes,
+                    attachmentDraft = attachmentDraft
+                )
+            }
             _isBusy.value = false
             result.fold(
                 onSuccess = { saveRes ->
@@ -679,32 +1094,61 @@ class MainViewModel(
         targetNewCustomerRequests: Long,
         branchName: String = BranchOptions.ALL_BRANCHES_OPTION,
         applyToAllIndividualBranches: Boolean = false,
+        periodId: String? = null,
         onSuccess: () -> Unit
     ) {
+        if (!isCurrentAccountAdmin()) {
+            _actionMessage.value = "Solo los administradores pueden configurar metas quincenales."
+            return
+        }
         viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
-            val result = repository.saveBiweeklyQuota(
-                title = title,
-                startDate = startDate,
-                endDate = endDate,
-                totalDays = totalDays,
-                targetGlobalSales = targetGlobalSales,
-                targetCreditSales = targetCreditSales,
-                targetNewCustomers = targetNewCustomers,
-                targetAppMaOperations = targetAppMaOperations,
-                targetNewCustomerRequests = targetNewCustomerRequests,
-                branchName = branchName,
-                periodId = DateAndFormatters.biweeklyPeriodIdForIso(startDate),
-                applyToAllIndividualBranches = applyToAllIndividualBranches
-            )
+            val openCycle = activeCycleInfoState.value
+            val resolvedPeriodId = periodId?.trim()?.takeIf { it.isNotBlank() }
+                ?: if (startDate == openCycle.startDate && openCycle.periodId.isNotBlank()) {
+                    openCycle.periodId
+                } else {
+                    DateAndFormatters.biweeklyPeriodIdForIso(startDate)
+                }
+            val result = if (quotaExtensions != null) {
+                quotaExtensions.saveIndependentBiweeklyQuota(
+                    title = title,
+                    startDate = startDate,
+                    endDate = endDate,
+                    totalDays = totalDays,
+                    targetGlobalSales = targetGlobalSales,
+                    targetCreditSales = targetCreditSales,
+                    targetNewCustomers = targetNewCustomers,
+                    targetAppMaOperations = targetAppMaOperations,
+                    targetNewCustomerRequests = targetNewCustomerRequests,
+                    branchName = branchName,
+                    periodId = resolvedPeriodId,
+                    applyToAllIndividualBranches = applyToAllIndividualBranches
+                )
+            } else {
+                repository.saveBiweeklyQuota(
+                    title = title,
+                    startDate = startDate,
+                    endDate = endDate,
+                    totalDays = totalDays,
+                    targetGlobalSales = targetGlobalSales,
+                    targetCreditSales = targetCreditSales,
+                    targetNewCustomers = targetNewCustomers,
+                    targetAppMaOperations = targetAppMaOperations,
+                    targetNewCustomerRequests = targetNewCustomerRequests,
+                    branchName = branchName,
+                    periodId = resolvedPeriodId,
+                    applyToAllIndividualBranches = applyToAllIndividualBranches
+                )
+            }
             _isBusy.value = false
             result.fold(
                 onSuccess = {
                     _actionMessage.value = if (branchName == BranchOptions.ALL_BRANCHES_OPTION) {
                         if (applyToAllIndividualBranches) {
-                            "Meta quincenal aplicada a todas las sucursales."
+                            "Meta quincenal aplicada individualmente a las sucursales."
                         } else {
-                            "Meta quincenal general actualizada."
+                            "Meta quincenal general independiente actualizada."
                         }
                     } else {
                         "Meta quincenal actualizada para $branchName."
@@ -713,6 +1157,77 @@ class MainViewModel(
                 },
                 onFailure = { err ->
                     _actionMessage.value = err.localizedMessage ?: "No se pudo actualizar la meta."
+                }
+            )
+        }
+    }
+
+    fun closeAndResetBiweeklyCycle(
+        onSuccess: (BiweeklyCycleArchive) -> Unit = {}
+    ) {
+        if (!isCurrentAccountAdmin()) {
+            _actionMessage.value = "Solo el administrador puede confirmar el cierre del ciclo quincenal."
+            return
+        }
+        val ext = quotaExtensions
+        if (ext == null) {
+            _actionMessage.value = "Servicio de cierre de ciclo no disponible."
+            return
+        }
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val todayIso = DateAndFormatters.todayIso()
+            val activeQuotas = (activeQuotasState.value as? UiState.Success)?.data ?: emptyList()
+            val result = ext.closeAndResetBiweeklyCycle(
+                adminGeneralSummary = adminGeneralSummaryState.value,
+                branchSummaries = branchSalesSummariesState.value,
+                activeQuotas = activeQuotas,
+                todayIso = todayIso
+            )
+            _isBusy.value = false
+            result.fold(
+                onSuccess = { archive ->
+                    _actionMessage.value = "Ciclo cerrado y archivado. Acumulados reiniciados a $0.00 manteniendo tus cuotas base."
+                    onSuccess(archive)
+                },
+                onFailure = { err ->
+                    _actionMessage.value = err.localizedMessage ?: "No se pudo cerrar el ciclo quincenal."
+                }
+            )
+        }
+    }
+
+    fun updateGeneralIndicatorTarget(
+        metric: SalesMetricType,
+        newTargetValue: Double,
+        onSuccess: () -> Unit = {}
+    ) {
+        if (!isCurrentAccountAdmin()) {
+            _actionMessage.value = "Solo los administradores pueden editar la cuota general."
+            return
+        }
+        val ext = quotaExtensions
+        if (ext == null) {
+            _actionMessage.value = "Servicio de cuotas no disponible."
+            return
+        }
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val currentGeneralQuota = adminGeneralSummaryState.value?.quota
+                ?: (activeQuotaState.value as? UiState.Success)?.data
+            val result = ext.updateAdminGeneralIndicatorTarget(
+                metric = metric,
+                newTargetValue = newTargetValue,
+                baseGeneralQuota = currentGeneralQuota
+            )
+            _isBusy.value = false
+            result.fold(
+                onSuccess = {
+                    _actionMessage.value = "Meta general de ${metric.titleEs} guardada."
+                    onSuccess()
+                },
+                onFailure = { err ->
+                    _actionMessage.value = err.localizedMessage ?: "No se pudo guardar la meta de ${metric.titleEs}."
                 }
             )
         }
@@ -761,16 +1276,33 @@ class MainViewModel(
     fun completeTaskWithEvidenceFiles(
         task: AssignedTask,
         files: List<EncodedAttachment>,
+        onError: (String) -> Unit = {},
         onSuccess: () -> Unit
     ) {
+        if (isCurrentAccountAdmin() && isDailySalesClosingTask(task)) {
+            val msg = "Las cuentas de administrador no suben cierres de venta diaria; solo las sucursales lo registran."
+            _actionMessage.value = msg
+            onError(msg)
+            return
+        }
         viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
-            val uploaderName = currentUserProfile.value?.effectiveBranchLabel ?: currentUserName
-            val result = repository.completeTaskWithEvidenceFiles(
-                task = task,
-                uploaderName = uploaderName,
-                files = files
-            )
+            val identity = currentEmployeeIdentity.value
+            val idRepo = identityRepository
+            val result = if (!isCurrentAccountAdmin() && identity != null && identity.isComplete && idRepo != null) {
+                idRepo.completeTaskWithEvidenceAndIdentity(
+                    task = task,
+                    identity = identity,
+                    files = files
+                )
+            } else {
+                val uploaderName = currentUserProfile.value?.effectiveBranchLabel ?: currentUserName
+                repository.completeTaskWithEvidenceFiles(
+                    task = task,
+                    uploaderName = uploaderName,
+                    files = files
+                )
+            }
             _isBusy.value = false
             result.fold(
                 onSuccess = {
@@ -778,7 +1310,12 @@ class MainViewModel(
                     onSuccess()
                 },
                 onFailure = { err ->
-                    _actionMessage.value = err.localizedMessage ?: "No se pudo registrar la evidencia."
+                    val msg = when (err) {
+                        is BranchTaskAlreadyCompletedException -> err.message ?: "Esta tarea ya fue completada por otro compañero."
+                        else -> err.localizedMessage ?: "No se pudo registrar la evidencia."
+                    }
+                    _actionMessage.value = msg
+                    onError(msg)
                 }
             )
         }
@@ -985,16 +1522,28 @@ class MainViewModel(
     }
 
     private fun resolveClosingUserLabel(): String {
+        val identity = currentEmployeeIdentity.value
+        if (identity != null && identity.hasIdentityCore) {
+            return "${identity.displayPayroll} · ${identity.fullName}".take(80)
+        }
         val selected = _selectedBranch.value
         if (selected in BranchOptions.ALL_BRANCHES) return selected
         return currentUserProfile.value?.effectiveBranchLabel ?: currentUserName
     }
 
     private fun resolveClosingBranchName(): String? {
+        val identityBranch = currentEmployeeIdentity.value?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+        if (identityBranch != null) return identityBranch
         val selected = _selectedBranch.value
         if (selected in BranchOptions.ALL_BRANCHES) return selected
         return currentUserProfile.value?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
     }
+
+    private fun isCurrentAccountAdmin(): Boolean =
+        isAdminState.value || bootstrappedAdmin || currentUserProfile.value?.parsedRole == UserRole.ADMIN
+
+    private fun isDailySalesClosingTask(task: AssignedTask): Boolean =
+        ScheduledTasksCatalog.isDailySalesClosingTask(task)
 
     private fun filterEntriesForSelectedBranch(
         entries: List<DailySalesEntry>,
@@ -1014,178 +1563,6 @@ class MainViewModel(
                 entry.userName == branchFilter ||
                 entry.userId in matchingUserIds
         }
-    }
-
-    private fun selectEntriesForPeriod(
-        quota: BiweeklyQuota,
-        entries: List<DailySalesEntry>,
-        users: List<UserProfile>,
-        todayIso: String = DateAndFormatters.todayIso()
-    ): List<DailySalesEntry> {
-        val (periodStartIso, periodEndIso) = DateAndFormatters.biweeklyRangeForIso(todayIso)
-        val uidToBranch = users
-            .mapNotNull { u -> u.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }?.let { u.userId to it } }
-            .toMap()
-        return entries
-            .filter { entry ->
-                entry.dateString >= periodStartIso && entry.dateString <= periodEndIso
-            }
-            .sortedWith(
-                compareByDescending<DailySalesEntry> { it.dateString }
-                    .thenByDescending { it.updatedAt?.seconds ?: 0L }
-                    .thenByDescending { it.quotaId == quota.id }
-            )
-            .distinctBy { entry ->
-                val branchKey = entry.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
-                    ?: uidToBranch[entry.userId]
-                    ?: entry.userId
-                "${branchKey}_${entry.dateString}"
-            }
-    }
-
-    private fun computeProjectionSummary(
-        quota: BiweeklyQuota,
-        entries: List<DailySalesEntry>,
-        uid: String,
-        users: List<UserProfile>,
-        todayIso: String = DateAndFormatters.todayIso()
-    ): SalesProjectionSummary {
-        val today = todayIso
-        val totalDays = quota.totalDays.toInt().coerceIn(1, 31)
-        val daysElapsed = DateAndFormatters.dayIndexInPeriod(quota.startDate, today, totalDays)
-        val periodEntries = selectEntriesForPeriod(quota, entries, users, today)
-        val todayEntry = periodEntries.firstOrNull { it.userId == uid && it.dateString == today }
-            ?: periodEntries.firstOrNull { it.dateString == today && resolveClosingBranchName()?.let { b -> it.branchName == b || it.userName == b } == true }
-
-        fun buildMetric(
-            metric: SalesMetricType,
-            actual: Double,
-            target: Double
-        ): MetricProgress {
-            val safeTarget = target.coerceAtLeast(1.0)
-            val dailyAvg = actual / daysElapsed.toDouble()
-            val projected = dailyAvg * totalDays.toDouble()
-            val remainingDays = (totalDays - daysElapsed).coerceAtLeast(1)
-            val requiredPace = ((safeTarget - actual).coerceAtLeast(0.0)) / remainingDays.toDouble()
-            val progressRatio = (actual / safeTarget).toFloat().coerceIn(0f, 1.5f)
-            val projectedRatio = (projected / safeTarget).toFloat().coerceIn(0f, 2f)
-            val pace = when {
-                projectedRatio >= 0.98f -> ProjectionPace.ON_TRACK
-                projectedRatio >= 0.80f -> ProjectionPace.MODERATE_RISK
-                else -> ProjectionPace.BEHIND
-            }
-            return MetricProgress(
-                metric = metric,
-                actualTotal = actual,
-                targetTotal = target,
-                projectedTotal = projected,
-                progressRatio = progressRatio,
-                projectedRatio = projectedRatio,
-                dailyAverage = dailyAvg,
-                requiredDailyPace = requiredPace,
-                pace = pace
-            )
-        }
-
-        val metrics = listOf(
-            buildMetric(
-                SalesMetricType.GLOBAL_SALES,
-                periodEntries.sumOf { it.globalSales },
-                quota.targetGlobalSales
-            ),
-            buildMetric(
-                SalesMetricType.CREDIT_SALES,
-                periodEntries.sumOf { it.creditSales },
-                quota.targetCreditSales
-            ),
-            buildMetric(
-                SalesMetricType.NEW_CUSTOMERS,
-                periodEntries.sumOf { it.newCustomers }.toDouble(),
-                quota.targetNewCustomers.toDouble()
-            ),
-            buildMetric(
-                SalesMetricType.APP_MA_OPS,
-                periodEntries.sumOf { it.appMaOperations }.toDouble(),
-                quota.targetAppMaOperations.toDouble()
-            ),
-            buildMetric(
-                SalesMetricType.NEW_CUSTOMER_REQUESTS,
-                periodEntries.sumOf { it.newCustomerRequests }.toDouble(),
-                quota.targetNewCustomerRequests.toDouble()
-            )
-        )
-
-        return SalesProjectionSummary(
-            quota = quota,
-            daysElapsed = daysElapsed,
-            totalDays = totalDays,
-            metrics = metrics,
-            entriesCount = periodEntries.size,
-            todayEntry = todayEntry,
-            recentEntries = periodEntries.sortedByDescending { it.dateString }.take(15)
-        )
-    }
-
-    private fun buildChartSeries(
-        quota: BiweeklyQuota,
-        entries: List<DailySalesEntry>,
-        metric: SalesMetricType,
-        users: List<UserProfile>,
-        todayIso: String = DateAndFormatters.todayIso()
-    ): ChartSeries {
-        val totalDays = quota.totalDays.toInt().coerceIn(1, 31)
-        val today = todayIso
-        val elapsedDays = DateAndFormatters.dayIndexInPeriod(quota.startDate, today, totalDays)
-        val periodEntries = selectEntriesForPeriod(quota, entries, users, today)
-
-        val dailyTotals = DoubleArray(totalDays) { 0.0 }
-        periodEntries.forEach { entry ->
-            val dayIdx = DateAndFormatters.dayIndexInPeriod(quota.startDate, entry.dateString, totalDays) - 1
-            val value = when (metric) {
-                SalesMetricType.GLOBAL_SALES -> entry.globalSales
-                SalesMetricType.CREDIT_SALES -> entry.creditSales
-                SalesMetricType.NEW_CUSTOMERS -> entry.newCustomers.toDouble()
-                SalesMetricType.APP_MA_OPS -> entry.appMaOperations.toDouble()
-                SalesMetricType.NEW_CUSTOMER_REQUESTS -> entry.newCustomerRequests.toDouble()
-            }
-            if (dayIdx in 0 until totalDays) {
-                dailyTotals[dayIdx] += value
-            }
-        }
-
-        val actualCumulative = mutableListOf<Double>()
-        var running = 0.0
-        for (i in 0 until elapsedDays) {
-            running += dailyTotals[i]
-            actualCumulative.add(running)
-        }
-
-        val avgDaily = if (elapsedDays > 0) running / elapsedDays.toDouble() else 0.0
-        val projectedCumulative = mutableListOf<Double>()
-        for (day in 1..totalDays) {
-            if (day <= elapsedDays) {
-                projectedCumulative.add(actualCumulative[day - 1])
-            } else {
-                projectedCumulative.add(running + avgDaily * (day - elapsedDays))
-            }
-        }
-
-        val target = when (metric) {
-            SalesMetricType.GLOBAL_SALES -> quota.targetGlobalSales
-            SalesMetricType.CREDIT_SALES -> quota.targetCreditSales
-            SalesMetricType.NEW_CUSTOMERS -> quota.targetNewCustomers.toDouble()
-            SalesMetricType.APP_MA_OPS -> quota.targetAppMaOperations.toDouble()
-            SalesMetricType.NEW_CUSTOMER_REQUESTS -> quota.targetNewCustomerRequests.toDouble()
-        }
-
-        return ChartSeries(
-            metric = metric,
-            totalDays = totalDays,
-            elapsedDays = elapsedDays,
-            targetValue = target,
-            actualCumulativeByDay = actualCumulative,
-            projectedCumulativeByDay = projectedCumulative
-        )
     }
 
     private fun unwrapFirestoreOrThrow(error: Throwable, opName: String): Throwable {

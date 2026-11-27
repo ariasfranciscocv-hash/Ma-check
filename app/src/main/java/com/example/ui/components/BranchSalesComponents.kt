@@ -78,10 +78,13 @@ import com.example.data.model.BiweeklyQuota
 import com.example.data.model.BranchOptions
 import com.example.data.model.BranchSalesSummary
 import com.example.data.model.DailySalesEntry
+import com.example.data.model.ProjectionPace
 import com.example.data.model.resolveQuotaForBranch
+import com.example.data.repository.ProjectionCalculator
 import com.example.ui.theme.BorderSubtle
 import com.example.ui.theme.BrandNavy
 import com.example.ui.theme.BrandRed
+import com.example.ui.theme.BrandRedSoft
 import com.example.ui.theme.MonoFontFamily
 import com.example.ui.theme.SuccessGreen
 import com.example.ui.theme.SuccessGreenSoft
@@ -163,17 +166,19 @@ fun BranchSalesTrackingSection(
     }
 }
 
+private fun paceVisuals(pace: ProjectionPace): Triple<Color, Color, String> = when (pace) {
+    ProjectionPace.ON_TRACK -> Triple(SuccessGreen, SuccessGreenSoft, "Proyección positiva")
+    ProjectionPace.MODERATE_RISK -> Triple(WarningAmber, WarningAmberSoft, "Riesgo moderado")
+    ProjectionPace.BEHIND -> Triple(BrandRed, BrandRedSoft, "Proyección negativa")
+}
+
 @Composable
 fun BranchSalesCard(
     summary: BranchSalesSummary,
     onClick: () -> Unit
 ) {
     val todayEntry = summary.todayEntry
-    val progressColor = when {
-        summary.completionPercent >= 100 -> SuccessGreen
-        summary.completionPercent >= 50 -> BrandNavy
-        else -> WarningAmber
-    }
+    val (progressColor, statusBg, paceLabel) = paceVisuals(summary.pace)
 
     Card(
         onClick = onClick,
@@ -238,7 +243,7 @@ fun BranchSalesCard(
                 }
             }
 
-            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -269,6 +274,44 @@ fun BranchSalesCard(
                     trackColor = MaterialTheme.colorScheme.surfaceVariant,
                     strokeCap = StrokeCap.Round
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (summary.isGlobalTargetMet) {
+                                "Meta superada: +${DateAndFormatters.formatCurrency(summary.surplusGlobalSales)}"
+                            } else {
+                                "Saldo pendiente: ${DateAndFormatters.formatCurrency(summary.remainingGlobalSales)}"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = MonoFontFamily,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (summary.isGlobalTargetMet) SuccessGreen else BrandNavy
+                        )
+                        Text(
+                            text = "Ritmo: ${DateAndFormatters.formatCurrency(summary.dailyAverage)}/día · Proy. ${DateAndFormatters.formatCurrency(summary.projectedGlobalSales)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        color = statusBg,
+                        shape = RoundedCornerShape(50),
+                        modifier = Modifier.testTag("branch_pace_badge_${summary.branchName}")
+                    ) {
+                        Text(
+                            text = "$paceLabel (${summary.projectedPercent}%)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = progressColor,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+                }
             }
 
             Row(
@@ -458,7 +501,7 @@ fun BranchSalesDetailDialog(
 @Composable
 private fun BranchQuotaComparisonCard(summary: BranchSalesSummary) {
     val difference = summary.totalGlobalSales - summary.quota.targetGlobalSales
-    val progressColor = if (summary.completionPercent >= 100) SuccessGreen else BrandNavy
+    val (progressColor, statusBg, paceLabel) = paceVisuals(summary.pace)
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -492,11 +535,11 @@ private fun BranchQuotaComparisonCard(summary: BranchSalesSummary) {
                     )
                 }
                 Surface(
-                    color = if (summary.completionPercent >= 100) SuccessGreenSoft else MaterialTheme.colorScheme.primaryContainer,
+                    color = statusBg,
                     shape = RoundedCornerShape(50)
                 ) {
                     Text(
-                        text = "${summary.completionPercent}% cumplido",
+                        text = "$paceLabel · ${summary.completionPercent}%",
                         style = MaterialTheme.typography.labelMedium,
                         fontFamily = MonoFontFamily,
                         color = progressColor,
@@ -549,6 +592,46 @@ private fun BranchQuotaComparisonCard(summary: BranchSalesSummary) {
                 trackColor = MaterialTheme.colorScheme.surfaceVariant,
                 strokeCap = StrokeCap.Round
             )
+
+            Surface(
+                color = statusBg.copy(alpha = 0.7f),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    val remainingText = if (summary.isGlobalTargetMet) {
+                        "Meta superada: +${DateAndFormatters.formatCurrency(summary.surplusGlobalSales)}"
+                    } else {
+                        "Saldo pendiente: ${DateAndFormatters.formatCurrency(summary.remainingGlobalSales)}"
+                    }
+                    Text(
+                        text = remainingText,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = MonoFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        color = if (summary.isGlobalTargetMet) SuccessGreen else BrandNavy
+                    )
+                    val projDeltaLabel = if (summary.projectedDelta >= 0.0) {
+                        "+${DateAndFormatters.formatCurrency(summary.projectedDelta)} sobre meta"
+                    } else {
+                        "-${DateAndFormatters.formatCurrency(abs(summary.projectedDelta))} vs. meta"
+                    }
+                    Text(
+                        text = "Proyección al cierre (día ${summary.daysElapsed}/${summary.totalCycleDays}, restan ${summary.remainingDays}d): ${DateAndFormatters.formatCurrency(summary.projectedGlobalSales)} ($projDeltaLabel)",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = progressColor
+                    )
+                    Text(
+                        text = "Ritmo actual: ${DateAndFormatters.formatCurrency(summary.dailyAverage)}/día · Necesario restante: ${DateAndFormatters.formatCurrency(summary.requiredDailyPace)}/día",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
 
             Text(
                 text = if (difference >= 0) {
@@ -670,7 +753,7 @@ private fun TodayClosingDetailCard(
                         modifier = Modifier.size(15.dp)
                     )
                     Text(
-                        text = "Registrado por: ${todayEntry.userName.ifBlank { "Sucursal" }} · ${DateAndFormatters.formatTimestamp(timestampDate)}",
+                        text = "Registrado por: ${todayEntry.formattedAuthorLabel} · ${DateAndFormatters.formatTimestamp(timestampDate)}",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -773,7 +856,7 @@ private fun PeriodHistoryClosingCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Registró: ${entry.userName.ifBlank { "Sucursal" }}",
+                    text = "Registró: ${entry.formattedAuthorLabel}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -977,11 +1060,13 @@ fun AssignBranchQuotaDialog(
     val normalizedInitial = if (initialBranch in branchOptions) initialBranch else BranchOptions.ALL_BRANCHES_OPTION
     var selectedBranch by remember { mutableStateOf(normalizedInitial) }
 
-    val defaultRange = remember { DateAndFormatters.defaultBiweeklyRange() }
-    val currentPeriodId = remember(defaultRange) { DateAndFormatters.biweeklyPeriodIdForIso(defaultRange.first) }
-    val defaultDays = remember(defaultRange) {
-        DateAndFormatters.daysBetweenInclusive(defaultRange.first, defaultRange.second).toLong()
+    val todayIso = DateAndFormatters.todayIso()
+    val activeCycle = remember(activeQuotas, todayIso) {
+        ProjectionCalculator.resolveActiveCycleInfo(activeQuotas, todayIso)
     }
+    val defaultRange = activeCycle.startDate to activeCycle.endDate
+    val currentPeriodId = activeCycle.periodId
+    val defaultDays = activeCycle.totalDays.toLong().coerceIn(1L, 31L)
 
     var title by remember { mutableStateOf(DateAndFormatters.defaultBiweeklyTitle()) }
     var globalTarget by remember { mutableStateOf("250000") }
@@ -1072,7 +1157,7 @@ fun AssignBranchQuotaDialog(
                                     color = BrandNavy
                                 )
                                 Text(
-                                    text = "Asigna este monto individualmente a las ${BranchOptions.ALL_BRANCHES.size} sucursales",
+                                    text = "Asigna este monto a cada una de las ${BranchOptions.ALL_BRANCHES.size} sucursales sin modificar la cuota general",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )

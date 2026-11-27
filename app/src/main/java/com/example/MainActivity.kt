@@ -36,17 +36,22 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Assessment
+import androidx.compose.material.icons.filled.Badge
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Checklist
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.EditCalendar
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Storefront
 import androidx.compose.material.icons.outlined.Assessment
+import androidx.compose.material.icons.outlined.Badge
 import androidx.compose.material.icons.outlined.Checklist
+import androidx.compose.material.icons.outlined.EditCalendar
 import androidx.compose.material.icons.outlined.Group
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material3.Badge
@@ -96,6 +101,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
@@ -114,12 +120,17 @@ import com.example.data.model.BranchOptions
 import com.example.data.model.UiState
 import com.example.data.repository.AppRepository
 import com.example.data.repository.AuthRepository
+import com.example.data.repository.EmployeeIdentityRepository
+import com.example.data.repository.QuotaRepositoryExtensions
 import com.example.notifications.NotificationHelper
 import com.example.ui.components.MueblesAmericaLogo
 import com.example.ui.components.SplashLaunchScreen
 import com.example.ui.screens.AdminEvidencesScreen
+import com.example.ui.screens.AdminQuotasScreen
 import com.example.ui.screens.AuthScreen
-import com.example.ui.screens.BranchSelectionScreen
+import com.example.ui.screens.EmployeeIdentityScreen
+import com.example.ui.screens.EmployeeProfileModalDialog
+import com.example.ui.screens.EmployeeProfileTabScreen
 import com.example.ui.screens.HomeSalesScreen
 import com.example.ui.screens.NotificationsSheet
 import com.example.ui.screens.TasksChecklistScreen
@@ -175,6 +186,8 @@ private enum class AppTab(
 ) {
     HOME("Inicio", Icons.Filled.Assessment, Icons.Outlined.Assessment),
     TASKS("Tareas", Icons.Filled.Checklist, Icons.Outlined.Checklist),
+    QUOTAS("Cuotas", Icons.Filled.EditCalendar, Icons.Outlined.EditCalendar),
+    MY_CARD("Mi Ficha", Icons.Filled.Badge, Icons.Outlined.Badge),
     EVIDENCES("Evidencias", Icons.Filled.PhotoLibrary, Icons.Outlined.PhotoLibrary),
     TEAM("Equipo", Icons.Filled.Group, Icons.Outlined.Group)
 }
@@ -274,15 +287,19 @@ private fun AuthenticatedApp(
                     currentUserId = user.uid,
                     currentUserName = user.displayName ?: user.email?.substringBefore("@") ?: "Usuario MA",
                     currentUserEmail = user.email,
-                    isEmailVerified = user.isEmailVerified
+                    isEmailVerified = user.isEmailVerified,
+                    quotaExtensions = QuotaRepositoryExtensions(app),
+                    identityRepository = EmployeeIdentityRepository(app)
                 )
             }
         }
     )
 
-    val lastCachedBranch by viewModel.lastCachedBranch.collectAsStateWithLifecycle()
     val isAdmin by viewModel.isAdminState.collectAsStateWithLifecycle()
     val isRoleResolved by viewModel.isRoleResolved.collectAsStateWithLifecycle()
+    val isIdentityResolved by viewModel.isEmployeeIdentityResolved.collectAsStateWithLifecycle()
+    val employeeIdentity by viewModel.currentEmployeeIdentity.collectAsStateWithLifecycle()
+    val employeeIdentities by viewModel.employeeIdentities.collectAsStateWithLifecycle()
     val selectedBranch by viewModel.selectedBranch.collectAsStateWithLifecycle()
     val userProfile by viewModel.currentUserProfile.collectAsStateWithLifecycle()
     val branchConfirmed by viewModel.branchConfirmedThisSession.collectAsStateWithLifecycle()
@@ -293,6 +310,7 @@ private fun AuthenticatedApp(
     val notifications by viewModel.notificationsState.collectAsStateWithLifecycle()
     val alertedIds by viewModel.alertedNotificationIds.collectAsStateWithLifecycle()
     val projectionState by viewModel.projectionSummaryState.collectAsStateWithLifecycle()
+    val adminGeneralSummary by viewModel.adminGeneralSummaryState.collectAsStateWithLifecycle()
     val selectedMetric by viewModel.selectedMetric.collectAsStateWithLifecycle()
     val chartSeries by viewModel.selectedChartSeries.collectAsStateWithLifecycle()
     val showDailyBriefing by viewModel.showFirstEntryBriefingToday.collectAsStateWithLifecycle()
@@ -307,11 +325,15 @@ private fun AuthenticatedApp(
     val evidencesState by viewModel.evidencesState.collectAsStateWithLifecycle()
     val teamUsers by viewModel.teamUsers.collectAsStateWithLifecycle()
     val closingAttachmentDraft by viewModel.closingAttachmentDraft.collectAsStateWithLifecycle()
+    val employeeParticipationStats by viewModel.employeeParticipationStatsState.collectAsStateWithLifecycle()
+    val activeCycleInfo by viewModel.activeCycleInfoState.collectAsStateWithLifecycle()
+    val cycleArchives by viewModel.cycleArchivesState.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     var currentTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
     var showNotificationsSheet by remember { mutableStateOf(false) }
     var showAdminBranchMenu by remember { mutableStateOf(false) }
+    var showEmployeeProfileModal by remember { mutableStateOf(false) }
 
     val notificationPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -328,14 +350,14 @@ private fun AuthenticatedApp(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(scheduleNowMillis, isRoleResolved, isAdmin, userProfile?.branchName) {
+    LaunchedEffect(scheduleNowMillis, isRoleResolved, isAdmin, userProfile?.branchName, employeeIdentity?.branchName) {
         if (isRoleResolved) {
             viewModel.checkDailyScheduleAndClosingReset(scheduleNowMillis)
         }
     }
 
-    LaunchedEffect(branchConfirmed, isAdmin, isRoleResolved) {
-        if (isRoleResolved && (branchConfirmed || isAdmin) &&
+    LaunchedEffect(branchConfirmed, isAdmin, isRoleResolved, employeeIdentity?.isComplete) {
+        if (isRoleResolved && (isAdmin || employeeIdentity?.isComplete == true) &&
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             !NotificationHelper.canPostNotifications(context)
         ) {
@@ -364,11 +386,13 @@ private fun AuthenticatedApp(
         viewModel.clearActionMessage()
     }
 
-    if (!isAdmin && (currentTab == AppTab.EVIDENCES || currentTab == AppTab.TEAM)) {
+    if (!isAdmin && (currentTab == AppTab.QUOTAS || currentTab == AppTab.EVIDENCES || currentTab == AppTab.TEAM)) {
+        currentTab = AppTab.HOME
+    } else if (isAdmin && currentTab == AppTab.MY_CARD) {
         currentTab = AppTab.HOME
     }
 
-    if (!isRoleResolved) {
+    if (!isRoleResolved || (!isAdmin && !isIdentityResolved)) {
         SetStatusBarAppearance(lightBackground = true)
         Box(
             modifier = Modifier
@@ -381,14 +405,28 @@ private fun AuthenticatedApp(
         return
     }
 
-    if (!branchConfirmed && !isAdmin) {
+    val currentIdentity = employeeIdentity
+    if (!isAdmin && (currentIdentity == null || !currentIdentity.isComplete)) {
         SetStatusBarAppearance(lightBackground = true)
-        BranchSelectionScreen(
-            initialBranch = userProfile?.branchName ?: lastCachedBranch,
-            isAdmin = isAdmin,
+        EmployeeIdentityScreen(
+            existingIdentity = currentIdentity,
             userEmail = user.email,
+            defaultNameHint = user.displayName,
             isBusy = isBusy,
-            onConfirmBranch = { branch -> viewModel.confirmBranchSelection(branch) },
+            onRegisterIdentity = { fullName, payrollNumber, branchName, onErr ->
+                viewModel.registerEmployeeIdentity(
+                    fullName = fullName,
+                    payrollNumber = payrollNumber,
+                    branchName = branchName,
+                    onError = onErr
+                )
+            },
+            onAssignReleasedBranch = { branchName, onErr ->
+                viewModel.assignBranchToReleasedIdentity(
+                    branchName = branchName,
+                    onError = onErr
+                )
+            },
             onSignOut = onSignOut
         )
         return
@@ -401,12 +439,14 @@ private fun AuthenticatedApp(
     val unreadCount = remember(notifications) { notifications.count { !it.acknowledged } }
     val branchLabel = selectedBranch.ifBlank {
         if (isAdmin) BranchOptions.ALL_BRANCHES_OPTION
-        else userProfile?.effectiveBranchLabel?.takeIf { it.isNotBlank() } ?: "Sucursal"
+        else currentIdentity?.branchName?.takeIf { it.isNotBlank() }
+            ?: userProfile?.effectiveBranchLabel?.takeIf { it.isNotBlank() }
+            ?: "Sucursal"
     }
 
     val visibleTabs = remember(isAdmin) {
-        if (isAdmin) listOf(AppTab.HOME, AppTab.TASKS, AppTab.EVIDENCES, AppTab.TEAM)
-        else listOf(AppTab.HOME, AppTab.TASKS)
+        if (isAdmin) listOf(AppTab.HOME, AppTab.TASKS, AppTab.QUOTAS, AppTab.EVIDENCES, AppTab.TEAM)
+        else listOf(AppTab.HOME, AppTab.TASKS, AppTab.MY_CARD)
     }
 
     SetStatusBarAppearance(lightBackground = false)
@@ -424,16 +464,36 @@ private fun AuthenticatedApp(
                         actionIconContentColor = Color.White
                     ),
                     title = {
-                        Column {
+                        val canOpenProfile = !isAdmin && currentIdentity != null
+                        Column(
+                            modifier = Modifier
+                                .let { base ->
+                                    if (canOpenProfile) {
+                                        base
+                                            .clickable { showEmployeeProfileModal = true }
+                                            .testTag("topbar_open_profile_area")
+                                    } else {
+                                        base
+                                    }
+                                }
+                        ) {
                             MueblesAmericaLogo(
                                 globeSize = 23.dp,
                                 fontSize = 16.sp,
                                 showTrademark = false
                             )
                             Text(
-                                text = stringResource(R.string.brand_subtitle),
+                                text = if (!isAdmin && currentIdentity != null) {
+                                    "Nómina: ${currentIdentity.displayPayroll} | ${currentIdentity.branchName ?: branchLabel}"
+                                } else {
+                                    stringResource(R.string.brand_subtitle)
+                                },
                                 style = MaterialTheme.typography.labelSmall,
-                                color = Color.White.copy(alpha = 0.92f)
+                                fontWeight = if (!isAdmin && currentIdentity != null) FontWeight.Bold else FontWeight.Normal,
+                                color = Color.White.copy(alpha = 0.95f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.testTag("topbar_identity_subtitle")
                             )
                         }
                     },
@@ -479,6 +539,15 @@ private fun AuthenticatedApp(
                     Row(
                         modifier = Modifier
                             .background(BrandRed)
+                            .let { base ->
+                                if (!isAdmin && currentIdentity != null) {
+                                    base
+                                        .clickable { showEmployeeProfileModal = true }
+                                        .testTag("subheader_payroll_chip")
+                                } else {
+                                    base
+                                }
+                            }
                             .padding(horizontal = 14.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(5.dp)
@@ -490,61 +559,85 @@ private fun AuthenticatedApp(
                                 tint = Color.White,
                                 modifier = Modifier.size(14.dp)
                             )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Filled.Badge,
+                                contentDescription = "Ver mi ficha",
+                                tint = Color.White,
+                                modifier = Modifier.size(14.dp)
+                            )
                         }
                         Text(
-                            text = if (isAdmin) "Admin" else "Sesión",
+                            text = if (isAdmin) "Admin" else "Nómina ${currentIdentity?.displayPayroll.orEmpty()}",
                             style = MaterialTheme.typography.labelMedium,
                             color = Color.White
                         )
                     }
 
                     Box(modifier = Modifier.weight(1f)) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    if (isAdmin) {
-                                        showAdminBranchMenu = true
-                                    } else {
-                                        viewModel.reopenBranchSelection()
-                                    }
+                        val rowModifier = Modifier
+                            .fillMaxWidth()
+                            .let { base ->
+                                when {
+                                    isAdmin -> base.clickable { showAdminBranchMenu = true }
+                                    currentIdentity != null -> base.clickable { showEmployeeProfileModal = true }
+                                    else -> base
                                 }
-                                .padding(horizontal = 14.dp, vertical = 7.dp)
-                                .testTag("switch_branch_pill"),
+                            }
+                            .padding(horizontal = 14.dp, vertical = 7.dp)
+                            .testTag("switch_branch_pill")
+
+                        Row(
+                            modifier = rowModifier,
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.weight(1f)
                             ) {
                                 Icon(
                                     imageVector = Icons.Filled.Storefront,
-                                    contentDescription = "Cambiar sucursal",
+                                    contentDescription = if (isAdmin) "Cambiar sucursal" else "Sucursal asignada",
                                     tint = BrandNavy,
                                     modifier = Modifier.size(15.dp)
                                 )
                                 Text(
-                                    text = branchLabel,
+                                    text = if (isAdmin) branchLabel else "${currentIdentity?.fullName ?: "Empleado"} · $branchLabel",
                                     style = MaterialTheme.typography.labelLarge,
-                                    color = BrandNavy
+                                    color = BrandNavy,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(2.dp)
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                Text(
-                                    text = if (isAdmin) "Filtrar" else "Cambiar",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = BrandNavy.copy(alpha = 0.72f)
-                                )
                                 if (isAdmin) {
+                                    Text(
+                                        text = "Filtrar",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = BrandNavy.copy(alpha = 0.72f)
+                                    )
                                     Icon(
                                         imageVector = Icons.Filled.KeyboardArrowDown,
                                         contentDescription = "Seleccionar sucursal",
                                         tint = BrandNavy.copy(alpha = 0.72f),
                                         modifier = Modifier.size(16.dp)
+                                    )
+                                } else {
+                                    Text(
+                                        text = "Mi Ficha",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = BrandNavy.copy(alpha = 0.8f)
+                                    )
+                                    Icon(
+                                        imageVector = Icons.Filled.Lock,
+                                        contentDescription = "Ficha de solo lectura",
+                                        tint = BrandNavy.copy(alpha = 0.65f),
+                                        modifier = Modifier.size(14.dp)
                                     )
                                 }
                             }
@@ -596,7 +689,13 @@ private fun AuthenticatedApp(
                                     contentDescription = tab.label
                                 )
                             },
-                            label = { Text(tab.label) },
+                            label = {
+                                Text(
+                                    text = tab.label,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            },
                             colors = NavigationBarItemDefaults.colors(
                                 selectedIconColor = BrandNavy,
                                 selectedTextColor = BrandNavy,
@@ -661,7 +760,9 @@ private fun AuthenticatedApp(
                         branchLabel = branchLabel,
                         isAdmin = isAdmin,
                         isBusy = isBusy,
+                        employeeIdentity = currentIdentity,
                         projectionState = projectionState,
+                        adminGeneralSummary = adminGeneralSummary,
                         selectedMetric = selectedMetric,
                         chartSeries = chartSeries,
                         showDailyBriefing = showDailyBriefing,
@@ -669,11 +770,19 @@ private fun AuthenticatedApp(
                         selectedBranchFilter = branchLabel,
                         activeQuotas = activeQuotas,
                         branchSalesSummaries = branchSalesSummaries,
+                        activeCycleInfo = activeCycleInfo,
                         onSelectBranchFilter = { branch -> viewModel.selectDashboardBranch(branch) },
+                        onOpenQuotasTab = if (isAdmin) { { currentTab = AppTab.QUOTAS } } else null,
+                        onCloseAndResetBiweeklyCycle = if (isAdmin) {
+                            { onDone -> viewModel.closeAndResetBiweeklyCycle { onDone() } }
+                        } else null,
                         onUpdateAttachmentDraft = { viewModel.updateClosingAttachmentDraft(it) },
                         onLoadEntryAttachmentChunks = { entry -> viewModel.loadClosingAttachmentChunks(entry) },
                         onDismissBriefing = { viewModel.dismissDailyBriefingForToday() },
                         onSelectMetric = { viewModel.selectMetric(it) },
+                        onUpdateGeneralIndicatorTarget = { metric, newTarget, onDone ->
+                            viewModel.updateGeneralIndicatorTarget(metric, newTarget, onDone)
+                        },
                         onSaveDailyClosing = { qId, g, c, nc, ma, req, notes, draft ->
                             viewModel.saveDailyClosingSales(
                                 quotaId = qId,
@@ -713,6 +822,7 @@ private fun AuthenticatedApp(
                         evidencesState = evidencesState,
                         teamUsers = teamUsers,
                         currentUserProfile = userProfile,
+                        employeeIdentity = currentIdentity,
                         activeQuota = activeQuota,
                         onCreateTask = { assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess ->
                             viewModel.createTask(assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess)
@@ -739,8 +849,13 @@ private fun AuthenticatedApp(
                                 onSuccess = onSuccess
                             )
                         },
-                        onCompleteTaskWithEvidenceFiles = { task, files, onSuccess ->
-                            viewModel.completeTaskWithEvidenceFiles(task, files, onSuccess)
+                        onCompleteTaskWithEvidenceFiles = { task, files, onError, onSuccess ->
+                            viewModel.completeTaskWithEvidenceFiles(
+                                task = task,
+                                files = files,
+                                onError = onError,
+                                onSuccess = onSuccess
+                            )
                         },
                         onConfirmBranchResetForQuota = { branchName, branchUsers ->
                             viewModel.confirmBranchChecklistResetForQuota(branchName, branchUsers)
@@ -769,6 +884,43 @@ private fun AuthenticatedApp(
                         }
                     )
 
+                    AppTab.QUOTAS -> AdminQuotasScreen(
+                        activeQuotas = activeQuotas,
+                        adminGeneralSummary = adminGeneralSummary,
+                        branchSalesSummaries = branchSalesSummaries,
+                        activeCycleInfo = activeCycleInfo,
+                        cycleArchives = cycleArchives,
+                        isBusy = isBusy,
+                        onCloseAndResetBiweeklyCycle = { onDone ->
+                            viewModel.closeAndResetBiweeklyCycle { onDone() }
+                        },
+                        onSaveBiweeklyQuota = { t, s, e, d, g, c, nc, ma, req, branch, applyAll, onDone ->
+                            viewModel.saveBiweeklyQuota(
+                                title = t,
+                                startDate = s,
+                                endDate = e,
+                                totalDays = d,
+                                targetGlobalSales = g,
+                                targetCreditSales = c,
+                                targetNewCustomers = nc,
+                                targetAppMaOperations = ma,
+                                targetNewCustomerRequests = req,
+                                branchName = branch,
+                                applyToAllIndividualBranches = applyAll,
+                                onSuccess = onDone
+                            )
+                        }
+                    )
+
+                    AppTab.MY_CARD -> {
+                        if (currentIdentity != null) {
+                            EmployeeProfileTabScreen(
+                                identity = currentIdentity,
+                                stats = employeeParticipationStats
+                            )
+                        }
+                    }
+
                     AppTab.EVIDENCES -> AdminEvidencesScreen(
                         evidencesState = evidencesState,
                         onLoadEvidenceFiles = { evidence ->
@@ -779,10 +931,18 @@ private fun AuthenticatedApp(
                     AppTab.TEAM -> TeamAdminScreen(
                         currentUserId = user.uid,
                         teamUsers = teamUsers,
+                        employeeIdentities = employeeIdentities,
                         activeQuota = activeQuota,
                         activeQuotas = activeQuotas,
                         branchSalesSummaries = branchSalesSummaries,
                         isBusy = isBusy,
+                        onOpenQuotasTab = { currentTab = AppTab.QUOTAS },
+                        onReleaseEmployeeBranch = { identity ->
+                            viewModel.releaseEmployeeBranch(identity)
+                        },
+                        onDeleteEmployeeIdentity = { identity ->
+                            viewModel.deleteEmployeeIdentityCompletely(identity)
+                        },
                         onToggleAdmin = { target, makeAdmin ->
                             viewModel.toggleUserAdminRole(target, makeAdmin)
                         },
@@ -823,6 +983,14 @@ private fun AuthenticatedApp(
             onAcknowledge = { id -> viewModel.acknowledgeNotification(id) },
             onOpenTasks = { currentTab = AppTab.TASKS },
             onDismiss = { showNotificationsSheet = false }
+        )
+    }
+
+    if (showEmployeeProfileModal && !isAdmin && currentIdentity != null) {
+        EmployeeProfileModalDialog(
+            identity = currentIdentity,
+            stats = employeeParticipationStats,
+            onDismiss = { showEmployeeProfileModal = false }
         )
     }
 

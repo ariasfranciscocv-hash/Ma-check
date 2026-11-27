@@ -233,9 +233,10 @@ fun AdminEvidencesScreen(
                                         horizontalArrangement = Arrangement.SpaceBetween
                                     ) {
                                         Text(
-                                            text = evidence.uploaderName,
+                                            text = evidence.formattedUploaderLabel,
                                             style = MaterialTheme.typography.labelMedium,
-                                            color = BrandNavy
+                                            color = BrandNavy,
+                                            modifier = Modifier.weight(1f)
                                         )
                                         Text(
                                             text = DateAndFormatters.formatTimestamp(evidence.capturedAt?.toDate()),
@@ -295,7 +296,7 @@ fun EvidencePreviewDialog(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "Enviada por: ${evidence.uploaderName} · ${DateAndFormatters.formatTimestamp(evidence.capturedAt?.toDate())}",
+                    text = "Enviada por: ${evidence.formattedUploaderLabel} · ${DateAndFormatters.formatTimestamp(evidence.capturedAt?.toDate())}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

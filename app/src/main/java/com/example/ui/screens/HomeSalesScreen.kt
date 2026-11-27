@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.EditCalendar
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GroupAdd
@@ -47,6 +48,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -76,17 +78,22 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.model.ActiveBiweeklyCycleInfo
+import com.example.data.model.AdminWeightedProjection
 import com.example.data.model.BiweeklyQuota
 import com.example.data.model.BranchOptions
 import com.example.data.model.BranchSalesSummary
 import com.example.data.model.ChartSeries
 import com.example.data.model.ClosingAttachmentDraft
 import com.example.data.model.DailySalesEntry
+import com.example.data.model.EmployeeIdentity
 import com.example.data.model.MetricProgress
 import com.example.data.model.ProjectionPace
 import com.example.data.model.SalesMetricType
 import com.example.data.model.SalesProjectionSummary
 import com.example.data.model.UiState
+import com.example.data.repository.ProjectionCalculator
+import com.example.ui.components.AdminCycleClosureControlCard
 import com.example.ui.components.AssignBranchQuotaDialog
 import com.example.ui.components.BranchSalesDetailDialog
 import com.example.ui.components.BranchSalesTrackingSection
@@ -105,13 +112,17 @@ import com.example.utils.ImageCompressor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @Composable
 fun HomeSalesScreen(
     branchLabel: String,
     isAdmin: Boolean,
     isBusy: Boolean,
+    employeeIdentity: EmployeeIdentity? = null,
     projectionState: UiState<SalesProjectionSummary?>,
+    adminGeneralSummary: SalesProjectionSummary? = null,
     selectedMetric: SalesMetricType,
     chartSeries: ChartSeries?,
     showDailyBriefing: Boolean,
@@ -119,11 +130,19 @@ fun HomeSalesScreen(
     selectedBranchFilter: String = branchLabel,
     activeQuotas: List<BiweeklyQuota> = emptyList(),
     branchSalesSummaries: List<BranchSalesSummary> = emptyList(),
+    activeCycleInfo: ActiveBiweeklyCycleInfo = ProjectionCalculator.resolveActiveCycleInfo(activeQuotas),
     onSelectBranchFilter: ((String) -> Unit)? = null,
+    onOpenQuotasTab: (() -> Unit)? = null,
+    onCloseAndResetBiweeklyCycle: (((() -> Unit)) -> Unit)? = null,
     onUpdateAttachmentDraft: (ClosingAttachmentDraft) -> Unit,
     onLoadEntryAttachmentChunks: suspend (DailySalesEntry) -> Result<List<String>>,
     onDismissBriefing: () -> Unit,
     onSelectMetric: (SalesMetricType) -> Unit,
+    onUpdateGeneralIndicatorTarget: (
+        metric: SalesMetricType,
+        newTargetValue: Double,
+        onDone: () -> Unit
+    ) -> Unit = { _, _, onDone -> onDone() },
     onSaveDailyClosing: (
         quotaId: String,
         globalSales: Double,
@@ -193,6 +212,7 @@ fun HomeSalesScreen(
             if (showDailyBriefing && summary != null) {
                 DailyBriefingDialog(
                     branchLabel = branchLabel,
+                    isAdmin = isAdmin,
                     summary = summary,
                     onDismiss = onDismissBriefing
                 )
@@ -207,7 +227,12 @@ fun HomeSalesScreen(
                     isAdmin = isAdmin,
                     onDismiss = { selectedBranchDetailName = null },
                     onEditQuota = if (isAdmin) { branchName ->
-                        quotaTargetBranch = branchName
+                        selectedBranchDetailName = null
+                        if (onOpenQuotasTab != null) {
+                            onOpenQuotasTab()
+                        } else {
+                            quotaTargetBranch = branchName
+                        }
                     } else null,
                     onLoadEntryAttachmentChunks = onLoadEntryAttachmentChunks
                 )
@@ -253,12 +278,27 @@ fun HomeSalesScreen(
                         )
                     }
                 }
+                if (isAdmin && onCloseAndResetBiweeklyCycle != null) {
+                    item {
+                        AdminCycleClosureControlCard(
+                            cycleInfo = activeCycleInfo,
+                            adminGeneralSummary = adminGeneralSummary ?: summary,
+                            branchSummaries = branchSalesSummaries,
+                            isBusy = isBusy,
+                            onConfirmCloseCycle = onCloseAndResetBiweeklyCycle
+                        )
+                    }
+                }
                 if (summary == null) {
                     item {
                         NoActiveQuotaCard(
                             isAdmin = isAdmin,
                             onCreateQuota = {
-                                quotaTargetBranch = selectedBranchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+                                if (onOpenQuotasTab != null) {
+                                    onOpenQuotasTab()
+                                } else {
+                                    quotaTargetBranch = selectedBranchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+                                }
                             }
                         )
                     }
@@ -269,32 +309,39 @@ fun HomeSalesScreen(
                                 isAdmin = isAdmin,
                                 onOpenBranchDetail = { detail -> selectedBranchDetailName = detail.branchName },
                                 onConfigureBranchQuota = if (isAdmin) { branchName ->
-                                    quotaTargetBranch = branchName
+                                    if (onOpenQuotasTab != null) {
+                                        onOpenQuotasTab()
+                                    } else {
+                                        quotaTargetBranch = branchName
+                                    }
                                 } else null
                             )
                         }
                     }
                 } else {
-                    item {
-                        DailyClosingFormCard(
-                            summary = summary,
-                            branchLabel = branchLabel,
-                            isBusy = isBusy,
-                            closingAttachmentDraft = closingAttachmentDraft,
-                            onUpdateAttachmentDraft = onUpdateAttachmentDraft,
-                            onSave = { g, c, nc, ma, req, notes, draft ->
-                                onSaveDailyClosing(
-                                    summary.quota.id,
-                                    g,
-                                    c,
-                                    nc,
-                                    ma,
-                                    req,
-                                    notes,
-                                    draft
-                                )
-                            }
-                        )
+                    if (!isAdmin) {
+                        item {
+                            DailyClosingFormCard(
+                                summary = summary,
+                                branchLabel = branchLabel,
+                                employeeIdentity = employeeIdentity,
+                                isBusy = isBusy,
+                                closingAttachmentDraft = closingAttachmentDraft,
+                                onUpdateAttachmentDraft = onUpdateAttachmentDraft,
+                                onSave = { g, c, nc, ma, req, notes, draft ->
+                                    onSaveDailyClosing(
+                                        summary.quota.id,
+                                        g,
+                                        c,
+                                        nc,
+                                        ma,
+                                        req,
+                                        notes,
+                                        draft
+                                    )
+                                }
+                            )
+                        }
                     }
 
                     item {
@@ -305,7 +352,11 @@ fun HomeSalesScreen(
                             isAdmin = isAdmin,
                             onSelectMetric = onSelectMetric,
                             onEditQuota = {
-                                quotaTargetBranch = selectedBranchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+                                if (onOpenQuotasTab != null) {
+                                    onOpenQuotasTab()
+                                } else {
+                                    quotaTargetBranch = selectedBranchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+                                }
                             }
                         )
                     }
@@ -317,30 +368,55 @@ fun HomeSalesScreen(
                                 isAdmin = isAdmin,
                                 onOpenBranchDetail = { detail -> selectedBranchDetailName = detail.branchName },
                                 onConfigureBranchQuota = if (isAdmin) { branchName ->
-                                    quotaTargetBranch = branchName
+                                    if (onOpenQuotasTab != null) {
+                                        onOpenQuotasTab()
+                                    } else {
+                                        quotaTargetBranch = branchName
+                                    }
                                 } else null
                             )
                         }
                     }
+                }
 
+                val indicatorsSummary = if (isAdmin) (adminGeneralSummary ?: summary) else summary
+                if (indicatorsSummary != null) {
                     item {
-                        Text(
-                            text = "Indicadores de la Quincena",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = MaterialTheme.colorScheme.onBackground,
-                            modifier = Modifier.padding(top = 4.dp)
-                        )
+                        Column(
+                            modifier = Modifier.padding(top = 4.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = "Indicadores de la Quincena",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onBackground
+                            )
+                            if (isAdmin) {
+                                Text(
+                                    text = "Cuota general independiente · Real = suma de todas las sucursales",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
                     }
 
-                    items(summary.metrics.size) { index ->
-                        val item = summary.metrics[index]
+                    items(indicatorsSummary.metrics.size) { index ->
+                        val item = indicatorsSummary.metrics[index]
                         MetricScorecardItem(
                             progress = item,
                             isSelected = item.metric == selectedMetric,
-                            onClick = { onSelectMetric(item.metric) }
+                            canEditMeta = isAdmin,
+                            isBusy = isBusy,
+                            onClick = { onSelectMetric(item.metric) },
+                            onSaveTarget = { newTarget, onDone ->
+                                onUpdateGeneralIndicatorTarget(item.metric, newTarget, onDone)
+                            }
                         )
                     }
+                }
 
+                if (summary != null) {
                     val entriesWithDetails = summary.recentEntries.filter {
                         it.notes.isNotBlank() ||
                             (!it.attachmentName.isNullOrBlank() && (!it.attachmentBase64.isNullOrBlank() || it.attachmentChunkCount > 0L))
@@ -370,6 +446,7 @@ fun HomeSalesScreen(
 @Composable
 private fun DailyBriefingDialog(
     branchLabel: String,
+    isAdmin: Boolean,
     summary: SalesProjectionSummary,
     onDismiss: () -> Unit
 ) {
@@ -410,7 +487,11 @@ private fun DailyBriefingDialog(
                     )
                 }
                 Text(
-                    text = "Recuerda capturar tus 5 métricas al cierre de operaciones de hoy.",
+                    text = if (isAdmin) {
+                        "Supervisión general de sucursales en tiempo real."
+                    } else {
+                        "Recuerda capturar tus 5 métricas al cierre de operaciones de hoy."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -422,7 +503,7 @@ private fun DailyBriefingDialog(
                 colors = ButtonDefaults.buttonColors(containerColor = BrandNavy),
                 modifier = Modifier.testTag("dismiss_briefing_button")
             ) {
-                Text("Registrar Cierre / Ver Panel")
+                Text(if (isAdmin) "Ver Panel de Supervisión" else "Registrar Cierre / Ver Panel")
             }
         }
     )
@@ -463,7 +544,7 @@ private fun NoActiveQuotaCard(
             )
             Text(
                 text = if (isAdmin) {
-                    "Configura la meta quincenal del periodo para habilitar el cierre de ventas y las proyecciones."
+                    "Configura la meta quincenal de este periodo o sucursal para habilitar las proyecciones."
                 } else {
                     "El administrador aún no ha publicado la meta quincenal de este periodo."
                 },
@@ -487,6 +568,7 @@ private fun NoActiveQuotaCard(
 private fun DailyClosingFormCard(
     summary: SalesProjectionSummary,
     branchLabel: String,
+    employeeIdentity: EmployeeIdentity? = null,
     isBusy: Boolean,
     closingAttachmentDraft: ClosingAttachmentDraft,
     onUpdateAttachmentDraft: (ClosingAttachmentDraft) -> Unit,
@@ -609,6 +691,14 @@ private fun DailyClosingFormCard(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (employeeIdentity != null && employeeIdentity.hasIdentityCore) {
+                        Text(
+                            text = employeeIdentity.formattedMovementAuthor,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = BrandNavy
+                        )
+                    }
                 }
                 if (existingToday != null) {
                     Surface(
@@ -1055,7 +1145,7 @@ private fun RecentClosingAttachmentCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = entry.userName,
+                    text = entry.formattedAuthorLabel,
                     style = MaterialTheme.typography.titleSmall,
                     color = BrandNavy
                 )
@@ -1174,6 +1264,12 @@ private fun RecentClosingAttachmentCard(
     }
 }
 
+private fun paceColorsAndLabel(pace: ProjectionPace): Triple<Color, Color, String> = when (pace) {
+    ProjectionPace.ON_TRACK -> Triple(SuccessGreen, SuccessGreenSoft, "Proyección positiva")
+    ProjectionPace.MODERATE_RISK -> Triple(WarningAmber, WarningAmberSoft, "Riesgo moderado")
+    ProjectionPace.BEHIND -> Triple(BrandRed, BrandRedSoft, "Proyección negativa")
+}
+
 @Composable
 private fun ProjectionOverviewCard(
     summary: SalesProjectionSummary,
@@ -1185,6 +1281,8 @@ private fun ProjectionOverviewCard(
 ) {
     val activeProgress = summary.metrics.firstOrNull { it.metric == selectedMetric }
         ?: summary.metrics.first()
+    val (paceColor, _, _) = paceColorsAndLabel(activeProgress.pace)
+    val weighted = if (isAdmin) summary.weightedByMetric[activeProgress.metric] else null
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -1254,7 +1352,7 @@ private fun ProjectionOverviewCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = "Acumulado · ${activeProgress.metric.titleEs}",
                         style = MaterialTheme.typography.labelMedium,
@@ -1266,8 +1364,51 @@ private fun ProjectionOverviewCard(
                         fontFamily = MonoFontFamily,
                         color = MaterialTheme.colorScheme.onSurface
                     )
+                    val remainingStr = if (activeProgress.isTargetMet) {
+                        "Meta superada (+${DateAndFormatters.formatMetricValue(activeProgress.metric, activeProgress.surplusOverTarget)})"
+                    } else {
+                        "Saldo pendiente: ${DateAndFormatters.formatMetricValue(activeProgress.metric, activeProgress.remainingToTarget)} de ${DateAndFormatters.formatMetricValue(activeProgress.metric, activeProgress.targetTotal)}"
+                    }
+                    Text(
+                        text = remainingStr,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (activeProgress.isTargetMet) SuccessGreen else BrandNavy,
+                        modifier = Modifier.testTag("overview_remaining_balance")
+                    )
                 }
                 PaceStatusChip(pace = activeProgress.pace, projectedRatio = activeProgress.projectedRatio)
+            }
+
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                LinearProgressIndicator(
+                    progress = { activeProgress.progressRatio.coerceIn(0f, 1f) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(10.dp)
+                        .clip(RoundedCornerShape(50))
+                        .testTag("overview_progress_bar"),
+                    color = paceColor,
+                    trackColor = MaterialTheme.colorScheme.surfaceVariant,
+                    strokeCap = StrokeCap.Round
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    val actualPct = (activeProgress.progressRatio * 100).roundToInt().coerceAtLeast(0)
+                    Text(
+                        text = "$actualPct% actual · Día ${summary.daysElapsed}/${summary.totalDays} (restan ${summary.remainingDays}d)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "Ritmo: ${DateAndFormatters.formatMetricValue(activeProgress.metric, activeProgress.dailyAverage)}/día",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = MonoFontFamily,
+                        color = paceColor
+                    )
+                }
             }
 
             if (chartSeries != null) {
@@ -1298,7 +1439,8 @@ private fun ProjectionOverviewCard(
                             text = DateAndFormatters.formatMetricValue(activeProgress.metric, activeProgress.projectedTotal),
                             style = MaterialTheme.typography.titleMedium,
                             fontFamily = MonoFontFamily,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            color = paceColor
                         )
                     }
                     Column(horizontalAlignment = Alignment.End) {
@@ -1316,18 +1458,217 @@ private fun ProjectionOverviewCard(
                     }
                 }
             }
+
+            if (weighted != null) {
+                WeightedAdminBalanceCard(weighted = weighted)
+            }
+        }
+    }
+}
+
+@Composable
+private fun WeightedAdminBalanceCard(weighted: AdminWeightedProjection) {
+    val (paceColor, paceBg, paceLabel) = paceColorsAndLabel(weighted.pace)
+    val projectedVsAdminPct = (weighted.adminProjectedRatio * 100).roundToInt().coerceAtLeast(0)
+    val weightedBranchPct = (weighted.weightedBranchProjectedRatio * 100).roundToInt().coerceAtLeast(0)
+    var showBranchWeights by remember { mutableStateOf(false) }
+
+    Surface(
+        color = paceBg.copy(alpha = 0.55f),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, paceColor.copy(alpha = 0.35f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("admin_weighted_balance_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Balance Ponderado de Sucursales",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = BrandNavy
+                    )
+                    Text(
+                        text = "Ponderado por peso de cuota · Cumplimiento tiendas: $weightedBranchPct%",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Surface(color = paceBg, shape = RoundedCornerShape(50)) {
+                    Text(
+                        text = "$paceLabel · $projectedVsAdminPct%",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = paceColor,
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            LinearProgressIndicator(
+                progress = { weighted.adminProjectedRatio.coerceIn(0f, 1f) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(9.dp)
+                    .clip(RoundedCornerShape(50))
+                    .testTag("admin_weighted_progress_bar"),
+                color = paceColor,
+                trackColor = MaterialTheme.colorScheme.surface,
+                strokeCap = StrokeCap.Round
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Surface(
+                    color = SuccessGreenSoft,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        Text(
+                            text = "Positivas (${weighted.positiveBranchesCount})",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SuccessGreen
+                        )
+                        Text(
+                            text = "+${DateAndFormatters.formatMetricValue(weighted.metric, weighted.positiveSurplusTotal)}",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontFamily = MonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = SuccessGreen
+                        )
+                        Text(
+                            text = "Excedente proyectado",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                Surface(
+                    color = BrandRedSoft,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                    ) {
+                        val laggingCount = weighted.moderateRiskBranchesCount + weighted.behindBranchesCount
+                        Text(
+                            text = "Rezagadas ($laggingCount)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = BrandRed
+                        )
+                        Text(
+                            text = "-${DateAndFormatters.formatMetricValue(weighted.metric, weighted.negativeDeficitTotal)}",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontFamily = MonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = BrandRed
+                        )
+                        Text(
+                            text = "Déficit proyectado",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            val verdictText = when {
+                weighted.netBalanceVsAdminQuota >= 0.0 && weighted.negativeDeficitTotal > 0.0 ->
+                    "El superávit cubre el déficit y proyecta +${DateAndFormatters.formatMetricValue(weighted.metric, weighted.netBalanceVsAdminQuota)} sobre la meta general."
+                weighted.netBalanceVsAdminQuota >= 0.0 ->
+                    "Ritmo positivo general: +${DateAndFormatters.formatMetricValue(weighted.metric, weighted.netBalanceVsAdminQuota)} sobre la meta general."
+                weighted.pace == ProjectionPace.MODERATE_RISK ->
+                    "El excedente no alcanza a cubrir el déficit (-${DateAndFormatters.formatMetricValue(weighted.metric, abs(weighted.netBalanceVsAdminQuota))} vs. meta general). Riesgo recuperable."
+                else ->
+                    "El déficit supera al excedente (-${DateAndFormatters.formatMetricValue(weighted.metric, abs(weighted.netBalanceVsAdminQuota))} vs. meta general). Proyección negativa."
+            }
+            Text(
+                text = verdictText,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = paceColor,
+                modifier = Modifier.testTag("admin_weighted_verdict")
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val netStoreSign = if (weighted.branchNetBalance >= 0.0) "+" else "-"
+                Text(
+                    text = "Balance vs. cuotas de tienda: $netStoreSign${DateAndFormatters.formatMetricValue(weighted.metric, abs(weighted.branchNetBalance))}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(
+                    onClick = { showBranchWeights = !showBranchWeights },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                    modifier = Modifier.height(28.dp)
+                ) {
+                    Text(
+                        text = if (showBranchWeights) "Ocultar pesos" else "Ver pesos",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = BrandNavy
+                    )
+                }
+            }
+
+            if (showBranchWeights) {
+                HorizontalDivider(color = paceColor.copy(alpha = 0.25f))
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    weighted.branchOutcomes.forEach { outcome ->
+                        val (bColor, _, _) = paceColorsAndLabel(outcome.pace)
+                        val weightPct = (outcome.quotaWeightShare * 100f).roundToInt()
+                        val deltaSign = if (outcome.deltaVsBranchQuota >= 0.0) "+" else "-"
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "${outcome.branchName} ($weightPct% cuota)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = "$deltaSign${DateAndFormatters.formatMetricValue(weighted.metric, abs(outcome.deltaVsBranchQuota))}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = MonoFontFamily,
+                                fontWeight = FontWeight.SemiBold,
+                                color = bColor
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
 private fun PaceStatusChip(pace: ProjectionPace, projectedRatio: Float) {
-    val pct = (projectedRatio * 100).toInt()
-    val (bg, fg, label) = when (pace) {
-        ProjectionPace.ON_TRACK -> Triple(SuccessGreenSoft, SuccessGreen, "En meta ($pct%)")
-        ProjectionPace.MODERATE_RISK -> Triple(WarningAmberSoft, WarningAmber, "Ajustado ($pct%)")
-        ProjectionPace.BEHIND -> Triple(MaterialTheme.colorScheme.secondaryContainer, BrandRed, "Bajo ritmo ($pct%)")
-    }
+    val pct = (projectedRatio * 100).roundToInt().coerceAtLeast(0)
+    val (fg, bg, baseLabel) = paceColorsAndLabel(pace)
     Surface(color = bg, shape = RoundedCornerShape(50)) {
         Row(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
@@ -1340,7 +1681,7 @@ private fun PaceStatusChip(pace: ProjectionPace, projectedRatio: Float) {
                 tint = fg,
                 modifier = Modifier.size(16.dp)
             )
-            Text(text = label, style = MaterialTheme.typography.labelMedium, color = fg)
+            Text(text = "$baseLabel ($pct%)", style = MaterialTheme.typography.labelMedium, color = fg)
         }
     }
 }
@@ -1349,14 +1690,36 @@ private fun PaceStatusChip(pace: ProjectionPace, projectedRatio: Float) {
 private fun MetricScorecardItem(
     progress: MetricProgress,
     isSelected: Boolean,
-    onClick: () -> Unit
+    canEditMeta: Boolean = false,
+    isBusy: Boolean = false,
+    onClick: () -> Unit,
+    onSaveTarget: (Double, () -> Unit) -> Unit = { _, done -> done() }
 ) {
-    val pct = (progress.progressRatio * 100).toInt().coerceAtLeast(0)
+    val pct = (progress.progressRatio * 100).roundToInt().coerceAtLeast(0)
+    val projPct = (progress.projectedRatio * 100).roundToInt().coerceAtLeast(0)
+    val (paceColor, paceBg, paceLabel) = paceColorsAndLabel(progress.pace)
+    val isCurrency = progress.metric == SalesMetricType.GLOBAL_SALES ||
+        progress.metric == SalesMetricType.CREDIT_SALES
+    val initialText = remember(progress.metric, progress.targetTotal) {
+        if (isCurrency && progress.targetTotal % 1.0 != 0.0) {
+            progress.targetTotal.toString()
+        } else {
+            progress.targetTotal.toLong().toString()
+        }
+    }
+    var isEditingMeta by remember(progress.metric, canEditMeta) { mutableStateOf(false) }
+    var targetInput by remember(progress.metric, progress.targetTotal, isEditingMeta) {
+        mutableStateOf(initialText)
+    }
+    var inputError by remember(progress.metric, isEditingMeta) { mutableStateOf<String?>(null) }
+
     Card(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("indicator_card_${progress.metric.name}"),
         shape = RoundedCornerShape(16.dp),
-        border = if (isSelected) BorderStroke(1.5.dp, BrandNavy) else null,
+        border = if (isSelected) BorderStroke(1.5.dp, paceColor) else null,
         colors = CardDefaults.cardColors(
             containerColor = if (isSelected) Color(0xFFF8FBFF) else MaterialTheme.colorScheme.surface
         )
@@ -1373,22 +1736,64 @@ private fun MetricScorecardItem(
                 Text(
                     text = progress.metric.titleEs,
                     style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurface
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
                 )
-                Text(
-                    text = "$pct% de meta",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = BrandNavy,
-                    fontFamily = MonoFontFamily
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Surface(
+                        color = paceBg,
+                        shape = RoundedCornerShape(50),
+                        modifier = Modifier.testTag("indicator_pace_badge_${progress.metric.name}")
+                    ) {
+                        Text(
+                            text = "$pct% · Proy. $projPct%",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = paceColor,
+                            fontFamily = MonoFontFamily,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+                    if (canEditMeta) {
+                        TextButton(
+                            onClick = {
+                                targetInput = initialText
+                                inputError = null
+                                isEditingMeta = !isEditingMeta
+                            },
+                            enabled = !isBusy,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            modifier = Modifier
+                                .height(30.dp)
+                                .testTag("edit_indicator_meta_${progress.metric.name}")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Edit,
+                                contentDescription = "Editar meta de ${progress.metric.titleEs}",
+                                modifier = Modifier.size(14.dp),
+                                tint = BrandNavy
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (isEditingMeta) "Cerrar" else "Editar meta",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = BrandNavy
+                            )
+                        }
+                    }
+                }
             }
             LinearProgressIndicator(
                 progress = { progress.progressRatio.coerceIn(0f, 1f) },
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(8.dp)
-                    .clip(RoundedCornerShape(50)),
-                color = BrandNavy,
+                    .clip(RoundedCornerShape(50))
+                    .testTag("indicator_progress_bar_${progress.metric.name}"),
+                color = paceColor,
                 trackColor = MaterialTheme.colorScheme.surfaceVariant,
                 strokeCap = StrokeCap.Round
             )
@@ -1404,8 +1809,132 @@ private fun MetricScorecardItem(
                 Text(
                     text = "Meta: ${DateAndFormatters.formatMetricValue(progress.metric, progress.targetTotal)}",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    fontWeight = if (canEditMeta) FontWeight.SemiBold else FontWeight.Normal,
+                    color = if (canEditMeta) BrandNavy else MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (progress.isTargetMet) {
+                        "Meta superada: +${DateAndFormatters.formatMetricValue(progress.metric, progress.surplusOverTarget)}"
+                    } else {
+                        "Saldo pendiente: ${DateAndFormatters.formatMetricValue(progress.metric, progress.remainingToTarget)}"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = MonoFontFamily,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (progress.isTargetMet) SuccessGreen else BrandNavy,
+                    modifier = Modifier.testTag("indicator_remaining_${progress.metric.name}")
+                )
+                Text(
+                    text = "Proy.: ${DateAndFormatters.formatMetricValue(progress.metric, progress.projectedTotal)} · $paceLabel",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = paceColor
+                )
+            }
+
+            if (canEditMeta && isEditingMeta) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = targetInput,
+                            onValueChange = { raw ->
+                                targetInput = if (isCurrency) {
+                                    raw.filter { it.isDigit() || it == '.' }
+                                } else {
+                                    raw.filter { it.isDigit() }
+                                }
+                                inputError = null
+                            },
+                            label = {
+                                Text(
+                                    if (isCurrency) {
+                                        "Nueva meta ($ MXN)"
+                                    } else {
+                                        "Nueva meta (unidades)"
+                                    }
+                                )
+                            },
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = if (isCurrency) KeyboardType.Decimal else KeyboardType.Number
+                            ),
+                            singleLine = true,
+                            isError = inputError != null,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("indicator_meta_input_${progress.metric.name}")
+                        )
+                        if (inputError != null) {
+                            Text(
+                                text = inputError ?: "",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = BrandRed
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.End,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            TextButton(
+                                onClick = {
+                                    isEditingMeta = false
+                                    inputError = null
+                                },
+                                enabled = !isBusy
+                            ) {
+                                Text("Cancelar")
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Button(
+                                onClick = {
+                                    val parsedValue: Double? = if (isCurrency) {
+                                        targetInput.trim().toDoubleOrNull()
+                                    } else {
+                                        targetInput.trim().toLongOrNull()?.toDouble()
+                                    }
+                                    val validationMsg = when {
+                                        parsedValue == null -> "Ingresa un valor numérico válido."
+                                        progress.metric == SalesMetricType.GLOBAL_SALES && parsedValue <= 0.0 ->
+                                            "La meta de Venta global debe ser mayor a 0."
+                                        parsedValue < 0.0 -> "La meta no puede ser negativa."
+                                        else -> null
+                                    }
+                                    if (validationMsg != null) {
+                                        inputError = validationMsg
+                                    } else if (parsedValue != null) {
+                                        inputError = null
+                                        onSaveTarget(parsedValue) {
+                                            isEditingMeta = false
+                                        }
+                                    }
+                                },
+                                enabled = !isBusy,
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = BrandNavy,
+                                    contentColor = Color.White
+                                ),
+                                shape = RoundedCornerShape(10.dp),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                                modifier = Modifier.testTag("save_indicator_meta_${progress.metric.name}")
+                            ) {
+                                Text(if (isBusy) "Guardando..." else "Guardar", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                    }
+                }
             }
         }
     }

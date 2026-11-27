@@ -282,9 +282,47 @@ class ScheduledTasksTest {
         assertFalse(sundayMatches.any { it.slug == "avance_ventas_1400" })
     }
 
+    @Test
+    fun `admin role removes all Cierre de venta diaria tasks and templates while branch employee role retains them`() {
+        val closingTaskForBranch = com.example.data.model.AssignedTask(
+            id = "sched_emp1_2026-11-26_cierre_venta_diaria",
+            assigneeId = "emp1",
+            assigneeName = "Sucursal 87",
+            title = "Cierre de venta diaria",
+            taskType = com.example.data.model.TaskType.DAILY.name,
+            dueDate = "2026-11-26",
+            templateId = ScheduledTasksCatalog.templateDocIdForSlug(ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG)
+        )
+        val regularTask = com.example.data.model.AssignedTask(
+            id = "sched_emp1_2026-11-26_apertura_piso",
+            assigneeId = "emp1",
+            assigneeName = "Sucursal 87",
+            title = "Apertura de piso y encendido de exhibición",
+            taskType = com.example.data.model.TaskType.DAILY.name,
+            dueDate = "2026-11-26"
+        )
+        val tasks = listOf(closingTaskForBranch, regularTask)
+
+        val adminVisibleTasks = ScheduledTasksCatalog.filterTasksForRole(tasks, isAdmin = true)
+        assertEquals(1, adminVisibleTasks.size)
+        assertEquals(regularTask.id, adminVisibleTasks.first().id)
+
+        val employeeVisibleTasks = ScheduledTasksCatalog.filterTasksForRole(tasks, isAdmin = false)
+        assertEquals(2, employeeVisibleTasks.size)
+
+        val templates = ScheduledTasksCatalog.defaultTemplates("admin_uid")
+        val adminTemplates = ScheduledTasksCatalog.filterTemplatesForRole(templates, isAdmin = true)
+        assertFalse(adminTemplates.any { it.slug == ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG })
+        assertFalse(adminTemplates.any { it.title.equals(ScheduledTasksCatalog.DAILY_SALES_CLOSING_TITLE, ignoreCase = true) })
+
+        val employeeTemplates = ScheduledTasksCatalog.filterTemplatesForRole(templates, isAdmin = false)
+        assertTrue(employeeTemplates.any { it.slug == ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG })
+    }
+
     private fun millisOf(year: Int, month: Int, day: Int, hour: Int, minute: Int): Long =
         Calendar.getInstance().apply {
             set(year, month, day, hour, minute, 0)
             set(Calendar.MILLISECOND, 0)
         }.timeInMillis
 }
+

@@ -235,7 +235,7 @@ fun ProjectionLineChart(
         ) {
             ChartLegendDot(color = actualColor, label = "Real")
             ChartLegendDot(color = projectionColor, label = "Proyección")
-            ChartLegendDot(color = targetColor, label = "Meta 14d")
+            ChartLegendDot(color = targetColor, label = "Meta ${series.totalDays}d")
         }
     }
 }

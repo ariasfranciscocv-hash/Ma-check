@@ -7,12 +7,19 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import kotlin.math.roundToInt
 
 object DateAndFormatters {
 
     private val esMx = Locale.forLanguageTag("es-MX")
-    private val isoFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+    private val isoFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+        isLenient = false
+    }
+    private val isoUtcFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply {
+        isLenient = false
+        timeZone = TimeZone.getTimeZone("UTC")
+    }
     private val displayDateFormat = SimpleDateFormat("dd MMM yyyy", esMx)
     private val shortDateFormat = SimpleDateFormat("dd/MM", esMx)
     private val timeFormat = SimpleDateFormat("dd MMM · HH:mm", esMx)
@@ -21,104 +28,134 @@ object DateAndFormatters {
     }
     private val integerFormat = NumberFormat.getIntegerInstance(esMx)
 
-    fun todayIso(): String = isoFormat.format(Date())
+    private const val MILLIS_PER_DAY = 24L * 60L * 60L * 1000L
+    const val OPENING_HOUR_OF_DAY = 8
+
+    private fun formatIsoLocal(date: Date): String =
+        synchronized(isoFormat) { isoFormat.format(date) }
+
+    private fun parseIsoLocal(iso: String): Date? =
+        runCatching { synchronized(isoFormat) { isoFormat.parse(iso) } }.getOrNull()
+
+    private fun parseIsoUtc(iso: String): Date? =
+        runCatching { synchronized(isoUtcFormat) { isoUtcFormat.parse(iso) } }.getOrNull()
+
+    fun todayIso(): String = formatIsoLocal(Date())
 
     fun addDaysIso(startIso: String, daysToAdd: Int): String {
-        val parsed = runCatching { isoFormat.parse(startIso) }.getOrNull() ?: Date()
-        val cal = Calendar.getInstance().apply {
+        val parsed = parseIsoUtc(startIso) ?: parseIsoLocal(startIso) ?: Date()
+        val cal = Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
             time = parsed
             add(Calendar.DAY_OF_YEAR, daysToAdd)
         }
-        return isoFormat.format(cal.time)
+        return synchronized(isoUtcFormat) { isoUtcFormat.format(cal.time) }
     }
 
-    fun biweeklyRangeForDate(cal: Calendar = Calendar.getInstance()): Pair<String, String> {
+    fun defaultBiweeklyRange(referenceDate: Date = Date()): Pair<String, String> {
+        val cal = Calendar.getInstance().apply { time = referenceDate }
         val day = cal.get(Calendar.DAY_OF_MONTH)
-        val startCal = (cal.clone() as Calendar).apply {
+        val startCal = Calendar.getInstance().apply {
+            time = cal.time
             set(Calendar.DAY_OF_MONTH, if (day <= 15) 1 else 16)
         }
-        val endCal = (cal.clone() as Calendar).apply {
+        val endCal = Calendar.getInstance().apply {
+            time = startCal.time
             val endDay = if (day <= 15) 15 else getActualMaximum(Calendar.DAY_OF_MONTH)
             set(Calendar.DAY_OF_MONTH, endDay)
         }
-        synchronized(isoFormat) {
-            return isoFormat.format(startCal.time) to isoFormat.format(endCal.time)
-        }
+        return formatIsoLocal(startCal.time) to formatIsoLocal(endCal.time)
     }
 
-    fun nextBiweeklyRange(cal: Calendar = Calendar.getInstance()): Pair<String, String> {
-        val day = cal.get(Calendar.DAY_OF_MONTH)
-        val nextCal = (cal.clone() as Calendar).apply {
-            if (day <= 15) {
-                set(Calendar.DAY_OF_MONTH, 16)
-            } else {
-                set(Calendar.DAY_OF_MONTH, 1)
-                add(Calendar.MONTH, 1)
-            }
-        }
-        return biweeklyRangeForDate(nextCal)
+    fun biweeklyRangeForIso(dateIso: String): Pair<String, String> {
+        val parsed = parseIsoLocal(dateIso) ?: Date()
+        return defaultBiweeklyRange(parsed)
     }
 
-    fun defaultBiweeklyRange(): Pair<String, String> = biweeklyRangeForDate(Calendar.getInstance())
+    fun currentBiweeklyPeriodId(referenceDate: Date = Date()): String {
+        val cal = Calendar.getInstance().apply { time = referenceDate }
+        val year = cal.get(Calendar.YEAR)
+        val month = cal.get(Calendar.MONTH) + 1
+        val half = if (cal.get(Calendar.DAY_OF_MONTH) <= 15) "Q1" else "Q2"
+        return String.format(Locale.US, "%04d-%02d_%s", year, month, half)
+    }
 
-    fun biweeklyTitleForRange(startIso: String): String {
-        val parsed = runCatching { synchronized(isoFormat) { isoFormat.parse(startIso) } }.getOrNull() ?: Date()
-        val cal = Calendar.getInstance().apply { time = parsed }
+    fun biweeklyPeriodIdForIso(dateIso: String): String {
+        val parsed = parseIsoLocal(dateIso) ?: Date()
+        return currentBiweeklyPeriodId(parsed)
+    }
+
+    fun defaultBiweeklyTitle(referenceDate: Date = Date()): String {
+        val cal = Calendar.getInstance().apply { time = referenceDate }
         val quincenaNum = if (cal.get(Calendar.DAY_OF_MONTH) <= 15) "1ª Quincena" else "2ª Quincena"
         val monthFormat = SimpleDateFormat("MMMM yyyy", esMx)
         val monthName = monthFormat.format(cal.time).replaceFirstChar { it.uppercase() }
         return "$quincenaNum · $monthName"
     }
 
-    fun defaultBiweeklyTitle(): String = biweeklyTitleForRange(defaultBiweeklyRange().first)
-
     fun daysBetweenInclusive(startIso: String, endIso: String): Int {
-        val start = runCatching { isoFormat.parse(startIso) }.getOrNull() ?: return 1
-        val end = runCatching { isoFormat.parse(endIso) }.getOrNull() ?: return 1
-        val diffDays = ((end.time - start.time) / (24L * 60L * 60L * 1000L)).toInt() + 1
+        val start = parseIsoUtc(startIso) ?: return 1
+        val end = parseIsoUtc(endIso) ?: return 1
+        val diffDays = ((end.time - start.time) / MILLIS_PER_DAY).toInt() + 1
         return diffDays.coerceAtLeast(1)
     }
 
     fun dayIndexInPeriod(startIso: String, targetIso: String, totalDays: Int): Int {
-        val start = runCatching { isoFormat.parse(startIso) }.getOrNull() ?: return 1
-        val target = runCatching { isoFormat.parse(targetIso) }.getOrNull() ?: return 1
-        val diffDays = ((target.time - start.time) / (24L * 60L * 60L * 1000L)).toInt() + 1
+        val start = parseIsoUtc(startIso) ?: return 1
+        val target = parseIsoUtc(targetIso) ?: return 1
+        val diffDays = ((target.time - start.time) / MILLIS_PER_DAY).toInt() + 1
         return diffDays.coerceIn(1, totalDays.coerceAtLeast(1))
     }
 
     fun formatIsoToDisplay(iso: String): String {
-        val parsed = runCatching { isoFormat.parse(iso) }.getOrNull() ?: return iso
-        return displayDateFormat.format(parsed)
+        val parsed = parseIsoLocal(iso) ?: return iso
+        return synchronized(displayDateFormat) { displayDateFormat.format(parsed) }
     }
 
     fun formatIsoToShort(iso: String): String {
-        val parsed = runCatching { isoFormat.parse(iso) }.getOrNull() ?: return iso
-        return shortDateFormat.format(parsed)
+        val parsed = parseIsoLocal(iso) ?: return iso
+        return synchronized(shortDateFormat) { shortDateFormat.format(parsed) }
     }
 
     fun formatTimestamp(date: Date?): String {
         if (date == null) return "Reciente"
-        return timeFormat.format(date)
+        return synchronized(timeFormat) { timeFormat.format(date) }
     }
 
     fun formatMetricValue(metric: SalesMetricType, value: Double): String {
         return if (metric.isCurrency) {
-            currencyFormat.format(value)
+            synchronized(currencyFormat) { currencyFormat.format(value) }
         } else {
-            "${integerFormat.format(value.roundToInt())} ${metric.unitLabel}"
+            val formattedInt = synchronized(integerFormat) { integerFormat.format(value.roundToInt()) }
+            "$formattedInt ${metric.unitLabel}"
         }
     }
 
-    fun formatCurrency(value: Double): String = currencyFormat.format(value)
+    fun formatCurrency(value: Double): String =
+        synchronized(currencyFormat) { currencyFormat.format(value) }
 
-    fun formatUnits(value: Double): String = integerFormat.format(value.roundToInt())
+    fun formatUnits(value: Double): String =
+        synchronized(integerFormat) { integerFormat.format(value.roundToInt()) }
 
     fun dayOfWeekForIso(iso: String): Int {
-        val parsed = runCatching { isoFormat.parse(iso) }.getOrNull() ?: Date()
+        val parsed = parseIsoLocal(iso) ?: Date()
         return Calendar.getInstance().apply { time = parsed }.get(Calendar.DAY_OF_WEEK)
     }
 
-    private val scheduledIdDateRegex = Regex("""^sched_.+_(\d{4}-\d{2}-\d{2})_[a-z0-9_]+$""")
+    fun isWithinOpeningOrWorkdayHours(nowMillis: Long = System.currentTimeMillis()): Boolean {
+        val hour = Calendar.getInstance().apply { timeInMillis = nowMillis }.get(Calendar.HOUR_OF_DAY)
+        return hour in OPENING_HOUR_OF_DAY..23
+    }
+
+    fun shouldAutoResetDailyClosing(
+        lastClosingDateIso: String?,
+        todayIso: String = todayIso(),
+        nowMillis: Long = System.currentTimeMillis()
+    ): Boolean {
+        if (!isWithinOpeningOrWorkdayHours(nowMillis)) return false
+        return lastClosingDateIso.isNullOrBlank() || lastClosingDateIso != todayIso
+    }
+
+    private val scheduledIdDateRegex = Regex("""^sched_.+_(\d{4}-\d{2}-\d{2})_([a-z0-9_]+)$""")
 
     private fun parseDateTimeMillis(
         dateIso: String,
@@ -145,6 +182,9 @@ object DateAndFormatters {
 
     fun extractScheduledAssignedDate(taskId: String): String? =
         scheduledIdDateRegex.find(taskId)?.groupValues?.getOrNull(1)
+
+    fun extractScheduledSlug(taskId: String): String? =
+        scheduledIdDateRegex.find(taskId)?.groupValues?.getOrNull(2)
 
     fun resolveTaskWindowMillis(task: AssignedTask): Pair<Long, Long>? {
         if (task.dueDate.isBlank()) return null

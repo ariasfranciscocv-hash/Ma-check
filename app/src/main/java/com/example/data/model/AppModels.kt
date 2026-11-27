@@ -60,6 +60,8 @@ enum class SalesMetricType(
 }
 
 object BranchOptions {
+    const val ALL_BRANCHES_OPTION = "Todas las Sucursales"
+
     val ALL_BRANCHES = listOf(
         "Sucursal 87",
         "Sucursal 107",
@@ -162,7 +164,9 @@ data class BiweeklyQuota(
     val title: String = "",
     val startDate: String = "",
     val endDate: String = "",
-    val totalDays: Long = 14L,
+    val totalDays: Long = 15L,
+    val periodId: String = "",
+    val branchName: String? = null,
     val targetGlobalSales: Double = 0.0,
     val targetCreditSales: Double = 0.0,
     val targetNewCustomers: Long = 0L,
@@ -172,7 +176,16 @@ data class BiweeklyQuota(
     val createdBy: String = "",
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
-)
+) {
+    val effectiveBranchName: String
+        get() = branchName?.takeIf { it.isNotBlank() } ?: BranchOptions.ALL_BRANCHES_OPTION
+
+    val effectivePeriodId: String
+        get() = periodId.ifBlank {
+            if (startDate.length == 10) com.example.utils.DateAndFormatters.biweeklyPeriodIdForIso(startDate)
+            else com.example.utils.DateAndFormatters.currentBiweeklyPeriodId()
+        }
+}
 
 @Keep
 @IgnoreExtraProperties
@@ -180,6 +193,7 @@ data class DailySalesEntry(
     @DocumentId val id: String = "",
     val userId: String = "",
     val userName: String = "",
+    val branchName: String? = null,
     val quotaId: String = "",
     val dateString: String = "",
     val globalSales: Double = 0.0,
@@ -236,67 +250,6 @@ data class ChartSeries(
     val projectedCumulativeByDay: List<Double>
 )
 
-data class BranchSalesSummary(
-    val branchName: String,
-    val globalSales: Double,
-    val creditSales: Double,
-    val newCustomers: Long,
-    val appMaOperations: Long,
-    val newCustomerRequests: Long,
-    val hasTodayClosing: Boolean,
-    val entriesCount: Int
-)
-
-fun buildBranchSalesSummaries(
-    teamUsers: List<UserProfile>,
-    entries: List<DailySalesEntry>,
-    todayIso: String
-): List<BranchSalesSummary> {
-    val uidToBranch = teamUsers
-        .mapNotNull { user ->
-            val branch = user.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
-            if (branch != null) user.userId to branch else null
-        }
-        .toMap()
-
-    val entriesByBranch = entries.groupBy { entry ->
-        uidToBranch[entry.userId]
-            ?: entry.userName.takeIf { it in BranchOptions.ALL_BRANCHES }
-            ?: entry.userName.ifBlank { "Sin sucursal" }
-    }
-
-    val officialSummaries = BranchOptions.ALL_BRANCHES.map { branch ->
-        val branchEntries = entriesByBranch[branch].orEmpty()
-        BranchSalesSummary(
-            branchName = branch,
-            globalSales = branchEntries.sumOf { it.globalSales },
-            creditSales = branchEntries.sumOf { it.creditSales },
-            newCustomers = branchEntries.sumOf { it.newCustomers },
-            appMaOperations = branchEntries.sumOf { it.appMaOperations },
-            newCustomerRequests = branchEntries.sumOf { it.newCustomerRequests },
-            hasTodayClosing = branchEntries.any { it.dateString == todayIso },
-            entriesCount = branchEntries.size
-        )
-    }
-
-    val extraKeys = entriesByBranch.keys.filter { it !in BranchOptions.ALL_BRANCHES }.sorted()
-    val extraSummaries = extraKeys.map { branch ->
-        val branchEntries = entriesByBranch[branch].orEmpty()
-        BranchSalesSummary(
-            branchName = branch,
-            globalSales = branchEntries.sumOf { it.globalSales },
-            creditSales = branchEntries.sumOf { it.creditSales },
-            newCustomers = branchEntries.sumOf { it.newCustomers },
-            appMaOperations = branchEntries.sumOf { it.appMaOperations },
-            newCustomerRequests = branchEntries.sumOf { it.newCustomerRequests },
-            hasTodayClosing = branchEntries.any { it.dateString == todayIso },
-            entriesCount = branchEntries.size
-        )
-    }
-
-    return officialSummaries + extraSummaries
-}
-
 data class SalesProjectionSummary(
     val quota: BiweeklyQuota,
     val daysElapsed: Int,
@@ -304,9 +257,126 @@ data class SalesProjectionSummary(
     val metrics: List<MetricProgress>,
     val entriesCount: Int,
     val todayEntry: DailySalesEntry?,
-    val recentEntries: List<DailySalesEntry> = emptyList(),
-    val branchBreakdowns: List<BranchSalesSummary> = emptyList()
+    val recentEntries: List<DailySalesEntry> = emptyList()
 )
+
+data class BranchSalesSummary(
+    val branchName: String,
+    val quota: BiweeklyQuota,
+    val hasCustomBranchQuota: Boolean,
+    val todayEntry: DailySalesEntry?,
+    val periodEntries: List<DailySalesEntry>,
+    val totalGlobalSales: Double,
+    val totalCreditSales: Double,
+    val totalNewCustomers: Long,
+    val totalAppMaOps: Long,
+    val totalNewRequests: Long,
+    val progressRatio: Float,
+    val completionPercent: Int
+)
+
+fun resolveQuotaForBranch(
+    branchName: String,
+    quotas: List<BiweeklyQuota>,
+    currentPeriodId: String = com.example.utils.DateAndFormatters.currentBiweeklyPeriodId()
+): Pair<BiweeklyQuota?, Boolean> {
+    if (quotas.isEmpty()) return null to false
+    val currentPeriodQuotas = quotas.filter { it.effectivePeriodId == currentPeriodId }
+    val exactBranchCurrent = if (branchName in BranchOptions.ALL_BRANCHES) {
+        currentPeriodQuotas.firstOrNull { it.branchName == branchName }
+    } else {
+        null
+    }
+    if (exactBranchCurrent != null) return exactBranchCurrent to true
+
+    val generalCurrent = currentPeriodQuotas.firstOrNull {
+        it.branchName.isNullOrBlank() || it.branchName == BranchOptions.ALL_BRANCHES_OPTION
+    }
+    if (generalCurrent != null) return generalCurrent to false
+
+    val exactBranchAny = if (branchName in BranchOptions.ALL_BRANCHES) {
+        quotas.firstOrNull { it.branchName == branchName }
+    } else {
+        null
+    }
+    if (exactBranchAny != null) return exactBranchAny to true
+
+    val fallbackGeneral = quotas.firstOrNull {
+        it.branchName.isNullOrBlank() || it.branchName == BranchOptions.ALL_BRANCHES_OPTION
+    } ?: quotas.firstOrNull()
+    return fallbackGeneral to false
+}
+
+data class DailyClosingSaveResult(
+    val branchAccumulatedGlobalSales: Double,
+    val branchPeriodEntriesCount: Int
+)
+
+fun buildBranchSalesSummaries(
+    branches: List<String>,
+    quotas: List<BiweeklyQuota>,
+    entries: List<DailySalesEntry>,
+    teamUsers: List<UserProfile>,
+    todayIso: String = com.example.utils.DateAndFormatters.todayIso(),
+    currentPeriodId: String = com.example.utils.DateAndFormatters.currentBiweeklyPeriodId()
+): List<BranchSalesSummary> {
+    if (quotas.isEmpty()) return emptyList()
+    val (periodStartIso, periodEndIso) = com.example.utils.DateAndFormatters.biweeklyRangeForIso(todayIso)
+    val uidToBranch = teamUsers
+        .mapNotNull { user ->
+            val branch = user.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+            if (branch != null) user.userId to branch else null
+        }
+        .toMap()
+
+    return branches.mapNotNull { branch ->
+        val (resolvedQuota, hasCustom) = resolveQuotaForBranch(branch, quotas, currentPeriodId)
+        val quota = resolvedQuota ?: return@mapNotNull null
+
+        val branchEntries = entries
+            .filter { entry ->
+                val resolvedBranch = entry.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                    ?: uidToBranch[entry.userId]
+                    ?: entry.userName.takeIf { it in BranchOptions.ALL_BRANCHES }
+                    ?: entry.userName
+                val matchesBranch = resolvedBranch == branch
+                val inCalendarQuincena = entry.dateString >= periodStartIso && entry.dateString <= periodEndIso
+                matchesBranch && inCalendarQuincena
+            }
+            .sortedWith(
+                compareByDescending<DailySalesEntry> { it.dateString }
+                    .thenByDescending { it.updatedAt?.seconds ?: 0L }
+                    .thenByDescending { it.quotaId == quota.id }
+            )
+            .distinctBy { it.dateString }
+
+        val todayEntry = branchEntries.firstOrNull { it.dateString == todayIso }
+        val totalGlobal = branchEntries.sumOf { it.globalSales }
+        val totalCredit = branchEntries.sumOf { it.creditSales }
+        val totalCustomers = branchEntries.sumOf { it.newCustomers }
+        val totalAppMa = branchEntries.sumOf { it.appMaOperations }
+        val totalRequests = branchEntries.sumOf { it.newCustomerRequests }
+
+        val target = quota.targetGlobalSales
+        val ratio = if (target > 0.0) (totalGlobal / target).toFloat().coerceAtLeast(0f) else 0f
+        val pct = kotlin.math.round(ratio * 100f).toInt().coerceAtLeast(0)
+
+        BranchSalesSummary(
+            branchName = branch,
+            quota = quota,
+            hasCustomBranchQuota = hasCustom,
+            todayEntry = todayEntry,
+            periodEntries = branchEntries,
+            totalGlobalSales = totalGlobal,
+            totalCreditSales = totalCredit,
+            totalNewCustomers = totalCustomers,
+            totalAppMaOps = totalAppMa,
+            totalNewRequests = totalRequests,
+            progressRatio = ratio,
+            completionPercent = pct
+        )
+    }
+}
 
 data class BranchTaskSummary(
     val branchName: String,

@@ -1,19 +1,54 @@
 package com.example
 
-import com.example.data.model.DailySalesEntry
-import com.example.data.model.UserProfile
-import com.example.data.model.buildBranchSalesSummaries
 import com.example.utils.DateAndFormatters
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.util.Calendar
 
 class ProjectionMathTest {
 
     @Test
-    fun `daysBetweenInclusive and dayIndexInPeriod clamp cleanly for calendar half-month cycles`() {
+    fun `first half of month is strictly days 1 to 15 across all months including DST`() {
+        val (marStart, marEnd) = DateAndFormatters.biweeklyRangeForIso("2026-03-10")
+        assertEquals("2026-03-01", marStart)
+        assertEquals("2026-03-15", marEnd)
+        assertEquals(15, DateAndFormatters.daysBetweenInclusive(marStart, marEnd))
+
+        val (novStart, novEnd) = DateAndFormatters.biweeklyRangeForIso("2026-11-01")
+        assertEquals("2026-11-01", novStart)
+        assertEquals("2026-11-15", novEnd)
+        assertEquals(15, DateAndFormatters.daysBetweenInclusive(novStart, novEnd))
+    }
+
+    @Test
+    fun `second half of month adjusts strictly to 28, 29, 30, and 31 day months`() {
+        // 28-day February (non-leap year 2026)
+        val (feb28Start, feb28End) = DateAndFormatters.biweeklyRangeForIso("2026-02-20")
+        assertEquals("2026-02-16", feb28Start)
+        assertEquals("2026-02-28", feb28End)
+        assertEquals(13, DateAndFormatters.daysBetweenInclusive(feb28Start, feb28End))
+
+        // 29-day February (leap year 2024)
+        val (feb29Start, feb29End) = DateAndFormatters.biweeklyRangeForIso("2024-02-16")
+        assertEquals("2024-02-16", feb29Start)
+        assertEquals("2024-02-29", feb29End)
+        assertEquals(14, DateAndFormatters.daysBetweenInclusive(feb29Start, feb29End))
+
+        // 30-day November
+        val (novStart, novEnd) = DateAndFormatters.biweeklyRangeForIso("2026-11-24")
+        assertEquals("2026-11-16", novStart)
+        assertEquals("2026-11-30", novEnd)
+        assertEquals(15, DateAndFormatters.daysBetweenInclusive(novStart, novEnd))
+
+        // 31-day December
+        val (decStart, decEnd) = DateAndFormatters.biweeklyRangeForIso("2026-12-31")
+        assertEquals("2026-12-16", decStart)
+        assertEquals("2026-12-31", decEnd)
+        assertEquals(16, DateAndFormatters.daysBetweenInclusive(decStart, decEnd))
+    }
+
+    @Test
+    fun `daysBetweenInclusive and dayIndexInPeriod clamp cleanly for calendar biweekly cycle`() {
         val start = "2026-11-16"
         val end = "2026-11-30"
         val totalDays = DateAndFormatters.daysBetweenInclusive(start, end)
@@ -25,78 +60,9 @@ class ProjectionMathTest {
     }
 
     @Test
-    fun `biweeklyRangeForDate always uses 1-15 and 16-last day of month`() {
-        val nov10 = Calendar.getInstance().apply { set(2026, Calendar.NOVEMBER, 10, 10, 0, 0) }
-        val nov26 = Calendar.getInstance().apply { set(2026, Calendar.NOVEMBER, 26, 10, 0, 0) }
-        val dec20 = Calendar.getInstance().apply { set(2026, Calendar.DECEMBER, 20, 10, 0, 0) }
-        val febNonLeap = Calendar.getInstance().apply { set(2026, Calendar.FEBRUARY, 20, 10, 0, 0) }
-        val febLeap = Calendar.getInstance().apply { set(2024, Calendar.FEBRUARY, 20, 10, 0, 0) }
-
-        assertEquals("2026-11-01" to "2026-11-15", DateAndFormatters.biweeklyRangeForDate(nov10))
-        assertEquals(15, DateAndFormatters.daysBetweenInclusive("2026-11-01", "2026-11-15"))
-
-        assertEquals("2026-11-16" to "2026-11-30", DateAndFormatters.biweeklyRangeForDate(nov26))
-        assertEquals(15, DateAndFormatters.daysBetweenInclusive("2026-11-16", "2026-11-30"))
-
-        assertEquals("2026-12-16" to "2026-12-31", DateAndFormatters.biweeklyRangeForDate(dec20))
-        assertEquals(16, DateAndFormatters.daysBetweenInclusive("2026-12-16", "2026-12-31"))
-
-        assertEquals("2026-02-16" to "2026-02-28", DateAndFormatters.biweeklyRangeForDate(febNonLeap))
-        assertEquals(13, DateAndFormatters.daysBetweenInclusive("2026-02-16", "2026-02-28"))
-
-        assertEquals("2024-02-16" to "2024-02-29", DateAndFormatters.biweeklyRangeForDate(febLeap))
-        assertEquals(14, DateAndFormatters.daysBetweenInclusive("2024-02-16", "2024-02-29"))
-
-        assertEquals("2026-11-16" to "2026-11-30", DateAndFormatters.nextBiweeklyRange(nov10))
-        assertEquals("2026-12-01" to "2026-12-15", DateAndFormatters.nextBiweeklyRange(nov26))
-    }
-
-    @Test
-    fun `buildBranchSalesSummaries consolidates all 6 branches and detects today closing`() {
-        val users = listOf(
-            UserProfile(userId = "u107", branchName = "Sucursal 107", displayName = "Sucursal 107"),
-            UserProfile(userId = "u112", branchName = "Sucursal 112", displayName = "Sucursal 112")
-        )
-        val entries = listOf(
-            DailySalesEntry(
-                userId = "u107",
-                userName = "Sucursal 107",
-                dateString = "2026-11-26",
-                globalSales = 15000.0,
-                creditSales = 9000.0,
-                newCustomers = 3L,
-                appMaOperations = 4L,
-                newCustomerRequests = 5L
-            ),
-            DailySalesEntry(
-                userId = "u112",
-                userName = "Sucursal 112",
-                dateString = "2026-11-25",
-                globalSales = 12000.0,
-                creditSales = 7000.0,
-                newCustomers = 2L,
-                appMaOperations = 2L,
-                newCustomerRequests = 3L
-            )
-        )
-
-        val summaries = buildBranchSalesSummaries(users, entries, todayIso = "2026-11-26")
-        assertEquals(6, summaries.size)
-        val s107 = summaries.first { it.branchName == "Sucursal 107" }
-        val s112 = summaries.first { it.branchName == "Sucursal 112" }
-        val s87 = summaries.first { it.branchName == "Sucursal 87" }
-
-        assertEquals(15000.0, s107.globalSales, 0.01)
-        assertTrue(s107.hasTodayClosing)
-        assertEquals(12000.0, s112.globalSales, 0.01)
-        assertFalse(s112.hasTodayClosing)
-        assertEquals(0.0, s87.globalSales, 0.01)
-        assertFalse(s87.hasTodayClosing)
-    }
-
-    @Test
-    fun `addDaysIso advances date accurately`() {
+    fun `addDaysIso advances date accurately across month boundaries`() {
         assertEquals("2026-11-30", DateAndFormatters.addDaysIso("2026-11-16", 14))
+        assertEquals("2026-03-01", DateAndFormatters.addDaysIso("2026-02-28", 1))
         assertTrue(DateAndFormatters.formatUnits(42.0).contains("42"))
     }
 }

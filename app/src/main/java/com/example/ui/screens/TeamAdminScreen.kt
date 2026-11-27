@@ -16,6 +16,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.PlaylistAddCheck
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.EditCalendar
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Storefront
 import androidx.compose.material3.AlertDialog
@@ -41,8 +42,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.example.data.model.BiweeklyQuota
+import com.example.data.model.BranchOptions
+import com.example.data.model.BranchSalesSummary
+import com.example.data.model.DailySalesEntry
 import com.example.data.model.UserProfile
 import com.example.data.model.UserRole
+import com.example.ui.components.AssignBranchQuotaDialog
+import com.example.ui.components.BranchSalesDetailDialog
+import com.example.ui.components.BranchSalesTrackingSection
 import com.example.ui.theme.BrandNavy
 import com.example.ui.theme.BrandRed
 import com.example.ui.theme.BrandRedSoft
@@ -56,12 +63,31 @@ fun TeamAdminScreen(
     currentUserId: String,
     teamUsers: List<UserProfile>,
     activeQuota: BiweeklyQuota?,
+    activeQuotas: List<BiweeklyQuota> = emptyList(),
+    branchSalesSummaries: List<BranchSalesSummary> = emptyList(),
     isBusy: Boolean,
     onToggleAdmin: (UserProfile, Boolean) -> Unit,
     onSeedChecklist: (UserProfile) -> Unit,
-    onConfirmBranchResetForQuota: (branchName: String, branchUsers: List<UserProfile>) -> Unit
+    onConfirmBranchResetForQuota: (branchName: String, branchUsers: List<UserProfile>) -> Unit,
+    onLoadEntryAttachmentChunks: suspend (DailySalesEntry) -> Result<List<String>> = { Result.success(emptyList()) },
+    onSaveBiweeklyQuota: (
+        title: String,
+        startDate: String,
+        endDate: String,
+        totalDays: Long,
+        targetGlobalSales: Double,
+        targetCreditSales: Double,
+        targetNewCustomers: Long,
+        targetAppMaOperations: Long,
+        targetNewCustomerRequests: Long,
+        branchName: String,
+        applyToAllIndividualBranches: Boolean,
+        onDone: () -> Unit
+    ) -> Unit = { _, _, _, _, _, _, _, _, _, _, _, onDone -> onDone() }
 ) {
     var pendingResetTarget by remember { mutableStateOf<UserProfile?>(null) }
+    var quotaTargetBranch by remember { mutableStateOf<String?>(null) }
+    var selectedBranchDetailName by remember { mutableStateOf<String?>(null) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -69,9 +95,67 @@ fun TeamAdminScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         item {
+            Card(
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Metas Quincenales por Sucursal",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = BrandNavy
+                        )
+                        Text(
+                            text = "Asigna metas para la quincena actual y consulta cierres diarios.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = { quotaTargetBranch = BranchOptions.ALL_BRANCHES_OPTION },
+                        enabled = !isBusy,
+                        colors = ButtonDefaults.buttonColors(containerColor = BrandNavy),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.testTag("team_assign_branch_quota_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.EditCalendar,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Asignar Meta", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+            }
+        }
+
+        if (branchSalesSummaries.isNotEmpty()) {
+            item {
+                BranchSalesTrackingSection(
+                    summaries = branchSalesSummaries,
+                    isAdmin = true,
+                    onOpenBranchDetail = { detail -> selectedBranchDetailName = detail.branchName },
+                    onConfigureBranchQuota = { branchName -> quotaTargetBranch = branchName }
+                )
+            }
+        }
+
+        item {
             Text(
                 text = "Sucursales y Roles del Sistema",
-                style = MaterialTheme.typography.titleLarge
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(top = 6.dp)
             )
             Text(
                 text = "Gestiona permisos, asigna el check list base y confirma individualmente el reinicio de tareas por sucursal al actualizar la cuota quincenal.",
@@ -154,18 +238,26 @@ fun TeamAdminScreen(
                             )
                         }
 
-                        OutlinedButton(
-                            onClick = { onSeedChecklist(user) },
-                            enabled = !isBusy,
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.PlaylistAddCheck,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp)
+                        if (!userIsAdmin) {
+                            OutlinedButton(
+                                onClick = { onSeedChecklist(user) },
+                                enabled = !isBusy,
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.PlaylistAddCheck,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Check List Base", style = MaterialTheme.typography.labelSmall)
+                            }
+                        } else {
+                            Text(
+                                text = "Sin checklist diario",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Check List Base", style = MaterialTheme.typography.labelSmall)
                         }
                     }
 
@@ -252,6 +344,46 @@ fun TeamAdminScreen(
             dismissButton = {
                 TextButton(onClick = { pendingResetTarget = null }, enabled = !isBusy) {
                     Text("Cancelar")
+                }
+            }
+        )
+    }
+
+    val activeBranchDetail = selectedBranchDetailName?.let { name ->
+        branchSalesSummaries.firstOrNull { it.branchName == name }
+    }
+    if (activeBranchDetail != null) {
+        BranchSalesDetailDialog(
+            summary = activeBranchDetail,
+            isAdmin = true,
+            onDismiss = { selectedBranchDetailName = null },
+            onEditQuota = { branchName -> quotaTargetBranch = branchName },
+            onLoadEntryAttachmentChunks = onLoadEntryAttachmentChunks
+        )
+    }
+
+    val targetBranchForQuota = quotaTargetBranch
+    if (targetBranchForQuota != null) {
+        AssignBranchQuotaDialog(
+            initialBranch = targetBranchForQuota,
+            activeQuotas = activeQuotas,
+            isBusy = isBusy,
+            onDismiss = { quotaTargetBranch = null },
+            onSave = { title, start, end, days, g, c, nc, ma, req, targetBranch, applyAll ->
+                onSaveBiweeklyQuota(
+                    title,
+                    start,
+                    end,
+                    days,
+                    g,
+                    c,
+                    nc,
+                    ma,
+                    req,
+                    targetBranch,
+                    applyAll
+                ) {
+                    quotaTargetBranch = null
                 }
             }
         )

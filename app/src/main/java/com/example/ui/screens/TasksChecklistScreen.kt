@@ -35,7 +35,7 @@ import androidx.compose.material.icons.filled.CalendarToday
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -97,6 +97,7 @@ import com.example.data.model.TaskStatus
 import com.example.data.model.TaskType
 import com.example.data.model.UiState
 import com.example.data.model.UserProfile
+import com.example.data.model.UserRole
 import com.example.data.model.buildBranchTaskSummaries
 import com.example.data.model.buildDayTaskGroups
 import com.example.ui.theme.BrandNavy
@@ -147,53 +148,42 @@ fun TasksChecklistScreen(
         deadlineLabel: String?,
         onSuccess: () -> Unit
     ) -> Unit,
-    onUpdateTasks: (
-        tasks: List<AssignedTask>,
-        title: String,
-        description: String,
-        taskType: TaskType,
-        priority: TaskPriority,
-        dueDate: String,
-        dueTime: String?,
-        deadlineLabel: String?,
-        onSuccess: () -> Unit
-    ) -> Unit,
-    onDeleteTasks: (
-        tasks: List<AssignedTask>,
-        onSuccess: () -> Unit
-    ) -> Unit,
     onCompleteTaskWithEvidenceFiles: (
         task: AssignedTask,
         files: List<EncodedAttachment>,
         onSuccess: () -> Unit
     ) -> Unit,
     onConfirmBranchResetForQuota: (branchName: String, branchUsers: List<UserProfile>) -> Unit,
-    onLoadEvidenceFiles: suspend (TaskEvidence) -> Result<List<TaskEvidenceAttachmentFile>>
+    onLoadEvidenceFiles: suspend (TaskEvidence) -> Result<List<TaskEvidenceAttachmentFile>>,
+    onUpdateDailyTask: (
+        task: AssignedTask,
+        title: String,
+        description: String,
+        priority: TaskPriority,
+        dueTime: String?,
+        deadlineLabel: String?,
+        applyToAllBranchesSameDay: Boolean,
+        onSuccess: () -> Unit
+    ) -> Unit = { _, _, _, _, _, _, _, onSuccess -> onSuccess() },
+    onDeleteDailyTask: (
+        task: AssignedTask,
+        deleteAllBranchesSameDay: Boolean,
+        onSuccess: () -> Unit
+    ) -> Unit = { _, _, onSuccess -> onSuccess() }
 ) {
     var adminViewMode by remember { mutableStateOf(AdminTaskViewMode.BY_BRANCH) }
     var selectedFilter by remember { mutableStateOf(TaskFilter.ALL) }
     var taskToDocumentId by rememberSaveable { mutableStateOf<String?>(null) }
     var showCreateTaskDialog by remember { mutableStateOf(false) }
-    var taskToEditId by rememberSaveable { mutableStateOf<String?>(null) }
-    var taskToDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
     var evidencePreviewForAdmin by remember { mutableStateOf<TaskEvidence?>(null) }
+    var dailyTaskToEdit by remember { mutableStateOf<AssignedTask?>(null) }
+    var dailyTaskToDelete by remember { mutableStateOf<AssignedTask?>(null) }
     val expandedDayState = remember { mutableStateMapOf<String, Boolean>() }
 
-    val allTasksList = (tasksState as? UiState.Success)?.data.orEmpty()
-
-    val taskToDocument = remember(taskToDocumentId, allTasksList) {
+    val taskToDocument = remember(taskToDocumentId, tasksState) {
         val targetId = taskToDocumentId ?: return@remember null
-        allTasksList.firstOrNull { it.id == targetId && it.parsedStatus == TaskStatus.PENDING }
-    }
-
-    val taskToEdit = remember(taskToEditId, allTasksList) {
-        val targetId = taskToEditId ?: return@remember null
-        allTasksList.firstOrNull { it.id == targetId }
-    }
-
-    val taskToDelete = remember(taskToDeleteId, allTasksList) {
-        val targetId = taskToDeleteId ?: return@remember null
-        allTasksList.firstOrNull { it.id == targetId }
+        (tasksState as? UiState.Success)?.data
+            ?.firstOrNull { it.id == targetId && it.parsedStatus == TaskStatus.PENDING }
     }
 
     val evidencesMap = remember(evidencesState, isAdmin) {
@@ -300,9 +290,9 @@ fun TasksChecklistScreen(
                             nowMillis = nowMillis,
                             evidencesMap = evidencesMap,
                             onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev },
-                            onEditTask = { task -> taskToEditId = task.id },
-                            onDeleteTask = { task -> taskToDeleteId = task.id },
-                            onConfirmBranchResetForQuota = onConfirmBranchResetForQuota
+                            onConfirmBranchResetForQuota = onConfirmBranchResetForQuota,
+                            onEditDailyTask = { task -> dailyTaskToEdit = task },
+                            onDeleteDailyTask = { task -> dailyTaskToDelete = task }
                         )
                     } else {
                         val filtered = remember(tasksState.data, selectedFilter) {
@@ -345,8 +335,8 @@ fun TasksChecklistScreen(
                                                     }
                                                 },
                                                 onViewAdminEvidence = { ev -> evidencePreviewForAdmin = ev },
-                                                onEditTask = { taskToEditId = task.id },
-                                                onDeleteTask = { taskToDeleteId = task.id }
+                                                onEditDailyTask = { dailyTaskToEdit = task },
+                                                onDeleteDailyTask = { dailyTaskToDelete = task }
                                             )
                                         }
                                     }
@@ -373,9 +363,8 @@ fun TasksChecklistScreen(
     }
 
     if (showCreateTaskDialog && isAdmin) {
-        val availableUsers = remember(teamUsers, currentUserProfile) {
-            if (teamUsers.isNotEmpty()) teamUsers
-            else listOfNotNull(currentUserProfile)
+        val availableUsers = remember(teamUsers) {
+            teamUsers.filter { it.parsedRole != UserRole.ADMIN }
         }
         CreateTaskDialog(
             teamUsers = availableUsers,
@@ -399,59 +388,30 @@ fun TasksChecklistScreen(
         }
     }
 
-    taskToEdit?.let { targetTask ->
+    dailyTaskToEdit?.let { task ->
         if (isAdmin) {
-            val matchingTasks = remember(targetTask, allTasksList) {
-                val targetDay = DateAndFormatters.extractTaskDayIso(targetTask)
-                allTasksList.filter { candidate ->
-                    candidate.title == targetTask.title &&
-                        candidate.taskType == targetTask.taskType &&
-                        DateAndFormatters.extractTaskDayIso(candidate) == targetDay
-                }
-            }
-            EditTaskDialog(
-                task = targetTask,
-                matchingTasksCount = matchingTasks.size,
+            EditDailyTaskDialog(
+                task = task,
                 isBusy = isBusy,
-                onDismiss = { taskToEditId = null },
-                onSave = { title, desc, type, priority, dueDate, dueTime, deadlineLabel, applyToAll ->
-                    val scopeTasks = if (applyToAll && matchingTasks.size > 1) matchingTasks else listOf(targetTask)
-                    onUpdateTasks(
-                        scopeTasks,
-                        title,
-                        desc,
-                        type,
-                        priority,
-                        dueDate,
-                        dueTime,
-                        deadlineLabel
-                    ) {
-                        taskToEditId = null
+                onDismiss = { if (!isBusy) dailyTaskToEdit = null },
+                onConfirmEdit = { title, desc, priority, dueTime, deadlineLabel, applyAllBranches ->
+                    onUpdateDailyTask(task, title, desc, priority, dueTime, deadlineLabel, applyAllBranches) {
+                        dailyTaskToEdit = null
                     }
                 }
             )
         }
     }
 
-    taskToDelete?.let { targetTask ->
+    dailyTaskToDelete?.let { task ->
         if (isAdmin) {
-            val matchingTasks = remember(targetTask, allTasksList) {
-                val targetDay = DateAndFormatters.extractTaskDayIso(targetTask)
-                allTasksList.filter { candidate ->
-                    candidate.title == targetTask.title &&
-                        candidate.taskType == targetTask.taskType &&
-                        DateAndFormatters.extractTaskDayIso(candidate) == targetDay
-                }
-            }
-            DeleteTaskConfirmDialog(
-                task = targetTask,
-                matchingTasksCount = matchingTasks.size,
+            DeleteDailyTaskDialog(
+                task = task,
                 isBusy = isBusy,
-                onDismiss = { taskToDeleteId = null },
+                onDismiss = { if (!isBusy) dailyTaskToDelete = null },
                 onConfirmDelete = { deleteAllBranches ->
-                    val scopeTasks = if (deleteAllBranches && matchingTasks.size > 1) matchingTasks else listOf(targetTask)
-                    onDeleteTasks(scopeTasks) {
-                        taskToDeleteId = null
+                    onDeleteDailyTask(task, deleteAllBranches) {
+                        dailyTaskToDelete = null
                     }
                 }
             )
@@ -563,9 +523,9 @@ private fun AdminBranchesChecklistView(
     nowMillis: Long,
     evidencesMap: Map<String, TaskEvidence>,
     onViewAdminEvidence: (TaskEvidence) -> Unit,
-    onEditTask: (AssignedTask) -> Unit,
-    onDeleteTask: (AssignedTask) -> Unit,
-    onConfirmBranchResetForQuota: (branchName: String, branchUsers: List<UserProfile>) -> Unit
+    onConfirmBranchResetForQuota: (branchName: String, branchUsers: List<UserProfile>) -> Unit,
+    onEditDailyTask: (AssignedTask) -> Unit,
+    onDeleteDailyTask: (AssignedTask) -> Unit
 ) {
     val expandedState = remember { mutableStateMapOf<String, Boolean>() }
     val completedBranches = summaries.count { it.allTasksCompleted }
@@ -636,8 +596,8 @@ private fun AdminBranchesChecklistView(
                     pendingResetBranch = summary.branchName to branchUsers
                 },
                 onViewAdminEvidence = onViewAdminEvidence,
-                onEditTask = onEditTask,
-                onDeleteTask = onDeleteTask
+                onEditDailyTask = onEditDailyTask,
+                onDeleteDailyTask = onDeleteDailyTask
             )
         }
     }
@@ -687,8 +647,8 @@ private fun BranchChecklistCard(
     onToggleExpand: () -> Unit,
     onRequestBranchReset: () -> Unit,
     onViewAdminEvidence: (TaskEvidence) -> Unit,
-    onEditTask: (AssignedTask) -> Unit,
-    onDeleteTask: (AssignedTask) -> Unit
+    onEditDailyTask: (AssignedTask) -> Unit,
+    onDeleteDailyTask: (AssignedTask) -> Unit
 ) {
     val indicatorColor = if (summary.allTasksCompleted) SuccessGreen else BrandRed
     val indicatorBg = if (summary.allTasksCompleted) SuccessGreenSoft else BrandRedSoft
@@ -927,8 +887,8 @@ private fun BranchChecklistCard(
                                                     nowMillis = nowMillis,
                                                     linkedEvidence = evidencesMap[task.id],
                                                     onViewAdminEvidence = onViewAdminEvidence,
-                                                    onEditTask = { onEditTask(task) },
-                                                    onDeleteTask = { onDeleteTask(task) }
+                                                    onEditDailyTask = { onEditDailyTask(task) },
+                                                    onDeleteDailyTask = { onDeleteDailyTask(task) }
                                                 )
                                             }
                                         }
@@ -949,8 +909,8 @@ private fun BranchTaskStatusRow(
     nowMillis: Long,
     linkedEvidence: TaskEvidence?,
     onViewAdminEvidence: (TaskEvidence) -> Unit,
-    onEditTask: () -> Unit,
-    onDeleteTask: () -> Unit
+    onEditDailyTask: () -> Unit,
+    onDeleteDailyTask: () -> Unit
 ) {
     val scheduleStatus = DateAndFormatters.resolveTaskScheduleStatus(task, nowMillis)
     val dotColor = when (scheduleStatus) {
@@ -972,6 +932,7 @@ private fun BranchTaskStatusRow(
         TaskScheduleStatus.AFTER_WINDOW -> "Fuera de horario"
     }
     val isDone = task.parsedStatus == TaskStatus.COMPLETED
+    val isDaily = task.parsedType == TaskType.DAILY
 
     Surface(
         color = MaterialTheme.colorScheme.surface,
@@ -982,12 +943,12 @@ private fun BranchTaskStatusRow(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 10.dp, vertical = 9.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Box(
                     modifier = Modifier
@@ -1009,62 +970,71 @@ private fun BranchTaskStatusRow(
                     )
                 }
 
-                Surface(color = badgeBg, shape = RoundedCornerShape(50)) {
-                    Text(
-                        text = statusText,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = dotColor,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                    )
+                Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Surface(color = badgeBg, shape = RoundedCornerShape(50)) {
+                        Text(
+                            text = statusText,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = dotColor,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+
+                    if (isDone && linkedEvidence != null) {
+                        TextButton(
+                            onClick = { onViewAdminEvidence(linkedEvidence) },
+                            contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                            modifier = Modifier.height(28.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Visibility,
+                                contentDescription = "Ver archivos de ${task.title}",
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Archivos (${linkedEvidence.resolvedFileCount})",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    }
                 }
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                if (isDone && linkedEvidence != null) {
+            if (isDaily) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     TextButton(
-                        onClick = { onViewAdminEvidence(linkedEvidence) },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        onClick = onEditDailyTask,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.testTag("branch_edit_daily_task_${task.id}")
                     ) {
                         Icon(
-                            imageVector = Icons.Filled.Visibility,
-                            contentDescription = "Ver archivos de ${task.title}",
+                            imageVector = Icons.Filled.Edit,
+                            contentDescription = "Editar ${task.title}",
+                            tint = BrandNavy,
                             modifier = Modifier.size(15.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Archivos (${linkedEvidence.resolvedFileCount})",
-                            style = MaterialTheme.typography.labelSmall
-                        )
+                        Text("Editar", style = MaterialTheme.typography.labelSmall, color = BrandNavy)
                     }
-                    Spacer(modifier = Modifier.weight(1f))
-                }
-
-                IconButton(
-                    onClick = onEditTask,
-                    modifier = Modifier.testTag("edit_branch_task_${task.id}")
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Edit,
-                        contentDescription = "Editar tarea ${task.title}",
-                        tint = BrandNavy,
-                        modifier = Modifier.size(18.dp)
-                    )
-                }
-
-                IconButton(
-                    onClick = onDeleteTask,
-                    modifier = Modifier.testTag("delete_branch_task_${task.id}")
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.DeleteOutline,
-                        contentDescription = "Eliminar tarea ${task.title}",
-                        tint = BrandRed,
-                        modifier = Modifier.size(18.dp)
-                    )
+                    TextButton(
+                        onClick = onDeleteDailyTask,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.testTag("branch_delete_daily_task_${task.id}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Delete,
+                            contentDescription = "Eliminar ${task.title}",
+                            tint = BrandRed,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Eliminar", style = MaterialTheme.typography.labelSmall, color = BrandRed)
+                    }
                 }
             }
         }
@@ -1129,8 +1099,8 @@ private fun TaskCardItem(
     linkedEvidence: TaskEvidence?,
     onDocumentClick: () -> Unit,
     onViewAdminEvidence: (TaskEvidence) -> Unit,
-    onEditTask: () -> Unit,
-    onDeleteTask: () -> Unit
+    onEditDailyTask: () -> Unit,
+    onDeleteDailyTask: () -> Unit
 ) {
     val isExtraordinary = task.parsedType == TaskType.EXTRAORDINARY
     val isCompleted = task.parsedStatus == TaskStatus.COMPLETED
@@ -1337,38 +1307,41 @@ private fun TaskCardItem(
                 }
             }
 
-            if (isAdmin) {
+            if (isAdmin && task.parsedType == TaskType.DAILY) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     OutlinedButton(
-                        onClick = onEditTask,
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                        modifier = Modifier.testTag("edit_task_button_${task.id}")
+                        onClick = onEditDailyTask,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.testTag("edit_daily_task_${task.id}")
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Edit,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
+                            contentDescription = "Editar tarea diaria",
+                            modifier = Modifier.size(15.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Editar", style = MaterialTheme.typography.labelMedium)
+                        Text("Editar", style = MaterialTheme.typography.labelSmall)
                     }
+                    Spacer(modifier = Modifier.width(8.dp))
                     OutlinedButton(
-                        onClick = onDeleteTask,
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = BrandRed),
-                        modifier = Modifier.testTag("delete_task_button_${task.id}")
+                        onClick = onDeleteDailyTask,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.testTag("delete_daily_task_${task.id}")
                     ) {
                         Icon(
-                            imageVector = Icons.Filled.DeleteOutline,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
+                            imageVector = Icons.Filled.Delete,
+                            contentDescription = "Eliminar tarea diaria",
+                            tint = BrandRed,
+                            modifier = Modifier.size(15.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Eliminar", style = MaterialTheme.typography.labelMedium)
+                        Text("Eliminar", style = MaterialTheme.typography.labelSmall, color = BrandRed)
                     }
                 }
             }
@@ -1879,78 +1852,72 @@ private fun CreateTaskDialog(
 }
 
 @Composable
-private fun EditTaskDialog(
+private fun EditDailyTaskDialog(
     task: AssignedTask,
-    matchingTasksCount: Int,
     isBusy: Boolean,
     onDismiss: () -> Unit,
-    onSave: (
+    onConfirmEdit: (
         title: String,
         description: String,
-        taskType: TaskType,
         priority: TaskPriority,
-        dueDate: String,
         dueTime: String?,
         deadlineLabel: String?,
-        applyToAllBranches: Boolean
+        applyToAllBranchesSameDay: Boolean
     ) -> Unit
 ) {
     var title by remember(task.id) { mutableStateOf(task.title) }
     var description by remember(task.id) { mutableStateOf(task.description) }
-    var taskType by remember(task.id) { mutableStateOf(task.parsedType) }
     var priority by remember(task.id) { mutableStateOf(task.parsedPriority) }
-    var dueDate by remember(task.id) { mutableStateOf(task.dueDate.ifBlank { DateAndFormatters.todayIso() }) }
-    var dueTime by remember(task.id) { mutableStateOf(task.dueTime ?: "") }
+    var dueTime by remember(task.id) { mutableStateOf(task.dueTime ?: "23:59") }
     var deadlineLabel by remember(task.id) { mutableStateOf(task.deadlineLabel ?: "") }
-    var applyToAllBranches by remember(task.id) { mutableStateOf(false) }
+    var applyAllBranches by remember(task.id) { mutableStateOf(false) }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
-    val todayIso = remember { DateAndFormatters.todayIso() }
-    val tomorrowIso = remember(todayIso) { DateAndFormatters.addDaysIso(todayIso, 1) }
+    val dayHeader = remember(task.id) {
+        DateAndFormatters.formatDayGroupHeader(DateAndFormatters.extractTaskDayIso(task))
+    }
 
     AlertDialog(
-        onDismissRequest = { if (!isBusy) onDismiss() },
-        title = { Text("Editar Tarea") },
+        onDismissRequest = onDismiss,
+        title = { Text("Editar Tarea Diaria") },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text(
-                    text = "Sucursal: ${task.assigneeName}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = BrandNavy
-                )
                 OutlinedTextField(
                     value = title,
                     onValueChange = { title = it.take(120) },
-                    label = { Text("Título de la tarea") },
+                    label = { Text("Título") },
                     singleLine = true,
-                    modifier = Modifier.testTag("edit_task_title_input")
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("edit_daily_title_input")
                 )
                 OutlinedTextField(
                     value = description,
                     onValueChange = { description = it.take(500) },
-                    label = { Text("Instrucciones / qué adjuntar") },
+                    label = { Text("Descripción / instrucciones") },
                     minLines = 2,
-                    maxLines = 3,
-                    modifier = Modifier.testTag("edit_task_desc_input")
+                    maxLines = 4,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("edit_daily_desc_input")
                 )
-
-                Text("Tipo de tarea", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TaskType.entries.forEach { type ->
-                        FilterChip(
-                            selected = taskType == type,
-                            onClick = { taskType = type },
-                            label = { Text(type.labelEs) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = if (type == TaskType.EXTRAORDINARY) BrandRed else BrandNavy,
-                                selectedLabelColor = Color.White
-                            )
-                        )
-                    }
-                }
+                OutlinedTextField(
+                    value = dueTime,
+                    onValueChange = { dueTime = it.take(5) },
+                    label = { Text("Hora límite (HH:mm)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = deadlineLabel,
+                    onValueChange = { deadlineLabel = it.take(80) },
+                    label = { Text("Etiqueta de horario (opcional)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
 
                 Text("Prioridad", style = MaterialTheme.typography.labelMedium)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1963,76 +1930,28 @@ private fun EditTaskDialog(
                     }
                 }
 
-                Text("Fecha límite (AAAA-MM-DD)", style = MaterialTheme.typography.labelMedium)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Alcance de la edición", style = MaterialTheme.typography.labelMedium)
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     FilterChip(
-                        selected = dueDate == todayIso,
-                        onClick = { dueDate = todayIso },
-                        label = { Text("Hoy") }
+                        selected = !applyAllBranches,
+                        onClick = { applyAllBranches = false },
+                        label = { Text("Solo esta sucursal (${task.assigneeName})") },
+                        modifier = Modifier.testTag("edit_scope_single_branch")
                     )
                     FilterChip(
-                        selected = dueDate == tomorrowIso,
-                        onClick = { dueDate = tomorrowIso },
-                        label = { Text("Mañana") }
+                        selected = applyAllBranches,
+                        onClick = { applyAllBranches = true },
+                        label = { Text("Todas las sucursales ($dayHeader)") },
+                        modifier = Modifier.testTag("edit_scope_all_branches")
                     )
-                }
-                OutlinedTextField(
-                    value = dueDate,
-                    onValueChange = { dueDate = it.take(10) },
-                    label = { Text("Fecha límite") },
-                    singleLine = true,
-                    modifier = Modifier.testTag("edit_task_due_date_input")
-                )
-
-                Text("Hora límite (HH:mm)", style = MaterialTheme.typography.labelMedium)
-                Row(
-                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    listOf("" to "Sin hora", "11:30" to "11:30", "17:59" to "17:59", "23:59" to "23:59").forEach { (value, label) ->
-                        FilterChip(
-                            selected = dueTime == value,
-                            onClick = { dueTime = value },
-                            label = { Text(label) }
-                        )
-                    }
-                }
-                OutlinedTextField(
-                    value = dueTime,
-                    onValueChange = { dueTime = it.take(5) },
-                    label = { Text("Hora (ej. 14:30 o 23:59, opcional)") },
-                    singleLine = true,
-                    modifier = Modifier.testTag("edit_task_due_time_input")
-                )
-
-                OutlinedTextField(
-                    value = deadlineLabel,
-                    onValueChange = { deadlineLabel = it.take(80) },
-                    label = { Text("Etiqueta de horario (opcional)") },
-                    singleLine = true,
-                    modifier = Modifier.testTag("edit_task_deadline_label_input")
-                )
-
-                if (matchingTasksCount > 1) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { applyToAllBranches = !applyToAllBranches },
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Checkbox(
-                            checked = applyToAllBranches,
-                            onCheckedChange = { applyToAllBranches = it }
-                        )
-                        Text(
-                            text = "Aplicar cambio a todas las sucursales con esta tarea hoy ($matchingTasksCount)",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
                 }
 
                 if (errorMsg != null) {
-                    Text(text = errorMsg ?: "", style = MaterialTheme.typography.bodySmall, color = BrandRed)
+                    Text(
+                        text = errorMsg ?: "",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = BrandRed
+                    )
                 }
             }
         },
@@ -2041,31 +1960,29 @@ private fun EditTaskDialog(
                 enabled = !isBusy,
                 onClick = {
                     val cleanTitle = title.trim()
-                    val cleanDate = dueDate.trim()
-                    val cleanTime = dueTime.trim().takeIf { it.isNotEmpty() }
+                    val cleanTime = dueTime.trim()
                     when {
                         cleanTitle.length < 3 ->
-                            errorMsg = "Escribe un título de al menos 3 caracteres."
-                        !cleanDate.matches(Regex("""^\d{4}-\d{2}-\d{2}$""")) ->
-                            errorMsg = "La fecha debe tener formato AAAA-MM-DD (ej. 2026-11-26)."
-                        cleanTime != null && !cleanTime.matches(Regex("""^([01]\d|2[0-3]):[0-5]\d$""")) ->
-                            errorMsg = "La hora debe tener formato HH:mm de 24h (ej. 14:30 o 23:59)."
-                        else -> onSave(
-                            cleanTitle,
-                            description.trim(),
-                            taskType,
-                            priority,
-                            cleanDate,
-                            cleanTime,
-                            deadlineLabel.trim().takeIf { it.isNotEmpty() },
-                            applyToAllBranches
-                        )
+                            errorMsg = "El título debe tener al menos 3 caracteres."
+                        cleanTime.isNotEmpty() && !Regex("""^([01][0-9]|2[0-3]):[0-5][0-9]$""").matches(cleanTime) ->
+                            errorMsg = "Usa formato de 24 horas HH:mm (ej. 17:59 o 23:59)."
+                        else -> {
+                            errorMsg = null
+                            onConfirmEdit(
+                                cleanTitle,
+                                description.trim(),
+                                priority,
+                                cleanTime.ifEmpty { null },
+                                deadlineLabel.trim().ifEmpty { null },
+                                applyAllBranches
+                            )
+                        }
                     }
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = BrandNavy),
-                modifier = Modifier.testTag("confirm_edit_task_button")
+                modifier = Modifier.testTag("confirm_edit_daily_task_button")
             ) {
-                Text(if (isBusy) "Guardando..." else "Guardar Cambios")
+                Text(if (isBusy) "Guardando..." else "Guardar cambios")
             }
         },
         dismissButton = {
@@ -2077,47 +1994,45 @@ private fun EditTaskDialog(
 }
 
 @Composable
-private fun DeleteTaskConfirmDialog(
+private fun DeleteDailyTaskDialog(
     task: AssignedTask,
-    matchingTasksCount: Int,
     isBusy: Boolean,
     onDismiss: () -> Unit,
-    onConfirmDelete: (deleteAllBranches: Boolean) -> Unit
+    onConfirmDelete: (deleteAllBranchesSameDay: Boolean) -> Unit
 ) {
     var deleteAllBranches by remember(task.id) { mutableStateOf(false) }
+    val dayHeader = remember(task.id) {
+        DateAndFormatters.formatDayGroupHeader(DateAndFormatters.extractTaskDayIso(task))
+    }
 
     AlertDialog(
-        onDismissRequest = { if (!isBusy) onDismiss() },
-        title = { Text("Eliminar Tarea") },
+        onDismissRequest = onDismiss,
+        title = { Text("Eliminar Tarea Diaria") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    text = "¿Seguro que deseas eliminar \"${task.title}\" (${task.assigneeName})?",
-                    style = MaterialTheme.typography.bodyMedium
+                    text = "¿Deseas eliminar \"${task.title}\"?",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = BrandNavy
                 )
-                if (task.parsedStatus == TaskStatus.COMPLETED) {
-                    Text(
-                        text = "Esta tarea ya estaba completada; también se eliminarán sus archivos de evidencia.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = BrandRed
+                Text(
+                    text = "Elige si deseas quitarla únicamente en ${task.assigneeName} o en todas las sucursales del día ($dayHeader).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(
+                        selected = !deleteAllBranches,
+                        onClick = { deleteAllBranches = false },
+                        label = { Text("Solo ${task.assigneeName}") },
+                        modifier = Modifier.testTag("delete_scope_single_branch")
                     )
-                }
-                if (matchingTasksCount > 1) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { deleteAllBranches = !deleteAllBranches },
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Checkbox(
-                            checked = deleteAllBranches,
-                            onCheckedChange = { deleteAllBranches = it }
-                        )
-                        Text(
-                            text = "Eliminar también en todas las sucursales con esta tarea hoy ($matchingTasksCount)",
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
+                    FilterChip(
+                        selected = deleteAllBranches,
+                        onClick = { deleteAllBranches = true },
+                        label = { Text("Todas las sucursales ($dayHeader)") },
+                        modifier = Modifier.testTag("delete_scope_all_branches")
+                    )
                 }
             }
         },
@@ -2126,7 +2041,7 @@ private fun DeleteTaskConfirmDialog(
                 enabled = !isBusy,
                 onClick = { onConfirmDelete(deleteAllBranches) },
                 colors = ButtonDefaults.buttonColors(containerColor = BrandRed),
-                modifier = Modifier.testTag("confirm_delete_task_button")
+                modifier = Modifier.testTag("confirm_delete_daily_task_button")
             ) {
                 Text(if (isBusy) "Eliminando..." else "Eliminar")
             }

@@ -22,17 +22,26 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Assessment
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Checklist
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Storefront
@@ -42,7 +51,13 @@ import androidx.compose.material.icons.outlined.Group
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -51,6 +66,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -59,6 +75,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -72,21 +89,28 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.credentials.CredentialManager
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.example.data.firestore.FirestoreProvider
 import com.example.data.local.AppPreferences
+import com.example.data.model.BranchOptions
 import com.example.data.model.UiState
 import com.example.data.repository.AppRepository
 import com.example.data.repository.AuthRepository
@@ -105,7 +129,10 @@ import com.example.ui.theme.BrandNavy
 import com.example.ui.theme.BrandRed
 import com.example.ui.theme.BrandRedSoft
 import com.example.ui.theme.MetaCheckTheme
+import com.example.ui.theme.MonoFontFamily
 import com.example.ui.viewmodel.MainViewModel
+import com.example.utils.AppCrashGuard
+import com.example.utils.TechnicalErrorReport
 import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.FirebaseUser
@@ -114,13 +141,17 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.flowOf
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        AppCrashGuard.install(applicationContext)
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        FirestoreProvider.getInstance(applicationContext)
-        NotificationHelper.ensureChannel(this)
+        runCatching { FirestoreProvider.getInstance(applicationContext) }
+            .onFailure { AppCrashGuard.reportNonFatal("Error al inicializar Firestore", it) }
+        runCatching { NotificationHelper.ensureChannel(this) }
+            .onFailure { AppCrashGuard.reportNonFatal("Error al crear canal de notificaciones", it) }
         setContent {
             MetaCheckTheme {
                 AppRoot()
@@ -149,22 +180,40 @@ private enum class AppTab(
 }
 
 @Composable
-private fun AppRoot(auth: FirebaseAuth = Firebase.auth) {
+private fun AppRoot() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val credentialManager = remember(context) { CredentialManager.create(context) }
+    val auth = remember {
+        runCatching { Firebase.auth }
+            .onFailure { AppCrashGuard.reportNonFatal("Error al inicializar Firebase Auth", it) }
+            .getOrNull()
+    }
+    val credentialManager = remember(context) {
+        runCatching { CredentialManager.create(context) }
+            .onFailure { AppCrashGuard.reportNonFatal("Error al inicializar CredentialManager", it) }
+            .getOrNull()
+    }
 
     var showSplash by remember { mutableStateOf(true) }
-    val currentUser by auth.authStateFlow().collectAsStateWithLifecycle(initialValue = auth.currentUser)
+    val authFlow = remember(auth) { auth?.authStateFlow() ?: flowOf(null) }
+    val initialUser = remember(auth) { runCatching { auth?.currentUser }.getOrNull() }
+    val currentUser by authFlow.collectAsStateWithLifecycle(initialValue = initialUser)
+    val crashReport by AppCrashGuard.errorState.collectAsStateWithLifecycle()
 
-    LaunchedEffect(Unit) {
-        AuthRepository.attemptAutoSignIn(
-            context = context,
-            credentialManager = credentialManager,
-            scope = scope,
-            onAuthSuccess = {},
-            onUnauthenticated = {}
-        )
+    LaunchedEffect(credentialManager) {
+        if (credentialManager != null) {
+            runCatching {
+                AuthRepository.attemptAutoSignIn(
+                    context = context,
+                    credentialManager = credentialManager,
+                    scope = scope,
+                    onAuthSuccess = {},
+                    onUnauthenticated = {}
+                )
+            }.onFailure {
+                AppCrashGuard.reportNonFatal("Error en inicio de sesión automático", it)
+            }
+        }
         delay(950L)
         showSplash = false
     }
@@ -179,7 +228,11 @@ private fun AppRoot(auth: FirebaseAuth = Firebase.auth) {
                 AuthenticatedApp(
                     user = user,
                     onSignOut = {
-                        AuthRepository.signOut(credentialManager = credentialManager, scope = scope)
+                        if (credentialManager != null) {
+                            AuthRepository.signOut(credentialManager = credentialManager, scope = scope)
+                        } else {
+                            runCatching { auth?.signOut() }
+                        }
                     }
                 )
             }
@@ -191,6 +244,13 @@ private fun AppRoot(auth: FirebaseAuth = Firebase.auth) {
             exit = fadeOut()
         ) {
             SplashLaunchScreen()
+        }
+
+        crashReport?.let { report ->
+            TechnicalErrorOverlay(
+                report = report,
+                onDismiss = { AppCrashGuard.clearError() }
+            )
         }
     }
 }
@@ -221,12 +281,15 @@ private fun AuthenticatedApp(
     )
 
     val lastCachedBranch by viewModel.lastCachedBranch.collectAsStateWithLifecycle()
-    val adminCheck by viewModel.adminCheckState.collectAsStateWithLifecycle()
     val isAdmin by viewModel.isAdminState.collectAsStateWithLifecycle()
+    val isRoleResolved by viewModel.isRoleResolved.collectAsStateWithLifecycle()
+    val selectedBranch by viewModel.selectedBranch.collectAsStateWithLifecycle()
     val userProfile by viewModel.currentUserProfile.collectAsStateWithLifecycle()
     val branchConfirmed by viewModel.branchConfirmedThisSession.collectAsStateWithLifecycle()
     val isBusy by viewModel.isBusy.collectAsStateWithLifecycle()
     val actionMessage by viewModel.actionMessage.collectAsStateWithLifecycle()
+    val technicalError by viewModel.technicalErrorState.collectAsStateWithLifecycle()
+    val crashReport by AppCrashGuard.errorState.collectAsStateWithLifecycle()
     val notifications by viewModel.notificationsState.collectAsStateWithLifecycle()
     val alertedIds by viewModel.alertedNotificationIds.collectAsStateWithLifecycle()
     val projectionState by viewModel.projectionSummaryState.collectAsStateWithLifecycle()
@@ -237,6 +300,9 @@ private fun AuthenticatedApp(
     val scheduleNowMillis by viewModel.scheduleTickerState.collectAsStateWithLifecycle()
     val activeQuotaState by viewModel.activeQuotaState.collectAsStateWithLifecycle()
     val activeQuota = (activeQuotaState as? UiState.Success)?.data
+    val activeQuotasState by viewModel.activeQuotasState.collectAsStateWithLifecycle()
+    val activeQuotas = (activeQuotasState as? UiState.Success)?.data ?: emptyList()
+    val branchSalesSummaries by viewModel.branchSalesSummariesState.collectAsStateWithLifecycle()
     val evidencesState by viewModel.evidencesState.collectAsStateWithLifecycle()
     val teamUsers by viewModel.teamUsers.collectAsStateWithLifecycle()
     val closingAttachmentDraft by viewModel.closingAttachmentDraft.collectAsStateWithLifecycle()
@@ -244,15 +310,32 @@ private fun AuthenticatedApp(
     val snackbarHostState = remember { SnackbarHostState() }
     var currentTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
     var showNotificationsSheet by remember { mutableStateOf(false) }
+    var showAdminBranchMenu by remember { mutableStateOf(false) }
 
     val notificationPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { }
 
-    val isReadyForMainUi = (adminCheck == true) || branchConfirmed
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.checkDailyScheduleAndClosingReset()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
-    LaunchedEffect(isReadyForMainUi) {
-        if (isReadyForMainUi && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+    LaunchedEffect(scheduleNowMillis, isRoleResolved, isAdmin, userProfile?.branchName) {
+        if (isRoleResolved) {
+            viewModel.checkDailyScheduleAndClosingReset(scheduleNowMillis)
+        }
+    }
+
+    LaunchedEffect(branchConfirmed, isAdmin, isRoleResolved) {
+        if (isRoleResolved && (branchConfirmed || isAdmin) &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             !NotificationHelper.canPostNotifications(context)
         ) {
             notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -284,7 +367,7 @@ private fun AuthenticatedApp(
         currentTab = AppTab.HOME
     }
 
-    if (adminCheck == null) {
+    if (!isRoleResolved) {
         SetStatusBarAppearance(lightBackground = true)
         Box(
             modifier = Modifier
@@ -297,7 +380,7 @@ private fun AuthenticatedApp(
         return
     }
 
-    if (!isReadyForMainUi) {
+    if (!branchConfirmed && !isAdmin) {
         SetStatusBarAppearance(lightBackground = true)
         BranchSelectionScreen(
             initialBranch = userProfile?.branchName ?: lastCachedBranch,
@@ -315,7 +398,10 @@ private fun AuthenticatedApp(
     }
 
     val unreadCount = remember(notifications) { notifications.count { !it.acknowledged } }
-    val branchLabel = if (isAdmin) "Todas las sucursales" else userProfile?.effectiveBranchLabel ?: "Sucursal"
+    val branchLabel = selectedBranch.ifBlank {
+        if (isAdmin) BranchOptions.ALL_BRANCHES_OPTION
+        else userProfile?.effectiveBranchLabel?.takeIf { it.isNotBlank() } ?: "Sucursal"
+    }
 
     val visibleTabs = remember(isAdmin) {
         if (isAdmin) listOf(AppTab.HOME, AppTab.TASKS, AppTab.EVIDENCES, AppTab.TEAM)
@@ -411,32 +497,17 @@ private fun AuthenticatedApp(
                         )
                     }
 
-                    if (isAdmin) {
+                    Box(modifier = Modifier.weight(1f)) {
                         Row(
                             modifier = Modifier
-                                .weight(1f)
-                                .padding(horizontal = 14.dp, vertical = 7.dp)
-                                .testTag("admin_all_branches_pill"),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Filled.Storefront,
-                                contentDescription = null,
-                                tint = BrandNavy,
-                                modifier = Modifier.size(15.dp)
-                            )
-                            Text(
-                                text = "Dashboard General · Todas las sucursales",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = BrandNavy
-                            )
-                        }
-                    } else {
-                        Row(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clickable { viewModel.reopenBranchSelection() }
+                                .fillMaxWidth()
+                                .clickable {
+                                    if (isAdmin) {
+                                        showAdminBranchMenu = true
+                                    } else {
+                                        viewModel.reopenBranchSelection()
+                                    }
+                                }
                                 .padding(horizontal = 14.dp, vertical = 7.dp)
                                 .testTag("switch_branch_pill"),
                             verticalAlignment = Alignment.CenterVertically,
@@ -458,11 +529,48 @@ private fun AuthenticatedApp(
                                     color = BrandNavy
                                 )
                             }
-                            Text(
-                                text = "Cambiar",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = BrandNavy.copy(alpha = 0.72f)
-                            )
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = if (isAdmin) "Filtrar" else "Cambiar",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = BrandNavy.copy(alpha = 0.72f)
+                                )
+                                if (isAdmin) {
+                                    Icon(
+                                        imageVector = Icons.Filled.KeyboardArrowDown,
+                                        contentDescription = "Seleccionar sucursal",
+                                        tint = BrandNavy.copy(alpha = 0.72f),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+                        }
+
+                        if (isAdmin) {
+                            DropdownMenu(
+                                expanded = showAdminBranchMenu,
+                                onDismissRequest = { showAdminBranchMenu = false }
+                            ) {
+                                val options = listOf(BranchOptions.ALL_BRANCHES_OPTION) + BranchOptions.ALL_BRANCHES
+                                options.forEach { option ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                text = option,
+                                                fontWeight = if (option == branchLabel) FontWeight.Bold else FontWeight.Normal,
+                                                color = if (option == branchLabel) BrandRed else BrandNavy
+                                            )
+                                        },
+                                        onClick = {
+                                            viewModel.selectDashboardBranch(option)
+                                            showAdminBranchMenu = false
+                                        }
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -557,6 +665,10 @@ private fun AuthenticatedApp(
                         chartSeries = chartSeries,
                         showDailyBriefing = showDailyBriefing,
                         closingAttachmentDraft = closingAttachmentDraft,
+                        selectedBranchFilter = branchLabel,
+                        activeQuotas = activeQuotas,
+                        branchSalesSummaries = branchSalesSummaries,
+                        onSelectBranchFilter = { branch -> viewModel.selectDashboardBranch(branch) },
                         onUpdateAttachmentDraft = { viewModel.updateClosingAttachmentDraft(it) },
                         onLoadEntryAttachmentChunks = { entry -> viewModel.loadClosingAttachmentChunks(entry) },
                         onDismissBriefing = { viewModel.dismissDailyBriefingForToday() },
@@ -573,8 +685,21 @@ private fun AuthenticatedApp(
                                 attachmentDraft = draft
                             )
                         },
-                        onSaveBiweeklyQuota = { t, s, e, d, g, c, nc, ma, req, onDone ->
-                            viewModel.saveBiweeklyQuota(t, s, e, d, g, c, nc, ma, req, onDone)
+                        onSaveBiweeklyQuota = { t, s, e, d, g, c, nc, ma, req, branch, applyAll, onDone ->
+                            viewModel.saveBiweeklyQuota(
+                                title = t,
+                                startDate = s,
+                                endDate = e,
+                                totalDays = d,
+                                targetGlobalSales = g,
+                                targetCreditSales = c,
+                                targetNewCustomers = nc,
+                                targetAppMaOperations = ma,
+                                targetNewCustomerRequests = req,
+                                branchName = branch,
+                                applyToAllIndividualBranches = applyAll,
+                                onSuccess = onDone
+                            )
                         }
                     )
 
@@ -590,12 +715,6 @@ private fun AuthenticatedApp(
                         onCreateTask = { assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess ->
                             viewModel.createTask(assignees, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess)
                         },
-                        onUpdateTasks = { tasksToUpdate, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess ->
-                            viewModel.updateTasks(tasksToUpdate, title, desc, type, priority, dueDate, dueTime, deadlineLabel, onSuccess)
-                        },
-                        onDeleteTasks = { tasksToDelete, onSuccess ->
-                            viewModel.deleteTasks(tasksToDelete, onSuccess)
-                        },
                         onCompleteTaskWithEvidenceFiles = { task, files, onSuccess ->
                             viewModel.completeTaskWithEvidenceFiles(task, files, onSuccess)
                         },
@@ -604,6 +723,25 @@ private fun AuthenticatedApp(
                         },
                         onLoadEvidenceFiles = { evidence ->
                             viewModel.loadTaskEvidenceFiles(evidence)
+                        },
+                        onUpdateDailyTask = { task, title, description, priority, dueTime, deadlineLabel, applyToAll, onSuccess ->
+                            viewModel.updateDailyTask(
+                                task = task,
+                                title = title,
+                                description = description,
+                                priority = priority,
+                                dueTime = dueTime,
+                                deadlineLabel = deadlineLabel,
+                                applyToAllBranchesSameDay = applyToAll,
+                                onSuccess = onSuccess
+                            )
+                        },
+                        onDeleteDailyTask = { task, deleteAll, onSuccess ->
+                            viewModel.deleteDailyTask(
+                                task = task,
+                                deleteAllBranchesSameDay = deleteAll,
+                                onSuccess = onSuccess
+                            )
                         }
                     )
 
@@ -618,6 +756,8 @@ private fun AuthenticatedApp(
                         currentUserId = user.uid,
                         teamUsers = teamUsers,
                         activeQuota = activeQuota,
+                        activeQuotas = activeQuotas,
+                        branchSalesSummaries = branchSalesSummaries,
                         isBusy = isBusy,
                         onToggleAdmin = { target, makeAdmin ->
                             viewModel.toggleUserAdminRole(target, makeAdmin)
@@ -627,6 +767,25 @@ private fun AuthenticatedApp(
                         },
                         onConfirmBranchResetForQuota = { branchName, branchUsers ->
                             viewModel.confirmBranchChecklistResetForQuota(branchName, branchUsers)
+                        },
+                        onLoadEntryAttachmentChunks = { entry ->
+                            viewModel.loadClosingAttachmentChunks(entry)
+                        },
+                        onSaveBiweeklyQuota = { t, s, e, d, g, c, nc, ma, req, branch, applyAll, onDone ->
+                            viewModel.saveBiweeklyQuota(
+                                title = t,
+                                startDate = s,
+                                endDate = e,
+                                totalDays = d,
+                                targetGlobalSales = g,
+                                targetCreditSales = c,
+                                targetNewCustomers = nc,
+                                targetAppMaOperations = ma,
+                                targetNewCustomerRequests = req,
+                                branchName = branch,
+                                applyToAllIndividualBranches = applyAll,
+                                onSuccess = onDone
+                            )
                         }
                     )
                 }
@@ -641,6 +800,146 @@ private fun AuthenticatedApp(
             onOpenTasks = { currentTab = AppTab.TASKS },
             onDismiss = { showNotificationsSheet = false }
         )
+    }
+
+    if (technicalError != null && crashReport == null) {
+        TechnicalErrorOverlay(
+            report = TechnicalErrorReport(
+                title = "Error inesperado en operación",
+                message = technicalError.orEmpty(),
+                stackTrace = "",
+                threadName = "viewModelScope"
+            ),
+            onDismiss = { viewModel.clearTechnicalError() }
+        )
+    }
+}
+
+@Composable
+private fun TechnicalErrorOverlay(
+    report: TechnicalErrorReport,
+    onDismiss: () -> Unit
+) {
+    val clipboard = LocalClipboardManager.current
+    var copied by remember(report.timestampMillis) { mutableStateOf(false) }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.62f))
+            .systemBarsPadding()
+            .padding(20.dp)
+            .testTag("technical_error_overlay"),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.ErrorOutline,
+                        contentDescription = "Error técnico",
+                        tint = BrandRed,
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = report.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = BrandNavy
+                        )
+                        Text(
+                            text = "Hilo: ${report.threadName}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                Surface(
+                    color = BrandRedSoft,
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    SelectionContainer {
+                        Text(
+                            text = report.message,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = BrandRed,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+                }
+
+                if (report.stackTrace.isNotBlank()) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 220.dp)
+                    ) {
+                        SelectionContainer {
+                            Text(
+                                text = report.stackTrace,
+                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                                color = BrandNavy,
+                                modifier = Modifier
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(10.dp)
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            clipboard.setText(AnnotatedString(report.fullTechnicalText))
+                            copied = true
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("copy_technical_error_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.ContentCopy,
+                            contentDescription = "Copiar detalle técnico",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(if (copied) "Copiado" else "Copiar detalle")
+                    }
+
+                    Button(
+                        onClick = onDismiss,
+                        colors = ButtonDefaults.buttonColors(containerColor = BrandNavy),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("dismiss_technical_error_button")
+                    ) {
+                        Text("Continuar")
+                    }
+                }
+            }
+        }
     }
 }
 

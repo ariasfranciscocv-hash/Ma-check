@@ -44,7 +44,7 @@ class ScheduledTasksTest {
     }
 
     @Test
-    fun `tasksToEnsureOnDate creates only that day's tasks without previous-day carry-over`() {
+    fun `tasksToEnsureOnDate generates tasks strictly for current day only and deadline checks enforce 11_30 cutoff`() {
         val saturdayNoon = Calendar.getInstance().apply {
             set(2026, Calendar.NOVEMBER, 28, 12, 0, 0)
             set(Calendar.MILLISECOND, 0)
@@ -211,6 +211,32 @@ class ScheduledTasksTest {
         assertFalse(groups[1].isToday)
         assertEquals(0, groups[1].completedCount)
         assertEquals(1, groups[1].totalCount)
+    }
+
+    @Test
+    fun `scheduled checklist includes Cierre de venta diaria and opening hours reset triggers only on new day at or after 8am`() {
+        val todayTasks = ScheduledTasksCatalog.tasksForDate("2026-11-26")
+        val dailyClosing = todayTasks.firstOrNull { it.title == ScheduledTasksCatalog.DAILY_SALES_CLOSING_TITLE }
+        assertNotNull(dailyClosing)
+        assertEquals(ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG, dailyClosing!!.slug)
+        assertTrue(ScheduledTasksCatalog.DAILY_SALES_CLOSING_TITLE in ScheduledTasksCatalog.ALLOWED_SELF_SCHEDULED_TITLES)
+
+        val beforeOpen759 = millisOf(2026, Calendar.NOVEMBER, 26, 7, 59)
+        val atOpen800 = millisOf(2026, Calendar.NOVEMBER, 26, 8, 0)
+        val evening2130 = millisOf(2026, Calendar.NOVEMBER, 26, 21, 30)
+
+        assertFalse(DateAndFormatters.isWithinOpeningOrWorkdayHours(beforeOpen759))
+        assertTrue(DateAndFormatters.isWithinOpeningOrWorkdayHours(atOpen800))
+        assertTrue(DateAndFormatters.isWithinOpeningOrWorkdayHours(evening2130))
+
+        // Before 8:00 a.m. -> do not reset yet
+        assertFalse(DateAndFormatters.shouldAutoResetDailyClosing("2026-11-25", "2026-11-26", beforeOpen759))
+        // New day & at/after 8:00 a.m. -> reset to pending
+        assertTrue(DateAndFormatters.shouldAutoResetDailyClosing("2026-11-25", "2026-11-26", atOpen800))
+        // No previous closing & at/after 8:00 a.m. -> initialize pending
+        assertTrue(DateAndFormatters.shouldAutoResetDailyClosing(null, "2026-11-26", atOpen800))
+        // Already closed today -> keep completed / do not reset
+        assertFalse(DateAndFormatters.shouldAutoResetDailyClosing("2026-11-26", "2026-11-26", evening2130))
     }
 
     private fun millisOf(year: Int, month: Int, day: Int, hour: Int, minute: Int): Long =

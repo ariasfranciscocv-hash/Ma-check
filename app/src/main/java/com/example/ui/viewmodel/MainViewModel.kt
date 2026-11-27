@@ -6,6 +6,8 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.local.AppPreferences
 import com.example.data.model.AssignedTask
 import com.example.data.model.BiweeklyQuota
+import com.example.data.model.BranchOptions
+import com.example.data.model.BranchSalesSummary
 import com.example.data.model.ChartSeries
 import com.example.data.model.ClosingAttachmentDraft
 import com.example.data.model.DailySalesEntry
@@ -20,23 +22,30 @@ import com.example.data.model.TaskPriority
 import com.example.data.model.TaskType
 import com.example.data.model.UiState
 import com.example.data.model.UserProfile
+import com.example.data.model.UserRole
 import com.example.data.model.buildBranchSalesSummaries
+import com.example.data.model.resolveQuotaForBranch
 import com.example.data.repository.AppRepository
+import com.example.utils.AppCrashGuard
 import com.example.utils.DateAndFormatters
 import com.example.utils.EncodedAttachment
 import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -50,11 +59,16 @@ class MainViewModel(
     val isEmailVerified: Boolean
 ) : ViewModel() {
 
+    private val bootstrappedAdmin: Boolean = AppRepository.isBootstrappedAdmin(currentUserEmail, isEmailVerified)
+
     private val _selectedMetric = MutableStateFlow(SalesMetricType.GLOBAL_SALES)
     val selectedMetric: StateFlow<SalesMetricType> = _selectedMetric.asStateFlow()
 
     private val _actionMessage = MutableStateFlow<String?>(null)
     val actionMessage: StateFlow<String?> = _actionMessage.asStateFlow()
+
+    private val _technicalErrorState = MutableStateFlow<String?>(null)
+    val technicalErrorState: StateFlow<String?> = _technicalErrorState.asStateFlow()
 
     private val _isBusy = MutableStateFlow(false)
     val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
@@ -65,8 +79,25 @@ class MainViewModel(
     private val _profileSynced = MutableStateFlow(false)
     val profileSynced: StateFlow<Boolean> = _profileSynced.asStateFlow()
 
-    private val _branchConfirmedThisSession = MutableStateFlow(false)
+    private val _selectedBranch = MutableStateFlow(
+        if (bootstrappedAdmin) BranchOptions.ALL_BRANCHES_OPTION else ""
+    )
+    val selectedBranch: StateFlow<String> = _selectedBranch.asStateFlow()
+
+    private val _isRoleResolved = MutableStateFlow(bootstrappedAdmin)
+    val isRoleResolved: StateFlow<Boolean> = _isRoleResolved.asStateFlow()
+
+    private val _branchConfirmedThisSession = MutableStateFlow(bootstrappedAdmin)
     val branchConfirmedThisSession: StateFlow<Boolean> = _branchConfirmedThisSession.asStateFlow()
+
+    private val safeExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        if (throwable is CancellationException) return@CoroutineExceptionHandler
+        Log.e(TAG, "Unhandled coroutine exception in MainViewModel", throwable)
+        _isBusy.value = false
+        val techDetails = "${throwable::class.java.simpleName}: ${throwable.localizedMessage ?: throwable.message ?: "Error desconocido"}"
+        _technicalErrorState.value = techDetails
+        AppCrashGuard.reportNonFatal("Error inesperado en operación", throwable)
+    }
 
     val lastCachedBranch: StateFlow<String?> = preferences
         .observeLastBranch(currentUserId)
@@ -76,27 +107,25 @@ class MainViewModel(
             initialValue = null
         )
 
-    private val bootstrappedAdmin =
-        currentUserEmail == "arias.francisco.cv@gmail.com" && isEmailVerified
-
-    val adminCheckState: StateFlow<Boolean?> = repository
+    val isAdminState: StateFlow<Boolean> = repository
         .observeIsAdmin(currentUserId, currentUserEmail, isEmailVerified)
-        .map<Boolean, Boolean?> { it }
+        .onEach { resolvedAdmin ->
+            if (resolvedAdmin) {
+                if (_selectedBranch.value.isBlank()) {
+                    _selectedBranch.value = BranchOptions.ALL_BRANCHES_OPTION
+                }
+                _branchConfirmedThisSession.value = true
+            }
+            _isRoleResolved.value = true
+        }
         .catch { error ->
             unwrapFirestoreOrThrow(error, "observeIsAdmin")
-            emit(false)
+            _isRoleResolved.value = true
+            emit(bootstrappedAdmin)
         }
         .stateIn(
             scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = if (bootstrappedAdmin) true else null
-        )
-
-    val isAdminState: StateFlow<Boolean> = adminCheckState
-        .map { it == true }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+            started = SharingStarted.Eagerly,
             initialValue = bootstrappedAdmin
         )
 
@@ -134,6 +163,10 @@ class MainViewModel(
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
         initialValue = System.currentTimeMillis()
     )
+
+    private val todayDateFlow: Flow<String> = scheduleTickerState
+        .map { DateAndFormatters.todayIso() }
+        .distinctUntilChanged()
 
     val tasksState: StateFlow<UiState<List<AssignedTask>>> = isAdminState
         .flatMapLatest { isAdmin -> repository.observeTasks(currentUserId, isAdmin) }
@@ -181,12 +214,32 @@ class MainViewModel(
             initialValue = emptySet()
         )
 
-    val activeQuotaState: StateFlow<UiState<BiweeklyQuota?>> = repository
-        .observeActiveQuota(currentUserId)
-        .map<BiweeklyQuota?, UiState<BiweeklyQuota?>> { UiState.Success(it) }
+    val activeQuotasState: StateFlow<UiState<List<BiweeklyQuota>>> = repository
+        .observeActiveQuotas(currentUserId)
+        .map<List<BiweeklyQuota>, UiState<List<BiweeklyQuota>>> { UiState.Success(it) }
         .catch { error ->
-            val root = unwrapFirestoreOrThrow(error, "observeActiveQuota")
-            emit(UiState.Error(root.message ?: "No se pudo cargar la meta quincenal."))
+            val root = unwrapFirestoreOrThrow(error, "observeActiveQuotas")
+            emit(UiState.Error(root.message ?: "No se pudieron cargar las metas quincenales."))
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+            initialValue = UiState.Loading
+        )
+
+    val activeQuotaState: StateFlow<UiState<BiweeklyQuota?>> = activeQuotasState
+        .map { state ->
+            when (state) {
+                is UiState.Loading -> UiState.Loading
+                is UiState.Error -> UiState.Error(state.message)
+                is UiState.Success -> {
+                    val generalQuota = resolveQuotaForBranch(
+                        branchName = BranchOptions.ALL_BRANCHES_OPTION,
+                        quotas = state.data
+                    ).first
+                    UiState.Success(generalQuota)
+                }
+            }
         }
         .stateIn(
             scope = viewModelScope,
@@ -207,31 +260,88 @@ class MainViewModel(
             initialValue = UiState.Loading
         )
 
-    val projectionSummaryState: StateFlow<UiState<SalesProjectionSummary?>> = combine(
-        activeQuotaState,
+    val branchSalesSummariesState: StateFlow<List<BranchSalesSummary>> = combine(
+        activeQuotasState,
         salesEntriesState,
         teamUsers,
-        isAdminState
-    ) { quotaState, entriesState, users, isAdmin ->
+        isAdminState,
+        currentUserProfile,
+        todayDateFlow
+    ) { values ->
+        @Suppress("UNCHECKED_CAST")
+        val quotasState = values[0] as UiState<List<BiweeklyQuota>>
+        @Suppress("UNCHECKED_CAST")
+        val entriesState = values[1] as UiState<List<DailySalesEntry>>
+        @Suppress("UNCHECKED_CAST")
+        val users = values[2] as List<UserProfile>
+        val isAdmin = values[3] as Boolean
+        val profile = values[4] as UserProfile?
+        val todayIso = values[5] as String
+
+        val quotas = (quotasState as? UiState.Success)?.data ?: return@combine emptyList()
+        val rawEntries = (entriesState as? UiState.Success)?.data ?: emptyList()
+        val branchesToShow = if (isAdmin) {
+            BranchOptions.ALL_BRANCHES
+        } else {
+            listOfNotNull(profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES })
+        }
+        buildBranchSalesSummaries(
+            branches = branchesToShow,
+            quotas = quotas,
+            entries = rawEntries,
+            teamUsers = users,
+            todayIso = todayIso,
+            currentPeriodId = DateAndFormatters.biweeklyPeriodIdForIso(todayIso)
+        )
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+        initialValue = emptyList()
+    )
+
+    val projectionSummaryState: StateFlow<UiState<SalesProjectionSummary?>> = combine(
+        activeQuotasState,
+        salesEntriesState,
+        selectedBranch,
+        isAdminState,
+        teamUsers,
+        currentUserProfile,
+        todayDateFlow
+    ) { values ->
+        @Suppress("UNCHECKED_CAST")
+        val quotasState = values[0] as UiState<List<BiweeklyQuota>>
+        @Suppress("UNCHECKED_CAST")
+        val entriesState = values[1] as UiState<List<DailySalesEntry>>
+        val branchFilter = values[2] as String
+        val isAdmin = values[3] as Boolean
+        @Suppress("UNCHECKED_CAST")
+        val users = values[4] as List<UserProfile>
+        val profile = values[5] as UserProfile?
+        val todayIso = values[6] as String
+
         when {
-            quotaState is UiState.Error -> UiState.Error(quotaState.message)
+            quotasState is UiState.Error -> UiState.Error(quotasState.message)
             entriesState is UiState.Error -> UiState.Error(entriesState.message)
-            quotaState is UiState.Loading || entriesState is UiState.Loading -> UiState.Loading
+            quotasState is UiState.Loading || entriesState is UiState.Loading -> UiState.Loading
             else -> {
-                val quota = (quotaState as UiState.Success).data
-                val entries = (entriesState as UiState.Success).data
+                val quotas = (quotasState as UiState.Success).data
+                val rawEntries = (entriesState as UiState.Success).data
+                val targetBranch = if (isAdmin) {
+                    branchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+                } else {
+                    profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                        ?: branchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+                }
+                val quota = resolveQuotaForBranch(
+                    branchName = targetBranch,
+                    quotas = quotas,
+                    currentPeriodId = DateAndFormatters.biweeklyPeriodIdForIso(todayIso)
+                ).first
                 if (quota == null) {
                     UiState.Success(null)
                 } else {
-                    UiState.Success(
-                        computeProjectionSummary(
-                            quota = quota,
-                            entries = entries,
-                            uid = currentUserId,
-                            teamUsers = users,
-                            includeBranchBreakdown = isAdmin
-                        )
-                    )
+                    val filteredEntries = filterEntriesForSelectedBranch(rawEntries, branchFilter, isAdmin, users)
+                    UiState.Success(computeProjectionSummary(quota, filteredEntries, currentUserId, users, todayIso))
                 }
             }
         }
@@ -242,40 +352,65 @@ class MainViewModel(
     )
 
     val selectedChartSeries: StateFlow<ChartSeries?> = combine(
-        activeQuotaState,
+        activeQuotasState,
         salesEntriesState,
-        selectedMetric
-    ) { quotaState, entriesState, metric ->
-        val quota = (quotaState as? UiState.Success)?.data ?: return@combine null
-        val entries = (entriesState as? UiState.Success)?.data ?: emptyList()
-        buildChartSeries(quota, entries, metric)
+        selectedMetric,
+        selectedBranch,
+        isAdminState,
+        teamUsers,
+        currentUserProfile,
+        todayDateFlow
+    ) { values ->
+        @Suppress("UNCHECKED_CAST")
+        val quotasState = values[0] as UiState<List<BiweeklyQuota>>
+        @Suppress("UNCHECKED_CAST")
+        val entriesState = values[1] as UiState<List<DailySalesEntry>>
+        val metric = values[2] as SalesMetricType
+        val branchFilter = values[3] as String
+        val isAdmin = values[4] as Boolean
+        @Suppress("UNCHECKED_CAST")
+        val users = values[5] as List<UserProfile>
+        val profile = values[6] as UserProfile?
+        val todayIso = values[7] as String
+
+        val quotas = (quotasState as? UiState.Success)?.data ?: return@combine null
+        val targetBranch = if (isAdmin) {
+            branchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+        } else {
+            profile?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                ?: branchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+        }
+        val quota = resolveQuotaForBranch(
+            branchName = targetBranch,
+            quotas = quotas,
+            currentPeriodId = DateAndFormatters.biweeklyPeriodIdForIso(todayIso)
+        ).first ?: return@combine null
+        val rawEntries = (entriesState as? UiState.Success)?.data ?: emptyList()
+        val filteredEntries = filterEntriesForSelectedBranch(rawEntries, branchFilter, isAdmin, users)
+        buildChartSeries(quota, filteredEntries, metric, users, todayIso)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
         initialValue = null
     )
 
-    val showFirstEntryBriefingToday: StateFlow<Boolean> = preferences
-        .observeLastBriefingDate(currentUserId)
-        .map { lastDate -> lastDate != DateAndFormatters.todayIso() }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
-            initialValue = false
-        )
+    val showFirstEntryBriefingToday: StateFlow<Boolean> = combine(
+        preferences.observeLastBriefingDate(currentUserId),
+        todayDateFlow
+    ) { lastDate, todayIso ->
+        lastDate != todayIso
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(STOP_TIMEOUT_MILLIS),
+        initialValue = false
+    )
 
-    private val lastTasksSyncDateState: StateFlow<String?> = preferences
-        .observeLastTasksSyncDate(currentUserId)
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.Eagerly,
-            initialValue = null
-        )
-
-    private val syncedTodayAttempted = mutableSetOf<String>()
+    private var lastAutoSyncedDayKey: String? = null
+    private var lastAutoClosingResetDayKey: String? = null
+    private var lastObservedClosingDayIso: String = DateAndFormatters.todayIso()
 
     init {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             val result = repository.syncCurrentUserProfile(
                 uid = currentUserId,
                 displayName = currentUserName,
@@ -288,43 +423,99 @@ class MainViewModel(
                 _actionMessage.value = "Error al sincronizar perfil: ${err.localizedMessage}"
             }
         }
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             isAdminState.collect { isAdmin ->
                 if (isAdmin) {
-                    _branchConfirmedThisSession.value = true
                     repository.ensureDefaultQuotaForAdminIfMissing()
                 }
             }
         }
-        viewModelScope.launch {
-            combine(
-                adminCheckState,
-                currentUserProfile,
-                preferences.observeLastTasksSyncDate(currentUserId)
-            ) { resolvedAdmin, profile, lastSyncDate ->
-                Triple(resolvedAdmin, profile, lastSyncDate)
-            }.collect { (resolvedAdmin, profile, lastSyncDate) ->
-                if (resolvedAdmin != false) return@collect
-                val branch = profile?.branchName?.takeIf { it.isNotBlank() } ?: return@collect
-                preferences.saveLastBranch(currentUserId, branch)
-                val todayIso = DateAndFormatters.todayIso()
-                if (lastSyncDate != todayIso) {
-                    syncTodayChecklistOncePerDay(branch, todayIso)
+        viewModelScope.launch(safeExceptionHandler) {
+            combine(isRoleResolved, isAdminState, currentUserProfile) { resolved, isAdmin, profile ->
+                Triple(resolved, isAdmin, profile)
+            }.collect { (resolved, isAdmin, profile) ->
+                if (!resolved) return@collect
+                if (isAdmin || bootstrappedAdmin || profile?.parsedRole == UserRole.ADMIN) {
+                    if (_selectedBranch.value.isBlank()) {
+                        _selectedBranch.value = BranchOptions.ALL_BRANCHES_OPTION
+                    }
+                    return@collect
+                }
+                val branch = profile?.branchName
+                if (!branch.isNullOrBlank()) {
+                    if (_selectedBranch.value.isBlank()) {
+                        _selectedBranch.value = branch
+                    }
+                    preferences.saveLastBranch(currentUserId, branch)
+                    syncScheduledChecklistIfNeeded(branch)
+                    syncDailyClosingResetIfNeeded(branch)
                 }
             }
         }
     }
 
-    private fun syncTodayChecklistOncePerDay(branchLabel: String, todayIso: String = DateAndFormatters.todayIso()) {
-        if (adminCheckState.value != false) return
-        val attemptKey = "${currentUserId}_$todayIso"
-        if (!syncedTodayAttempted.add(attemptKey)) return
-        viewModelScope.launch {
+    fun checkDailyScheduleAndClosingReset(nowMillis: Long = System.currentTimeMillis()) {
+        val today = DateAndFormatters.todayIso()
+        if (today != lastObservedClosingDayIso) {
+            lastObservedClosingDayIso = today
+            _closingAttachmentDraft.value = ClosingAttachmentDraft.Unchanged
+        }
+        if (isAdminState.value || bootstrappedAdmin || currentUserProfile.value?.parsedRole == UserRole.ADMIN) {
+            return
+        }
+        val branch = currentUserProfile.value?.branchName?.takeIf { it.isNotBlank() }
+            ?: _selectedBranch.value.takeIf { it in BranchOptions.ALL_BRANCHES }
+            ?: return
+        syncScheduledChecklistIfNeeded(branch)
+        syncDailyClosingResetIfNeeded(branch, nowMillis)
+    }
+
+    private fun syncScheduledChecklistIfNeeded(branchLabel: String) {
+        if (isAdminState.value || bootstrappedAdmin || currentUserProfile.value?.parsedRole == UserRole.ADMIN) {
+            return
+        }
+        val today = DateAndFormatters.todayIso()
+        val todayKey = "${today}_$currentUserId"
+        if (lastAutoSyncedDayKey == todayKey) return
+        lastAutoSyncedDayKey = todayKey
+        viewModelScope.launch(safeExceptionHandler) {
+            val alreadySyncedDate = preferences.getLastScheduledSyncDate(currentUserId)
+            if (alreadySyncedDate == today) {
+                return@launch
+            }
             val result = repository.syncScheduledTasksForCurrentUser(branchLabel)
             if (result.isSuccess) {
-                preferences.saveLastTasksSyncDate(currentUserId, todayIso)
+                preferences.markScheduledSyncDoneToday(currentUserId, today)
             } else {
-                syncedTodayAttempted.remove(attemptKey)
+                lastAutoSyncedDayKey = null
+            }
+        }
+    }
+
+    private fun syncDailyClosingResetIfNeeded(
+        branchLabel: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ) {
+        if (isAdminState.value || bootstrappedAdmin || currentUserProfile.value?.parsedRole == UserRole.ADMIN) {
+            return
+        }
+        if (!DateAndFormatters.isWithinOpeningOrWorkdayHours(nowMillis)) {
+            return
+        }
+        val today = DateAndFormatters.todayIso()
+        val todayKey = "${today}_$currentUserId"
+        if (lastAutoClosingResetDayKey == todayKey) return
+        lastAutoClosingResetDayKey = todayKey
+        viewModelScope.launch(safeExceptionHandler) {
+            val alreadyResetDate = preferences.getLastDailyClosingResetDate(currentUserId)
+            if (alreadyResetDate == today) {
+                return@launch
+            }
+            val result = repository.resetDailyClosingTaskOnNewDayIfNeeded(branchLabel, nowMillis)
+            if (result.isSuccess) {
+                preferences.markDailyClosingResetDoneToday(currentUserId, today)
+            } else {
+                lastAutoClosingResetDayKey = null
             }
         }
     }
@@ -333,18 +524,34 @@ class MainViewModel(
         _selectedMetric.value = metric
     }
 
+    fun selectDashboardBranch(branch: String) {
+        val normalized = branch.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+        _selectedBranch.value = normalized
+    }
+
+    fun clearTechnicalError() {
+        _technicalErrorState.value = null
+    }
+
     fun confirmBranchSelection(branchName: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
+            val cleanBranch = branchName.trim()
+            if (isAdminState.value && (cleanBranch.isEmpty() || cleanBranch == BranchOptions.ALL_BRANCHES_OPTION)) {
+                _selectedBranch.value = BranchOptions.ALL_BRANCHES_OPTION
+                _branchConfirmedThisSession.value = true
+                return@launch
+            }
             _isBusy.value = true
-            preferences.saveLastBranch(currentUserId, branchName)
-            val result = repository.updateCurrentUserBranch(branchName)
+            preferences.saveLastBranch(currentUserId, cleanBranch)
+            val result = repository.updateCurrentUserBranch(cleanBranch)
             _isBusy.value = false
             result.fold(
                 onSuccess = {
+                    _selectedBranch.value = cleanBranch
                     _branchConfirmedThisSession.value = true
-                    val todayIso = DateAndFormatters.todayIso()
-                    if (lastTasksSyncDateState.value != todayIso) {
-                        syncTodayChecklistOncePerDay(branchName, todayIso)
+                    if (!isAdminState.value && !bootstrappedAdmin) {
+                        syncScheduledChecklistIfNeeded(cleanBranch)
+                        syncDailyClosingResetIfNeeded(cleanBranch)
                     }
                 },
                 onFailure = { err ->
@@ -355,17 +562,23 @@ class MainViewModel(
     }
 
     fun reopenBranchSelection() {
+        if (isAdminState.value) {
+            if (_selectedBranch.value.isBlank()) {
+                _selectedBranch.value = BranchOptions.ALL_BRANCHES_OPTION
+            }
+            return
+        }
         _branchConfirmedThisSession.value = false
     }
 
     fun dismissDailyBriefingForToday() {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             preferences.markBriefingSeenToday(currentUserId, DateAndFormatters.todayIso())
         }
     }
 
     fun markNotificationsAlerted(ids: Collection<String>) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             preferences.markNotificationsAlerted(currentUserId, ids)
         }
     }
@@ -375,7 +588,7 @@ class MainViewModel(
     }
 
     fun acknowledgeNotification(notificationId: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             repository.acknowledgeNotification(notificationId)
         }
     }
@@ -399,12 +612,13 @@ class MainViewModel(
         attachmentDraft: ClosingAttachmentDraft = _closingAttachmentDraft.value,
         onSaved: () -> Unit = {}
     ) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
             val result = repository.upsertDailySalesEntry(
                 quotaId = quotaId,
                 dateString = DateAndFormatters.todayIso(),
-                userName = currentUserProfile.value?.effectiveBranchLabel ?: currentUserName,
+                userName = resolveClosingUserLabel(),
+                branchName = resolveClosingBranchName(),
                 globalSales = globalSales,
                 creditSales = creditSales,
                 newCustomers = newCustomers,
@@ -415,10 +629,10 @@ class MainViewModel(
             )
             _isBusy.value = false
             result.fold(
-                onSuccess = {
+                onSuccess = { saveRes ->
                     _closingAttachmentDraft.value = ClosingAttachmentDraft.Unchanged
                     preferences.markBriefingSeenToday(currentUserId, DateAndFormatters.todayIso())
-                    _actionMessage.value = "Cierre de operaciones guardado correctamente."
+                    _actionMessage.value = "Cierre guardado (${saveRes.branchPeriodEntriesCount} día(s)). Acumulado quincena: ${DateAndFormatters.formatCurrency(saveRes.branchAccumulatedGlobalSales)}"
                     onSaved()
                 },
                 onFailure = { err ->
@@ -438,9 +652,11 @@ class MainViewModel(
         targetNewCustomers: Long,
         targetAppMaOperations: Long,
         targetNewCustomerRequests: Long,
+        branchName: String = BranchOptions.ALL_BRANCHES_OPTION,
+        applyToAllIndividualBranches: Boolean = false,
         onSuccess: () -> Unit
     ) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
             val result = repository.saveBiweeklyQuota(
                 title = title,
@@ -451,12 +667,23 @@ class MainViewModel(
                 targetCreditSales = targetCreditSales,
                 targetNewCustomers = targetNewCustomers,
                 targetAppMaOperations = targetAppMaOperations,
-                targetNewCustomerRequests = targetNewCustomerRequests
+                targetNewCustomerRequests = targetNewCustomerRequests,
+                branchName = branchName,
+                periodId = DateAndFormatters.biweeklyPeriodIdForIso(startDate),
+                applyToAllIndividualBranches = applyToAllIndividualBranches
             )
             _isBusy.value = false
             result.fold(
                 onSuccess = {
-                    _actionMessage.value = "Meta quincenal actualizada."
+                    _actionMessage.value = if (branchName == BranchOptions.ALL_BRANCHES_OPTION) {
+                        if (applyToAllIndividualBranches) {
+                            "Meta quincenal aplicada a todas las sucursales."
+                        } else {
+                            "Meta quincenal general actualizada."
+                        }
+                    } else {
+                        "Meta quincenal actualizada para $branchName."
+                    }
                     onSuccess()
                 },
                 onFailure = { err ->
@@ -477,7 +704,7 @@ class MainViewModel(
         deadlineLabel: String? = null,
         onSuccess: () -> Unit
     ) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
             val result = repository.createTaskAndNotify(
                 assignees = assignees,
@@ -506,76 +733,12 @@ class MainViewModel(
         }
     }
 
-    fun updateTasks(
-        tasks: List<AssignedTask>,
-        title: String,
-        description: String,
-        taskType: TaskType,
-        priority: TaskPriority,
-        dueDate: String,
-        dueTime: String?,
-        deadlineLabel: String?,
-        onSuccess: () -> Unit
-    ) {
-        viewModelScope.launch {
-            _isBusy.value = true
-            val result = repository.updateTasks(
-                tasks = tasks,
-                title = title,
-                description = description,
-                taskType = taskType,
-                priority = priority,
-                dueDate = dueDate,
-                dueTime = dueTime,
-                deadlineLabel = deadlineLabel
-            )
-            _isBusy.value = false
-            result.fold(
-                onSuccess = { count ->
-                    _actionMessage.value = if (count > 1) {
-                        "Se actualizaron $count tareas correctamente."
-                    } else {
-                        "Tarea actualizada correctamente."
-                    }
-                    onSuccess()
-                },
-                onFailure = { err ->
-                    _actionMessage.value = err.localizedMessage ?: "No se pudo actualizar la tarea."
-                }
-            )
-        }
-    }
-
-    fun deleteTasks(
-        tasks: List<AssignedTask>,
-        onSuccess: () -> Unit
-    ) {
-        viewModelScope.launch {
-            _isBusy.value = true
-            val result = repository.deleteTasks(tasks)
-            _isBusy.value = false
-            result.fold(
-                onSuccess = { count ->
-                    _actionMessage.value = if (count > 1) {
-                        "Se eliminaron $count tareas correctamente."
-                    } else {
-                        "Tarea eliminada correctamente."
-                    }
-                    onSuccess()
-                },
-                onFailure = { err ->
-                    _actionMessage.value = err.localizedMessage ?: "No se pudo eliminar la tarea."
-                }
-            )
-        }
-    }
-
     fun completeTaskWithEvidenceFiles(
         task: AssignedTask,
         files: List<EncodedAttachment>,
         onSuccess: () -> Unit
     ) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
             val uploaderName = currentUserProfile.value?.effectiveBranchLabel ?: currentUserName
             val result = repository.completeTaskWithEvidenceFiles(
@@ -609,7 +772,7 @@ class MainViewModel(
             _actionMessage.value = "Primero define o activa una meta quincenal."
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
             val result = repository.confirmBranchChecklistResetForQuota(
                 branchName = branchName,
@@ -628,8 +791,74 @@ class MainViewModel(
         }
     }
 
+    fun updateDailyTask(
+        task: AssignedTask,
+        title: String,
+        description: String,
+        priority: TaskPriority,
+        dueTime: String?,
+        deadlineLabel: String?,
+        applyToAllBranchesSameDay: Boolean,
+        onSuccess: () -> Unit
+    ) {
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val result = repository.updateDailyTask(
+                task = task,
+                title = title,
+                description = description,
+                priority = priority,
+                dueTime = dueTime,
+                deadlineLabel = deadlineLabel,
+                applyToAllBranchesSameDay = applyToAllBranchesSameDay
+            )
+            _isBusy.value = false
+            result.fold(
+                onSuccess = { count ->
+                    _actionMessage.value = if (applyToAllBranchesSameDay) {
+                        "Tarea diaria actualizada en $count sucursal(es)."
+                    } else {
+                        "Tarea diaria actualizada."
+                    }
+                    onSuccess()
+                },
+                onFailure = { err ->
+                    _actionMessage.value = err.localizedMessage ?: "No se pudo actualizar la tarea diaria."
+                }
+            )
+        }
+    }
+
+    fun deleteDailyTask(
+        task: AssignedTask,
+        deleteAllBranchesSameDay: Boolean,
+        onSuccess: () -> Unit
+    ) {
+        viewModelScope.launch(safeExceptionHandler) {
+            _isBusy.value = true
+            val result = repository.deleteDailyTask(
+                task = task,
+                deleteAllBranchesSameDay = deleteAllBranchesSameDay
+            )
+            _isBusy.value = false
+            result.fold(
+                onSuccess = { count ->
+                    _actionMessage.value = if (deleteAllBranchesSameDay) {
+                        "Tarea diaria eliminada en $count sucursal(es)."
+                    } else {
+                        "Tarea diaria eliminada."
+                    }
+                    onSuccess()
+                },
+                onFailure = { err ->
+                    _actionMessage.value = err.localizedMessage ?: "No se pudo eliminar la tarea diaria."
+                }
+            )
+        }
+    }
+
     fun toggleUserAdminRole(targetUser: UserProfile, makeAdmin: Boolean) {
-        viewModelScope.launch {
+        viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
             val result = repository.setUserRole(targetUser, makeAdmin)
             _isBusy.value = false
@@ -649,7 +878,11 @@ class MainViewModel(
     }
 
     fun seedDailyChecklist(targetUser: UserProfile) {
-        viewModelScope.launch {
+        if (targetUser.parsedRole == UserRole.ADMIN) {
+            _actionMessage.value = "Las cuentas de administrador no reciben tareas programadas."
+            return
+        }
+        viewModelScope.launch(safeExceptionHandler) {
             _isBusy.value = true
             val result = repository.seedDailyChecklistForUser(targetUser)
             _isBusy.value = false
@@ -668,18 +901,78 @@ class MainViewModel(
         }
     }
 
+    private fun resolveClosingUserLabel(): String {
+        val selected = _selectedBranch.value
+        if (selected in BranchOptions.ALL_BRANCHES) return selected
+        return currentUserProfile.value?.effectiveBranchLabel ?: currentUserName
+    }
+
+    private fun resolveClosingBranchName(): String? {
+        val selected = _selectedBranch.value
+        if (selected in BranchOptions.ALL_BRANCHES) return selected
+        return currentUserProfile.value?.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+    }
+
+    private fun filterEntriesForSelectedBranch(
+        entries: List<DailySalesEntry>,
+        branchFilter: String,
+        isAdmin: Boolean,
+        users: List<UserProfile>
+    ): List<DailySalesEntry> {
+        if (!isAdmin || branchFilter.isBlank() || branchFilter == BranchOptions.ALL_BRANCHES_OPTION) {
+            return entries
+        }
+        val matchingUserIds = users
+            .filter { it.branchName == branchFilter || it.effectiveBranchLabel == branchFilter }
+            .map { it.userId }
+            .toSet()
+        return entries.filter { entry ->
+            entry.branchName == branchFilter ||
+                entry.userName == branchFilter ||
+                entry.userId in matchingUserIds
+        }
+    }
+
+    private fun selectEntriesForPeriod(
+        quota: BiweeklyQuota,
+        entries: List<DailySalesEntry>,
+        users: List<UserProfile>,
+        todayIso: String = DateAndFormatters.todayIso()
+    ): List<DailySalesEntry> {
+        val (periodStartIso, periodEndIso) = DateAndFormatters.biweeklyRangeForIso(todayIso)
+        val uidToBranch = users
+            .mapNotNull { u -> u.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }?.let { u.userId to it } }
+            .toMap()
+        return entries
+            .filter { entry ->
+                entry.dateString >= periodStartIso && entry.dateString <= periodEndIso
+            }
+            .sortedWith(
+                compareByDescending<DailySalesEntry> { it.dateString }
+                    .thenByDescending { it.updatedAt?.seconds ?: 0L }
+                    .thenByDescending { it.quotaId == quota.id }
+            )
+            .distinctBy { entry ->
+                val branchKey = entry.branchName?.takeIf { it in BranchOptions.ALL_BRANCHES }
+                    ?: uidToBranch[entry.userId]
+                    ?: entry.userId
+                "${branchKey}_${entry.dateString}"
+            }
+    }
+
     private fun computeProjectionSummary(
         quota: BiweeklyQuota,
         entries: List<DailySalesEntry>,
         uid: String,
-        teamUsers: List<UserProfile>,
-        includeBranchBreakdown: Boolean
+        users: List<UserProfile>,
+        todayIso: String = DateAndFormatters.todayIso()
     ): SalesProjectionSummary {
-        val today = DateAndFormatters.todayIso()
+        val today = todayIso
         val totalDays = quota.totalDays.toInt().coerceIn(1, 31)
         val daysElapsed = DateAndFormatters.dayIndexInPeriod(quota.startDate, today, totalDays)
-        val periodEntries = entries.filter { it.quotaId == quota.id }
+        val periodEntries = selectEntriesForPeriod(quota, entries, users, today)
         val todayEntry = periodEntries.firstOrNull { it.userId == uid && it.dateString == today }
+            ?: periodEntries.firstOrNull { it.dateString == today && resolveClosingBranchName()?.let { b -> it.branchName == b || it.userName == b } == true }
 
         fun buildMetric(
             metric: SalesMetricType,
@@ -739,16 +1032,6 @@ class MainViewModel(
             )
         )
 
-        val branchBreakdowns = if (includeBranchBreakdown) {
-            buildBranchSalesSummaries(
-                teamUsers = teamUsers,
-                entries = periodEntries,
-                todayIso = today
-            )
-        } else {
-            emptyList()
-        }
-
         return SalesProjectionSummary(
             quota = quota,
             daysElapsed = daysElapsed,
@@ -756,20 +1039,21 @@ class MainViewModel(
             metrics = metrics,
             entriesCount = periodEntries.size,
             todayEntry = todayEntry,
-            recentEntries = periodEntries.sortedByDescending { it.dateString }.take(15),
-            branchBreakdowns = branchBreakdowns
+            recentEntries = periodEntries.sortedByDescending { it.dateString }.take(15)
         )
     }
 
     private fun buildChartSeries(
         quota: BiweeklyQuota,
         entries: List<DailySalesEntry>,
-        metric: SalesMetricType
+        metric: SalesMetricType,
+        users: List<UserProfile>,
+        todayIso: String = DateAndFormatters.todayIso()
     ): ChartSeries {
         val totalDays = quota.totalDays.toInt().coerceIn(1, 31)
-        val today = DateAndFormatters.todayIso()
+        val today = todayIso
         val elapsedDays = DateAndFormatters.dayIndexInPeriod(quota.startDate, today, totalDays)
-        val periodEntries = entries.filter { it.quotaId == quota.id }
+        val periodEntries = selectEntriesForPeriod(quota, entries, users, today)
 
         val dailyTotals = DoubleArray(totalDays) { 0.0 }
         periodEntries.forEach { entry ->

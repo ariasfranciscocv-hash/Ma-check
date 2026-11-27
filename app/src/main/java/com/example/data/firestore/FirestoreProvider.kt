@@ -23,7 +23,7 @@ object FirestoreProvider {
 
     fun getInstance(context: Context): FirebaseFirestore {
         val appContext = context.applicationContext
-        val databaseId = "(default)"
+        val databaseId = appContext.getString(R.string.firestore_database_id)
         val firestore = FirebaseFirestore.getInstance(databaseId)
         synchronized(this) {
             if (databaseId !in configuredDatabases) {

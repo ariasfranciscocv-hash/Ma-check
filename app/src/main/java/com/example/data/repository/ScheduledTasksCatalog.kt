@@ -14,10 +14,14 @@ data class ScheduledTaskSpec(
 
 object ScheduledTasksCatalog {
 
+    const val DAILY_SALES_CLOSING_SLUG = "cierre_venta_diaria"
+    const val DAILY_SALES_CLOSING_TITLE = "Cierre de venta diaria"
+
     val ALLOWED_SELF_SCHEDULED_TITLES: Set<String> = setOf(
         "Apertura de piso y encendido de exhibición",
         "Revisión de exhibición destacada",
         "Cierre de caja y orden en módulo de crédito",
+        DAILY_SALES_CLOSING_TITLE,
         "Actualización de avance de ventas (2:00 p.m.)",
         "Actualización de avance de ventas (6:00 p.m.)",
         "Inventario",
@@ -51,6 +55,14 @@ object ScheduledTasksCatalog {
                 dueDateIso = dateIso,
                 dueTime = "23:59",
                 deadlineLabel = "Límite: Hoy al cierre"
+            ),
+            ScheduledTaskSpec(
+                slug = DAILY_SALES_CLOSING_SLUG,
+                title = DAILY_SALES_CLOSING_TITLE,
+                description = "Capturar el cierre de operaciones con las 5 métricas del día y adjuntar respaldo.",
+                dueDateIso = dateIso,
+                dueTime = "23:59",
+                deadlineLabel = "Jornada: Desde 8:00 a.m. al cierre"
             )
         )
 
@@ -132,13 +144,12 @@ object ScheduledTasksCatalog {
     }
 
     /**
-     * Returns (assignedDateIso, spec) pairs for [todayIso] only, ensuring only
-     * the current day's tasks are created.
+     * Returns (assignedDateIso, spec) pairs for [todayIso] only, ensuring scheduled tasks
+     * are generated strictly for the current day.
      */
     fun tasksToEnsureOnDate(
         todayIso: String,
         @Suppress("UNUSED_PARAMETER") nowMillis: Long = System.currentTimeMillis()
-    ): List<Pair<String, ScheduledTaskSpec>> {
-        return tasksForDate(todayIso).map { spec -> todayIso to spec }
-    }
+    ): List<Pair<String, ScheduledTaskSpec>> =
+        tasksForDate(todayIso).map { spec -> todayIso to spec }
 }

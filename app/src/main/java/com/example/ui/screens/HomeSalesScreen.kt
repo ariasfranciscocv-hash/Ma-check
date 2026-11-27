@@ -39,7 +39,6 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GroupAdd
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PhotoLibrary
-import androidx.compose.material.icons.filled.Storefront
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -48,7 +47,6 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -79,6 +77,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.BiweeklyQuota
+import com.example.data.model.BranchOptions
 import com.example.data.model.BranchSalesSummary
 import com.example.data.model.ChartSeries
 import com.example.data.model.ClosingAttachmentDraft
@@ -88,6 +87,9 @@ import com.example.data.model.ProjectionPace
 import com.example.data.model.SalesMetricType
 import com.example.data.model.SalesProjectionSummary
 import com.example.data.model.UiState
+import com.example.ui.components.AssignBranchQuotaDialog
+import com.example.ui.components.BranchSalesDetailDialog
+import com.example.ui.components.BranchSalesTrackingSection
 import com.example.ui.components.MueblesAmericaLogo
 import com.example.ui.components.ProjectionLineChart
 import com.example.ui.theme.BrandNavy
@@ -114,6 +116,10 @@ fun HomeSalesScreen(
     chartSeries: ChartSeries?,
     showDailyBriefing: Boolean,
     closingAttachmentDraft: ClosingAttachmentDraft,
+    selectedBranchFilter: String = branchLabel,
+    activeQuotas: List<BiweeklyQuota> = emptyList(),
+    branchSalesSummaries: List<BranchSalesSummary> = emptyList(),
+    onSelectBranchFilter: ((String) -> Unit)? = null,
     onUpdateAttachmentDraft: (ClosingAttachmentDraft) -> Unit,
     onLoadEntryAttachmentChunks: suspend (DailySalesEntry) -> Result<List<String>>,
     onDismissBriefing: () -> Unit,
@@ -138,10 +144,13 @@ fun HomeSalesScreen(
         targetNewCustomers: Long,
         targetAppMaOperations: Long,
         targetNewCustomerRequests: Long,
+        branchName: String,
+        applyToAllIndividualBranches: Boolean,
         onDone: () -> Unit
     ) -> Unit
 ) {
-    var showEditQuotaDialog by remember { mutableStateOf(false) }
+    var quotaTargetBranch by remember { mutableStateOf<String?>(null) }
+    var selectedBranchDetailName by remember { mutableStateOf<String?>(null) }
 
     when (projectionState) {
         is UiState.Loading -> {
@@ -184,20 +193,48 @@ fun HomeSalesScreen(
             if (showDailyBriefing && summary != null) {
                 DailyBriefingDialog(
                     branchLabel = branchLabel,
-                    isAdmin = isAdmin,
                     summary = summary,
                     onDismiss = onDismissBriefing
                 )
             }
 
-            if (showEditQuotaDialog) {
-                EditQuotaDialog(
-                    currentQuota = summary?.quota,
+            val activeBranchDetail = selectedBranchDetailName?.let { name ->
+                branchSalesSummaries.firstOrNull { it.branchName == name }
+            }
+            if (activeBranchDetail != null) {
+                BranchSalesDetailDialog(
+                    summary = activeBranchDetail,
+                    isAdmin = isAdmin,
+                    onDismiss = { selectedBranchDetailName = null },
+                    onEditQuota = if (isAdmin) { branchName ->
+                        quotaTargetBranch = branchName
+                    } else null,
+                    onLoadEntryAttachmentChunks = onLoadEntryAttachmentChunks
+                )
+            }
+
+            val targetBranchForQuota = quotaTargetBranch
+            if (targetBranchForQuota != null) {
+                AssignBranchQuotaDialog(
+                    initialBranch = targetBranchForQuota,
+                    activeQuotas = activeQuotas,
                     isBusy = isBusy,
-                    onDismiss = { showEditQuotaDialog = false },
-                    onSave = { title, start, end, days, g, c, nc, ma, req ->
-                        onSaveBiweeklyQuota(title, start, end, days, g, c, nc, ma, req) {
-                            showEditQuotaDialog = false
+                    onDismiss = { quotaTargetBranch = null },
+                    onSave = { title, start, end, days, g, c, nc, ma, req, targetBranch, applyAll ->
+                        onSaveBiweeklyQuota(
+                            title,
+                            start,
+                            end,
+                            days,
+                            g,
+                            c,
+                            nc,
+                            ma,
+                            req,
+                            targetBranch,
+                            applyAll
+                        ) {
+                            quotaTargetBranch = null
                         }
                     }
                 )
@@ -208,40 +245,56 @@ fun HomeSalesScreen(
                 contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
+                if (isAdmin && onSelectBranchFilter != null) {
+                    item {
+                        AdminBranchFilterStrip(
+                            selectedBranch = selectedBranchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION },
+                            onSelectBranch = onSelectBranchFilter
+                        )
+                    }
+                }
                 if (summary == null) {
                     item {
                         NoActiveQuotaCard(
                             isAdmin = isAdmin,
-                            onCreateQuota = { showEditQuotaDialog = true }
+                            onCreateQuota = {
+                                quotaTargetBranch = selectedBranchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+                            }
                         )
                     }
-                } else {
-                    if (isAdmin) {
+                    if (branchSalesSummaries.isNotEmpty()) {
                         item {
-                            AdminBranchesSalesBreakdownCard(summary = summary)
-                        }
-                    } else {
-                        item {
-                            DailyClosingFormCard(
-                                summary = summary,
-                                branchLabel = branchLabel,
-                                isBusy = isBusy,
-                                closingAttachmentDraft = closingAttachmentDraft,
-                                onUpdateAttachmentDraft = onUpdateAttachmentDraft,
-                                onSave = { g, c, nc, ma, req, notes, draft ->
-                                    onSaveDailyClosing(
-                                        summary.quota.id,
-                                        g,
-                                        c,
-                                        nc,
-                                        ma,
-                                        req,
-                                        notes,
-                                        draft
-                                    )
-                                }
+                            BranchSalesTrackingSection(
+                                summaries = branchSalesSummaries,
+                                isAdmin = isAdmin,
+                                onOpenBranchDetail = { detail -> selectedBranchDetailName = detail.branchName },
+                                onConfigureBranchQuota = if (isAdmin) { branchName ->
+                                    quotaTargetBranch = branchName
+                                } else null
                             )
                         }
+                    }
+                } else {
+                    item {
+                        DailyClosingFormCard(
+                            summary = summary,
+                            branchLabel = branchLabel,
+                            isBusy = isBusy,
+                            closingAttachmentDraft = closingAttachmentDraft,
+                            onUpdateAttachmentDraft = onUpdateAttachmentDraft,
+                            onSave = { g, c, nc, ma, req, notes, draft ->
+                                onSaveDailyClosing(
+                                    summary.quota.id,
+                                    g,
+                                    c,
+                                    nc,
+                                    ma,
+                                    req,
+                                    notes,
+                                    draft
+                                )
+                            }
+                        )
                     }
 
                     item {
@@ -251,8 +304,23 @@ fun HomeSalesScreen(
                             chartSeries = chartSeries,
                             isAdmin = isAdmin,
                             onSelectMetric = onSelectMetric,
-                            onEditQuota = { showEditQuotaDialog = true }
+                            onEditQuota = {
+                                quotaTargetBranch = selectedBranchFilter.ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+                            }
                         )
+                    }
+
+                    if (branchSalesSummaries.isNotEmpty()) {
+                        item {
+                            BranchSalesTrackingSection(
+                                summaries = branchSalesSummaries,
+                                isAdmin = isAdmin,
+                                onOpenBranchDetail = { detail -> selectedBranchDetailName = detail.branchName },
+                                onConfigureBranchQuota = if (isAdmin) { branchName ->
+                                    quotaTargetBranch = branchName
+                                } else null
+                            )
+                        }
                     }
 
                     item {
@@ -300,147 +368,8 @@ fun HomeSalesScreen(
 }
 
 @Composable
-private fun AdminBranchesSalesBreakdownCard(
-    summary: SalesProjectionSummary
-) {
-    val closingsToday = summary.branchBreakdowns.count { it.hasTodayClosing }
-    val totalBranches = summary.branchBreakdowns.size
-
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag("admin_all_branches_dashboard_card"),
-        shape = RoundedCornerShape(22.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
-    ) {
-        Column(
-            modifier = Modifier.padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Dashboard General · Todas las Sucursales",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = "Consolidado al ${DateAndFormatters.formatIsoToDisplay(DateAndFormatters.todayIso())}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Surface(
-                    color = if (totalBranches > 0 && closingsToday == totalBranches) SuccessGreenSoft else WarningAmberSoft,
-                    shape = RoundedCornerShape(50)
-                ) {
-                    Text(
-                        text = "$closingsToday/$totalBranches cierres hoy",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (totalBranches > 0 && closingsToday == totalBranches) SuccessGreen else WarningAmber,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                    )
-                }
-            }
-
-            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
-
-            summary.branchBreakdowns.forEach { branch ->
-                BranchSalesBreakdownRow(branch = branch)
-            }
-        }
-    }
-}
-
-@Composable
-private fun BranchSalesBreakdownRow(branch: BranchSalesSummary) {
-    Surface(
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.48f),
-        shape = RoundedCornerShape(14.dp),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Storefront,
-                        contentDescription = null,
-                        tint = BrandNavy,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Text(
-                        text = branch.branchName,
-                        style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                }
-                Surface(
-                    color = if (branch.hasTodayClosing) SuccessGreenSoft else WarningAmberSoft,
-                    shape = RoundedCornerShape(50)
-                ) {
-                    Text(
-                        text = if (branch.hasTodayClosing) "Cierre hoy ✓" else "Pendiente hoy",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (branch.hasTodayClosing) SuccessGreen else WarningAmber,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                    )
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Global: ${DateAndFormatters.formatCurrency(branch.globalSales)}",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontFamily = MonoFontFamily,
-                        color = BrandNavy
-                    )
-                    Text(
-                        text = "Crédito: ${DateAndFormatters.formatCurrency(branch.creditSales)}",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = MonoFontFamily,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Column(horizontalAlignment = Alignment.End) {
-                    Text(
-                        text = "${branch.newCustomers} clientes · ${branch.appMaOperations} App MA",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = "${branch.newCustomerRequests} solicitudes · ${branch.entriesCount} cierre(s)",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
 private fun DailyBriefingDialog(
     branchLabel: String,
-    isAdmin: Boolean,
     summary: SalesProjectionSummary,
     onDismiss: () -> Unit
 ) {
@@ -454,7 +383,7 @@ private fun DailyBriefingDialog(
                 MueblesAmericaLogo(globeSize = 30.dp, fontSize = 18.sp, showTrademark = false)
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
-                    text = if (isAdmin) "Resumen General · Todas las Sucursales" else "Avance Diario · $branchLabel",
+                    text = "Avance Diario · $branchLabel",
                     style = MaterialTheme.typography.titleLarge
                 )
             }
@@ -481,11 +410,7 @@ private fun DailyBriefingDialog(
                     )
                 }
                 Text(
-                    text = if (isAdmin) {
-                        "Resumen consolidado de todas las sucursales en la quincena activa."
-                    } else {
-                        "Recuerda capturar tus 5 métricas al cierre de operaciones de hoy."
-                    },
+                    text = "Recuerda capturar tus 5 métricas al cierre de operaciones de hoy.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -497,7 +422,7 @@ private fun DailyBriefingDialog(
                 colors = ButtonDefaults.buttonColors(containerColor = BrandNavy),
                 modifier = Modifier.testTag("dismiss_briefing_button")
             ) {
-                Text(if (isAdmin) "Ver Dashboard" else "Registrar Cierre / Ver Panel")
+                Text("Registrar Cierre / Ver Panel")
             }
         }
     )
@@ -538,7 +463,7 @@ private fun NoActiveQuotaCard(
             )
             Text(
                 text = if (isAdmin) {
-                    "Configura la meta de la quincena (del 1 al 15 o del 16 al fin de mes) para habilitar las proyecciones."
+                    "Configura la meta quincenal del periodo para habilitar el cierre de ventas y las proyecciones."
                 } else {
                     "El administrador aún no ha publicado la meta quincenal de este periodo."
                 },
@@ -569,23 +494,24 @@ private fun DailyClosingFormCard(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val todayIso = DateAndFormatters.todayIso()
     val existingToday = summary.todayEntry
-    var globalSalesText by rememberSaveable(summary.quota.id, existingToday?.id) {
+    var globalSalesText by rememberSaveable(summary.quota.id, todayIso, existingToday?.id) {
         mutableStateOf(existingToday?.globalSales?.let { if (it > 0) it.toLong().toString() else "" } ?: "")
     }
-    var creditSalesText by rememberSaveable(summary.quota.id, existingToday?.id) {
+    var creditSalesText by rememberSaveable(summary.quota.id, todayIso, existingToday?.id) {
         mutableStateOf(existingToday?.creditSales?.let { if (it > 0) it.toLong().toString() else "" } ?: "")
     }
-    var newCustomersText by rememberSaveable(summary.quota.id, existingToday?.id) {
+    var newCustomersText by rememberSaveable(summary.quota.id, todayIso, existingToday?.id) {
         mutableStateOf(existingToday?.newCustomers?.let { if (it > 0) it.toString() else "" } ?: "")
     }
-    var appMaOpsText by rememberSaveable(summary.quota.id, existingToday?.id) {
+    var appMaOpsText by rememberSaveable(summary.quota.id, todayIso, existingToday?.id) {
         mutableStateOf(existingToday?.appMaOperations?.let { if (it > 0) it.toString() else "" } ?: "")
     }
-    var newRequestsText by rememberSaveable(summary.quota.id, existingToday?.id) {
+    var newRequestsText by rememberSaveable(summary.quota.id, todayIso, existingToday?.id) {
         mutableStateOf(existingToday?.newCustomerRequests?.let { if (it > 0) it.toString() else "" } ?: "")
     }
-    var notesText by rememberSaveable(summary.quota.id, existingToday?.id) {
+    var notesText by rememberSaveable(summary.quota.id, todayIso, existingToday?.id) {
         mutableStateOf(existingToday?.notes ?: "")
     }
     var pendingCameraUriString by rememberSaveable { mutableStateOf<String?>(null) }
@@ -637,7 +563,7 @@ private fun DailyClosingFormCard(
         }
     }
 
-    LaunchedEffect(existingToday?.id, existingToday?.updatedAt) {
+    LaunchedEffect(todayIso, existingToday?.id, existingToday?.updatedAt) {
         if (existingToday != null) {
             globalSalesText = existingToday.globalSales.toLong().toString()
             creditSalesText = existingToday.creditSales.toLong().toString()
@@ -645,6 +571,15 @@ private fun DailyClosingFormCard(
             appMaOpsText = existingToday.appMaOperations.toString()
             newRequestsText = existingToday.newCustomerRequests.toString()
             notesText = existingToday.notes
+        } else {
+            globalSalesText = ""
+            creditSalesText = ""
+            newCustomersText = ""
+            appMaOpsText = ""
+            newRequestsText = ""
+            notesText = ""
+            attachmentError = null
+            validationError = null
         }
     }
 
@@ -697,6 +632,18 @@ private fun DailyClosingFormCard(
                                 color = SuccessGreen
                             )
                         }
+                    }
+                } else {
+                    Surface(
+                        color = WarningAmberSoft,
+                        shape = RoundedCornerShape(50)
+                    ) {
+                        Text(
+                            text = "Pendiente hoy",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = WarningAmber,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
                     }
                 }
             }
@@ -1278,7 +1225,7 @@ private fun ProjectionOverviewCard(
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Editar Meta", style = MaterialTheme.typography.labelMedium)
+                        Text("Meta ${summary.totalDays}d", style = MaterialTheme.typography.labelMedium)
                     }
                 }
             }
@@ -1465,172 +1412,44 @@ private fun MetricScorecardItem(
 }
 
 @Composable
-private fun EditQuotaDialog(
-    currentQuota: BiweeklyQuota?,
-    isBusy: Boolean,
-    onDismiss: () -> Unit,
-    onSave: (String, String, String, Long, Double, Double, Long, Long, Long) -> Unit
+private fun AdminBranchFilterStrip(
+    selectedBranch: String,
+    onSelectBranch: (String) -> Unit
 ) {
-    val currentPeriodRange = remember { DateAndFormatters.defaultBiweeklyRange() }
-    val nextPeriodRange = remember { DateAndFormatters.nextBiweeklyRange() }
-    var useNextPeriod by remember {
-        mutableStateOf(currentQuota?.startDate == nextPeriodRange.first)
-    }
-    val selectedRange = if (useNextPeriod) nextPeriodRange else currentPeriodRange
-    val selectedTotalDays = remember(selectedRange) {
-        DateAndFormatters.daysBetweenInclusive(selectedRange.first, selectedRange.second)
-    }
-    var lastAutoTitle by remember {
-        mutableStateOf(DateAndFormatters.biweeklyTitleForRange(selectedRange.first))
-    }
-    var title by remember {
-        mutableStateOf(currentQuota?.title ?: DateAndFormatters.biweeklyTitleForRange(selectedRange.first))
-    }
-    var globalTarget by remember { mutableStateOf((currentQuota?.targetGlobalSales ?: 250000.0).toLong().toString()) }
-    var creditTarget by remember { mutableStateOf((currentQuota?.targetCreditSales ?: 150000.0).toLong().toString()) }
-    var newCustomersTarget by remember { mutableStateOf((currentQuota?.targetNewCustomers ?: 45L).toString()) }
-    var appMaTarget by remember { mutableStateOf((currentQuota?.targetAppMaOperations ?: 60L).toString()) }
-    var requestsTarget by remember { mutableStateOf((currentQuota?.targetNewCustomerRequests ?: 75L).toString()) }
-    var errorMsg by remember { mutableStateOf<String?>(null) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Meta Quincenal") },
-        text = {
-            Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
+    val options = remember { listOf(BranchOptions.ALL_BRANCHES_OPTION) + BranchOptions.ALL_BRANCHES }
+    Surface(
+        color = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = "Vista de Dashboard · $selectedBranch",
+                style = MaterialTheme.typography.labelLarge,
+                color = BrandNavy
+            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text(
-                    text = "Periodo quincenal (1 al 15 o 16 al fin de mes)",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = BrandNavy
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                options.forEach { branch ->
                     FilterChip(
-                        selected = !useNextPeriod,
-                        onClick = {
-                            useNextPeriod = false
-                            val nextAuto = DateAndFormatters.biweeklyTitleForRange(currentPeriodRange.first)
-                            if (title.isBlank() || title == lastAutoTitle) {
-                                title = nextAuto
-                            }
-                            lastAutoTitle = nextAuto
-                        },
-                        label = { Text("Quincena actual") },
+                        selected = selectedBranch == branch,
+                        onClick = { onSelectBranch(branch) },
+                        label = { Text(branch, style = MaterialTheme.typography.labelSmall) },
                         colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                            selectedLabelColor = BrandNavy
-                        )
+                            selectedContainerColor = BrandNavy,
+                            selectedLabelColor = Color.White
+                        ),
+                        modifier = Modifier.testTag("dashboard_branch_chip_$branch")
                     )
-                    FilterChip(
-                        selected = useNextPeriod,
-                        onClick = {
-                            useNextPeriod = true
-                            val nextAuto = DateAndFormatters.biweeklyTitleForRange(nextPeriodRange.first)
-                            if (title.isBlank() || title == lastAutoTitle) {
-                                title = nextAuto
-                            }
-                            lastAutoTitle = nextAuto
-                        },
-                        label = { Text("Siguiente") },
-                        colors = FilterChipDefaults.filterChipColors(
-                            selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
-                            selectedLabelColor = BrandNavy
-                        )
-                    )
-                }
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "${DateAndFormatters.formatIsoToDisplay(selectedRange.first)} – ${DateAndFormatters.formatIsoToDisplay(selectedRange.second)} ($selectedTotalDays días)",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = BrandNavy,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                    )
-                }
-
-                OutlinedTextField(
-                    value = title,
-                    onValueChange = { title = it.take(80) },
-                    label = { Text("Nombre de la quincena") },
-                    singleLine = true
-                )
-                OutlinedTextField(
-                    value = globalTarget,
-                    onValueChange = { globalTarget = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                    label = { Text("Meta Venta global ($ MXN)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    singleLine = true
-                )
-                OutlinedTextField(
-                    value = creditTarget,
-                    onValueChange = { creditTarget = it.filter { ch -> ch.isDigit() || ch == '.' } },
-                    label = { Text("Meta Venta a crédito ($ MXN)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    singleLine = true
-                )
-                OutlinedTextField(
-                    value = newCustomersTarget,
-                    onValueChange = { newCustomersTarget = it.filter { ch -> ch.isDigit() } },
-                    label = { Text("Meta Clientes nuevos (unidades)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true
-                )
-                OutlinedTextField(
-                    value = appMaTarget,
-                    onValueChange = { appMaTarget = it.filter { ch -> ch.isDigit() } },
-                    label = { Text("Meta Operaciones app MA (unidades)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true
-                )
-                OutlinedTextField(
-                    value = requestsTarget,
-                    onValueChange = { requestsTarget = it.filter { ch -> ch.isDigit() } },
-                    label = { Text("Meta Solicitudes cliente nuevo (uds)") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    singleLine = true
-                )
-                if (errorMsg != null) {
-                    Text(text = errorMsg ?: "", style = MaterialTheme.typography.bodySmall, color = BrandRed)
                 }
             }
-        },
-        confirmButton = {
-            Button(
-                enabled = !isBusy,
-                onClick = {
-                    val g = globalTarget.toDoubleOrNull()
-                    val c = creditTarget.toDoubleOrNull()
-                    val nc = newCustomersTarget.toLongOrNull()
-                    val ma = appMaTarget.toLongOrNull()
-                    val req = requestsTarget.toLongOrNull()
-                    if (title.trim().length < 3 || g == null || g <= 0 || c == null || nc == null || ma == null || req == null) {
-                        errorMsg = "Revisa el nombre y todos los objetivos numéricos."
-                    } else {
-                        onSave(
-                            title.trim(),
-                            selectedRange.first,
-                            selectedRange.second,
-                            selectedTotalDays.toLong(),
-                            g,
-                            c,
-                            nc,
-                            ma,
-                            req
-                        )
-                    }
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = BrandNavy)
-            ) {
-                Text("Guardar Meta")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancelar") }
         }
-    )
+    }
 }

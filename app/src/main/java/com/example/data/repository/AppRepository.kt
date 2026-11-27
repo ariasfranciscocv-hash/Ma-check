@@ -8,6 +8,7 @@ import com.example.data.model.AssignedTask
 import com.example.data.model.BiweeklyQuota
 import com.example.data.model.BranchOptions
 import com.example.data.model.ClosingAttachmentDraft
+import com.example.data.model.DailyClosingSaveResult
 import com.example.data.model.DailySalesEntry
 import com.example.data.model.TaskEvidence
 import com.example.data.model.TaskEvidenceAttachmentFile
@@ -33,11 +34,8 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
-
-private const val BOOTSTRAPPED_ADMIN_EMAIL = "arias.francisco.cv@gmail.com"
 
 class AppRepository(
     private val db: FirebaseFirestore
@@ -52,8 +50,14 @@ class AppRepository(
             ?: throw IllegalStateException("El usuario debe iniciar sesión con Google primero.")
 
     private fun isBootstrappedAdmin(email: String?, emailVerified: Boolean): Boolean =
-    email?.trim()?.equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) == true && emailVerified
-    
+        Companion.isBootstrappedAdmin(email, emailVerified)
+
+    companion object {
+        private const val BOOTSTRAPPED_ADMIN_EMAIL = "arias.francisco.cv@gmail.com"
+
+        fun isBootstrappedAdmin(email: String?, emailVerified: Boolean): Boolean =
+            email?.trim()?.equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) == true && emailVerified
+    }
 
     suspend fun syncCurrentUserProfile(
         uid: String,
@@ -147,45 +151,82 @@ class AppRepository(
     }
 
     fun observeCurrentUserProfile(uid: String): Flow<UserProfile?> = flow {
+        if (uid.isBlank()) {
+            emit(null)
+            return@flow
+        }
         val path = "users/$uid"
-        emitAll(
-            db.collection("users").document(uid)
-                .snapshots()
-                .map { it.toObject(UserProfile::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) }
-                .catch { error ->
-                    handleFlowError(error, OperationType.GET, path, uid)
-                    throw error
-                }
-        )
+        try {
+            emitAll(
+                db.collection("users").document(uid)
+                    .snapshots()
+                    .map { it.toObject(UserProfile::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) }
+                    .catch { error ->
+                        handleFlowError(error, OperationType.GET, path, uid)
+                        throw error
+                    }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFlowError(e, OperationType.GET, path, uid)
+            throw e
+        }
     }
 
-    fun observeIsAdmin(uid: String, email: String?, emailVerified: Boolean): Flow<Boolean> {
+    fun observeIsAdmin(uid: String, email: String?, emailVerified: Boolean): Flow<Boolean> = flow {
         if (isBootstrappedAdmin(email, emailVerified)) {
-            return flowOf(true)
+            emit(true)
+            return@flow
+        }
+        if (uid.isBlank()) {
+            emit(false)
+            return@flow
         }
         val path = "admins/$uid"
-        return db.collection("admins").document(uid)
-            .snapshots()
-            .map { it.exists() }
-            .catch { error ->
-                handleFlowError(error, OperationType.GET, path, uid)
-                throw error
-            }
+        try {
+            emitAll(
+                db.collection("admins").document(uid)
+                    .snapshots()
+                    .map { it.exists() }
+                    .catch { error ->
+                        handleFlowError(error, OperationType.GET, path, uid)
+                        throw error
+                    }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFlowError(e, OperationType.GET, path, uid)
+            throw e
+        }
     }
 
-    fun observeTeamUsers(uid: String, isAdmin: Boolean): Flow<List<UserProfile>> {
-        if (!isAdmin) return flowOf(emptyList())
+    fun observeTeamUsers(uid: String, isAdmin: Boolean): Flow<List<UserProfile>> = flow {
+        if (!isAdmin || uid.isBlank()) {
+            emit(emptyList())
+            return@flow
+        }
         val path = "users"
-        return db.collection(path)
-            .snapshots()
-            .map { snapshot ->
-                snapshot.toObjects(UserProfile::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                    .sortedBy { it.displayName.lowercase() }
-            }
-            .catch { error ->
-                handleFlowError(error, OperationType.LIST, path, uid)
-                throw error
-            }
+        try {
+            emitAll(
+                db.collection(path)
+                    .snapshots()
+                    .map { snapshot ->
+                        snapshot.toObjects(UserProfile::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                            .sortedBy { it.displayName.lowercase() }
+                    }
+                    .catch { error ->
+                        handleFlowError(error, OperationType.LIST, path, uid)
+                        throw error
+                    }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFlowError(e, OperationType.LIST, path, uid)
+            throw e
+        }
     }
 
     suspend fun setUserRole(targetUser: UserProfile, makeAdmin: Boolean): Result<Unit> {
@@ -231,28 +272,41 @@ class AppRepository(
         }
     }
 
-    fun observeTasks(uid: String, isAdmin: Boolean): Flow<List<AssignedTask>> {
-        val path = "tasks"
-        val query = if (isAdmin) {
-            db.collection(path)
-        } else {
-            db.collection(path).whereEqualTo("assigneeId", uid)
+    fun observeTasks(uid: String, isAdmin: Boolean): Flow<List<AssignedTask>> = flow {
+        if (uid.isBlank()) {
+            emit(emptyList())
+            return@flow
         }
-        return query.snapshots()
-            .map { snapshot ->
-                snapshot
-                    .toObjects(AssignedTask::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                    .sortedWith(
-                        compareBy<AssignedTask> { it.parsedStatus == TaskStatus.COMPLETED }
-                            .thenByDescending { it.parsedType == TaskType.EXTRAORDINARY }
-                            .thenByDescending { it.parsedPriority == TaskPriority.URGENT }
-                            .thenByDescending { it.createdAt ?: Timestamp(0, 0) }
-                    )
+        val path = "tasks"
+        try {
+            val query = if (isAdmin) {
+                db.collection(path)
+            } else {
+                db.collection(path).whereEqualTo("assigneeId", uid)
             }
-            .catch { error ->
-                handleFlowError(error, OperationType.LIST, path, uid)
-                throw error
-            }
+            emitAll(
+                query.snapshots()
+                    .map { snapshot ->
+                        snapshot
+                            .toObjects(AssignedTask::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                            .sortedWith(
+                                compareBy<AssignedTask> { it.parsedStatus == TaskStatus.COMPLETED }
+                                    .thenByDescending { it.parsedType == TaskType.EXTRAORDINARY }
+                                    .thenByDescending { it.parsedPriority == TaskPriority.URGENT }
+                                    .thenByDescending { it.createdAt ?: Timestamp(0, 0) }
+                            )
+                    }
+                    .catch { error ->
+                        handleFlowError(error, OperationType.LIST, path, uid)
+                        throw error
+                    }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFlowError(e, OperationType.LIST, path, uid)
+            throw e
+        }
     }
 
     suspend fun createTaskAndNotify(
@@ -323,47 +377,191 @@ class AppRepository(
         }
     }
 
+    private suspend fun isAssigneeAdminAccount(assigneeId: String): Boolean {
+        if (assigneeId.isBlank()) return true
+        val currentUser = auth.currentUser
+        if (currentUser?.uid == assigneeId &&
+            isBootstrappedAdmin(currentUser.email, currentUser.isEmailVerified)
+        ) {
+            return true
+        }
+        val userSnap = db.collection("users").document(assigneeId).get().await()
+        if (userSnap.getString("role") == UserRole.ADMIN.name) return true
+        val userEmail = userSnap.getString("email")
+        if (userEmail == BOOTSTRAPPED_ADMIN_EMAIL) return true
+        val adminSnap = db.collection("admins").document(assigneeId).get().await()
+        return adminSnap.exists()
+    }
+
     suspend fun seedDailyChecklistForUser(targetUser: UserProfile): Result<Int> {
+        if (targetUser.parsedRole == UserRole.ADMIN) {
+            return Result.failure(
+                IllegalStateException("Las cuentas de administrador no reciben tareas programadas.")
+            )
+        }
         return syncScheduledTasksForAssignee(
             assigneeId = targetUser.userId,
             assigneeName = targetUser.effectiveBranchLabel,
-            skipIfDayAlreadyCreated = false
+            skipIfAlreadyGeneratedToday = false
         )
     }
 
     suspend fun syncScheduledTasksForCurrentUser(branchLabel: String): Result<Int> {
-        val uid = auth.currentUser?.uid
+        val currentUser = auth.currentUser
             ?: return Result.failure(IllegalStateException("Usuario no autenticado."))
+        if (isBootstrappedAdmin(currentUser.email, currentUser.isEmailVerified)) {
+            return Result.success(0)
+        }
         return syncScheduledTasksForAssignee(
-            assigneeId = uid,
+            assigneeId = currentUser.uid,
             assigneeName = branchLabel,
-            skipIfDayAlreadyCreated = true
+            skipIfAlreadyGeneratedToday = true
         )
+    }
+
+    /**
+     * Checks on login / app resume whether today is a new day compared to the branch's
+     * last recorded closing and current time is within opening/workday hours (>= 08:00).
+     * Resets/initializes the branch's "Cierre de venta diaria" task to PENDING for today
+     * without ever deleting or modifying historical sales closings in Firestore.
+     */
+    suspend fun resetDailyClosingTaskOnNewDayIfNeeded(
+        branchLabel: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): Result<Boolean> {
+        return try {
+            val currentUser = auth.currentUser
+                ?: return Result.success(false)
+            val uid = currentUser.uid
+            if (isBootstrappedAdmin(currentUser.email, currentUser.isEmailVerified) ||
+                isAssigneeAdminAccount(uid)
+            ) {
+                return Result.success(false)
+            }
+            if (!DateAndFormatters.isWithinOpeningOrWorkdayHours(nowMillis)) {
+                return Result.success(false)
+            }
+
+            val today = DateAndFormatters.todayIso()
+            val lastClosingDate = try {
+                db.collection("sales_entries")
+                    .whereEqualTo("userId", uid)
+                    .get()
+                    .await()
+                    .documents
+                    .mapNotNull { it.getString("dateString")?.takeIf { d -> d.length == 10 } }
+                    .maxOrNull()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                handleFirestoreError(e, OperationType.LIST, "sales_entries")
+                return Result.failure(e)
+            }
+
+            if (!DateAndFormatters.shouldAutoResetDailyClosing(lastClosingDate, today, nowMillis)) {
+                return Result.success(false)
+            }
+
+            val userTasksSnap = try {
+                db.collection("tasks")
+                    .whereEqualTo("assigneeId", uid)
+                    .get()
+                    .await()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                handleFirestoreError(e, OperationType.LIST, "tasks")
+                return Result.failure(e)
+            }
+
+            val closingDocs = userTasksSnap.documents.filter { doc ->
+                doc.getString("title") == ScheduledTasksCatalog.DAILY_SALES_CLOSING_TITLE ||
+                    doc.id.endsWith("_${ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG}")
+            }
+
+            val alreadyHasTodayClosingTask = closingDocs.any { doc ->
+                doc.getString("dueDate") == today ||
+                    doc.id == "sched_${uid}_${today}_${ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG}"
+            }
+            if (alreadyHasTodayClosingTask) {
+                return Result.success(false)
+            }
+
+            val reusableClosingDoc = closingDocs
+                .filter { !it.id.startsWith("sched_") && (it.getString("dueDate") ?: "") < today }
+                .maxByOrNull { it.getString("dueDate") ?: "" }
+
+            val safeName = branchLabel.trim().ifBlank { "Sucursal" }.take(80)
+            if (reusableClosingDoc != null) {
+                db.collection("tasks").document(reusableClosingDoc.id).update(
+                    mapOf(
+                        "dueDate" to today,
+                        "dueTime" to "23:59",
+                        "deadlineLabel" to "Jornada: Desde 8:00 a.m. al cierre",
+                        "status" to TaskStatus.PENDING.name,
+                        "hasPhotoEvidence" to false,
+                        "evidenceId" to FieldValue.delete(),
+                        "completedAt" to FieldValue.delete(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                ).await()
+            } else {
+                val deterministicId = "sched_${uid}_${today}_${ScheduledTasksCatalog.DAILY_SALES_CLOSING_SLUG}"
+                db.collection("tasks").document(deterministicId).set(
+                    mapOf(
+                        "assigneeId" to uid,
+                        "assigneeName" to safeName,
+                        "createdBy" to uid,
+                        "title" to ScheduledTasksCatalog.DAILY_SALES_CLOSING_TITLE,
+                        "description" to "Capturar el cierre de operaciones con las 5 métricas del día y adjuntar respaldo.",
+                        "taskType" to TaskType.DAILY.name,
+                        "priority" to TaskPriority.NORMAL.name,
+                        "dueDate" to today,
+                        "dueTime" to "23:59",
+                        "deadlineLabel" to "Jornada: Desde 8:00 a.m. al cierre",
+                        "status" to TaskStatus.PENDING.name,
+                        "hasPhotoEvidence" to false,
+                        "createdAt" to FieldValue.serverTimestamp(),
+                        "updatedAt" to FieldValue.serverTimestamp()
+                    )
+                ).await()
+            }
+
+            Result.success(true)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.WRITE, "tasks")
+            Result.failure(e)
+        }
     }
 
     private suspend fun syncScheduledTasksForAssignee(
         assigneeId: String,
         assigneeName: String,
-        skipIfDayAlreadyCreated: Boolean
+        skipIfAlreadyGeneratedToday: Boolean
     ): Result<Int> {
         return try {
             val actorUid = requireUserId()
+            if (assigneeId.isBlank() || isAssigneeAdminAccount(assigneeId)) {
+                return Result.success(0)
+            }
+
             val today = DateAndFormatters.todayIso()
             val expected = ScheduledTasksCatalog.tasksToEnsureOnDate(today)
 
-            val existingIds = db.collection("tasks")
+            val existingDocs = db.collection("tasks")
                 .whereEqualTo("assigneeId", assigneeId)
                 .get()
                 .await()
                 .documents
-                .map { it.id }
-                .toSet()
 
             val todayPrefix = "sched_${assigneeId}_${today}_"
-            if (skipIfDayAlreadyCreated && existingIds.any { it.startsWith(todayPrefix) }) {
+            if (skipIfAlreadyGeneratedToday && existingDocs.any { it.id.startsWith(todayPrefix) }) {
                 return Result.success(0)
             }
 
+            val existingIds = existingDocs.map { it.id }.toSet()
             val safeName = assigneeName.trim().ifBlank { "Sucursal" }.take(80)
             val missing = expected.filter { (assignedDate, spec) ->
                 val deterministicId = "sched_${assigneeId}_${assignedDate}_${spec.slug}"
@@ -416,15 +614,20 @@ class AppRepository(
         return try {
             val adminUid = requireUserId()
             require(quotaId.isNotBlank()) { "No hay una meta quincenal activa." }
-            require(branchUsers.isNotEmpty()) {
-                "No hay usuarios registrados en $branchName para confirmar el reinicio."
+            val eligibleUsers = branchUsers.filter {
+                it.userId.isNotBlank() && it.parsedRole != UserRole.ADMIN
+            }
+            require(eligibleUsers.isNotEmpty()) {
+                "No hay cuentas de sucursal no administradoras en $branchName para confirmar el reinicio."
             }
 
             val today = DateAndFormatters.todayIso()
             val expectedToday = ScheduledTasksCatalog.tasksToEnsureOnDate(today)
             var recreatedTotal = 0
 
-            for (user in branchUsers) {
+            for (user in eligibleUsers) {
+                if (isAssigneeAdminAccount(user.userId)) continue
+
                 val existingSnap = db.collection("tasks")
                     .whereEqualTo("assigneeId", user.userId)
                     .get()
@@ -485,65 +688,70 @@ class AppRepository(
         }
     }
 
-    suspend fun updateTasks(
-        tasks: List<AssignedTask>,
+    suspend fun updateDailyTask(
+        task: AssignedTask,
         title: String,
         description: String,
-        taskType: TaskType,
         priority: TaskPriority,
-        dueDate: String,
         dueTime: String?,
-        deadlineLabel: String?
+        deadlineLabel: String?,
+        applyToAllBranchesSameDay: Boolean
     ): Result<Int> {
-        val path = "tasks"
+        val path = if (applyToAllBranchesSameDay) "tasks" else "tasks/${task.id}"
         return try {
             requireUserId()
-            require(tasks.isNotEmpty()) { "No se encontraron tareas para actualizar." }
+            require(task.id.isNotBlank()) { "ID de tarea inválido." }
             val cleanTitle = title.trim()
             val cleanDesc = description.trim().take(500)
-            val cleanDueDate = dueDate.trim()
-            val cleanDueTime = dueTime?.trim()?.takeIf { it.isNotEmpty() }
-            val cleanDeadlineLabel = deadlineLabel?.trim()?.take(80)?.takeIf { it.isNotEmpty() }
-
             require(cleanTitle.length in 3..120) {
                 "El título debe tener entre 3 y 120 caracteres."
             }
-            require(cleanDueDate.matches(Regex("""^\d{4}-\d{2}-\d{2}$"""))) {
-                "La fecha límite debe tener formato AAAA-MM-DD."
-            }
+            val cleanDueTime = dueTime?.trim()?.takeIf { it.isNotEmpty() }
             if (cleanDueTime != null) {
-                require(cleanDueTime.matches(Regex("""^([01]\d|2[0-3]):[0-5]\d$"""))) {
-                    "La hora límite debe tener formato HH:mm (ej. 14:30 o 23:59)."
+                require(Regex("""^([01][0-9]|2[0-3]):[0-5][0-9]$""").matches(cleanDueTime)) {
+                    "La hora límite debe tener formato HH:mm (00:00 a 23:59)."
                 }
+            }
+            val cleanLabel = deadlineLabel?.trim()?.take(80)
+
+            val updatePayload = buildMap<String, Any> {
+                put("title", cleanTitle)
+                put("description", cleanDesc)
+                put("priority", priority.name)
+                if (cleanDueTime != null) {
+                    put("dueTime", cleanDueTime)
+                } else {
+                    put("dueTime", FieldValue.delete())
+                }
+                if (!cleanLabel.isNullOrEmpty()) {
+                    put("deadlineLabel", cleanLabel)
+                } else {
+                    put("deadlineLabel", FieldValue.delete())
+                }
+                put("updatedAt", FieldValue.serverTimestamp())
             }
 
-            tasks.chunked(380).forEach { chunk ->
+            if (!applyToAllBranchesSameDay) {
+                db.collection("tasks").document(task.id).update(updatePayload).await()
+                return Result.success(1)
+            }
+
+            // Single-field equality query requires no composite index; day/slug matching runs in memory.
+            val dailyDocs = db.collection("tasks")
+                .whereEqualTo("taskType", TaskType.DAILY.name)
+                .get()
+                .await()
+                .documents
+
+            val matchingRefs = findMatchingDailyTaskRefs(dailyDocs, task)
+                .ifEmpty { listOf(db.collection("tasks").document(task.id)) }
+
+            matchingRefs.chunked(380).forEach { chunk ->
                 val batch = db.batch()
-                chunk.forEach { task ->
-                    val ref = db.collection("tasks").document(task.id)
-                    val updatePayload = buildMap<String, Any> {
-                        put("title", cleanTitle)
-                        put("description", cleanDesc)
-                        put("taskType", taskType.name)
-                        put("priority", priority.name)
-                        put("dueDate", cleanDueDate)
-                        if (cleanDueTime != null) {
-                            put("dueTime", cleanDueTime)
-                        } else if (task.dueTime != null) {
-                            put("dueTime", FieldValue.delete())
-                        }
-                        if (cleanDeadlineLabel != null) {
-                            put("deadlineLabel", cleanDeadlineLabel)
-                        } else if (task.deadlineLabel != null) {
-                            put("deadlineLabel", FieldValue.delete())
-                        }
-                        put("updatedAt", FieldValue.serverTimestamp())
-                    }
-                    batch.update(ref, updatePayload)
-                }
+                chunk.forEach { ref -> batch.update(ref, updatePayload) }
                 batch.commit().await()
             }
-            Result.success(tasks.size)
+            Result.success(matchingRefs.size)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -552,47 +760,61 @@ class AppRepository(
         }
     }
 
-    suspend fun deleteTasks(tasks: List<AssignedTask>): Result<Int> {
-        val path = "tasks"
+    suspend fun deleteDailyTask(
+        task: AssignedTask,
+        deleteAllBranchesSameDay: Boolean
+    ): Result<Int> {
+        val path = if (deleteAllBranchesSameDay) "tasks" else "tasks/${task.id}"
         return try {
             requireUserId()
-            require(tasks.isNotEmpty()) { "No se encontraron tareas para eliminar." }
+            require(task.id.isNotBlank()) { "ID de tarea inválido." }
 
-            val refsToDelete = mutableListOf<com.google.firebase.firestore.DocumentReference>()
-            for (task in tasks) {
-                if (task.id.isBlank()) continue
-                refsToDelete.add(db.collection("tasks").document(task.id))
-
-                val evId = task.evidenceId?.takeIf { it.isNotBlank() }
-                if (evId != null) {
-                    val fileDocs = db.collection("task_evidences")
-                        .document(evId)
-                        .collection("files")
-                        .get()
-                        .await()
-                    fileDocs.documents.forEach { refsToDelete.add(it.reference) }
-                    refsToDelete.add(db.collection("task_evidences").document(evId))
-                }
-
-                val notifDocs = db.collection("notifications")
-                    .whereEqualTo("taskId", task.id)
-                    .get()
-                    .await()
-                notifDocs.documents.forEach { refsToDelete.add(it.reference) }
+            if (!deleteAllBranchesSameDay) {
+                db.collection("tasks").document(task.id).delete().await()
+                return Result.success(1)
             }
 
-            refsToDelete.chunked(380).forEach { chunk ->
+            // Single-field equality query requires no composite index; day/slug matching runs in memory.
+            val dailyDocs = db.collection("tasks")
+                .whereEqualTo("taskType", TaskType.DAILY.name)
+                .get()
+                .await()
+                .documents
+
+            val matchingRefs = findMatchingDailyTaskRefs(dailyDocs, task)
+                .ifEmpty { listOf(db.collection("tasks").document(task.id)) }
+
+            matchingRefs.chunked(380).forEach { chunk ->
                 val batch = db.batch()
                 chunk.forEach { ref -> batch.delete(ref) }
                 batch.commit().await()
             }
-            Result.success(tasks.size)
+            Result.success(matchingRefs.size)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.DELETE, path)
             Result.failure(e)
         }
+    }
+
+    private fun findMatchingDailyTaskRefs(
+        dailyDocs: List<DocumentSnapshot>,
+        targetTask: AssignedTask
+    ) = dailyDocs.mapNotNull { doc ->
+        val candidate = doc.toObject(AssignedTask::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            ?: return@mapNotNull null
+        val targetDay = DateAndFormatters.extractTaskDayIso(targetTask)
+        val candidateDay = DateAndFormatters.extractTaskDayIso(candidate)
+        if (candidateDay != targetDay) return@mapNotNull null
+
+        val targetSlug = DateAndFormatters.extractScheduledSlug(targetTask.id)
+        val candidateSlug = DateAndFormatters.extractScheduledSlug(candidate.id)
+        val sameTask = candidate.id == targetTask.id ||
+            (targetSlug != null && candidateSlug == targetSlug) ||
+            (candidate.title.trim().equals(targetTask.title.trim(), ignoreCase = true) &&
+                candidate.dueDate == targetTask.dueDate)
+        if (sameTask) doc.reference else null
     }
 
     suspend fun completeTaskWithEvidenceFiles(
@@ -776,35 +998,60 @@ class AppRepository(
         }
     }
 
-    fun observeEvidences(uid: String, isAdmin: Boolean): Flow<List<TaskEvidence>> {
+    fun observeEvidences(uid: String, isAdmin: Boolean): Flow<List<TaskEvidence>> = flow {
         // Non-admin employees NEVER read /task_evidences; enforced both here and in firestore.rules
-        if (!isAdmin) return flowOf(emptyList())
+        if (!isAdmin || uid.isBlank()) {
+            emit(emptyList())
+            return@flow
+        }
         val path = "task_evidences"
-        return db.collection(path)
-            .snapshots()
-            .map { snapshot ->
-                snapshot.toObjects(TaskEvidence::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                    .sortedByDescending { it.capturedAt ?: Timestamp(0, 0) }
-            }
-            .catch { error ->
-                handleFlowError(error, OperationType.LIST, path, uid)
-                throw error
-            }
+        try {
+            emitAll(
+                db.collection(path)
+                    .snapshots()
+                    .map { snapshot ->
+                        snapshot.toObjects(TaskEvidence::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                            .sortedByDescending { it.capturedAt ?: Timestamp(0, 0) }
+                    }
+                    .catch { error ->
+                        handleFlowError(error, OperationType.LIST, path, uid)
+                        throw error
+                    }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFlowError(e, OperationType.LIST, path, uid)
+            throw e
+        }
     }
 
-    fun observeNotifications(uid: String): Flow<List<TaskNotification>> {
+    fun observeNotifications(uid: String): Flow<List<TaskNotification>> = flow {
+        if (uid.isBlank()) {
+            emit(emptyList())
+            return@flow
+        }
         val path = "notifications"
-        return db.collection(path)
-            .whereEqualTo("recipientId", uid)
-            .snapshots()
-            .map { snapshot ->
-                snapshot.toObjects(TaskNotification::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                    .sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
-            }
-            .catch { error ->
-                handleFlowError(error, OperationType.LIST, path, uid)
-                throw error
-            }
+        try {
+            emitAll(
+                db.collection(path)
+                    .whereEqualTo("recipientId", uid)
+                    .snapshots()
+                    .map { snapshot ->
+                        snapshot.toObjects(TaskNotification::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                            .sortedByDescending { it.createdAt ?: Timestamp(0, 0) }
+                    }
+                    .catch { error ->
+                        handleFlowError(error, OperationType.LIST, path, uid)
+                        throw error
+                    }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFlowError(e, OperationType.LIST, path, uid)
+            throw e
+        }
     }
 
     suspend fun acknowledgeNotification(notificationId: String): Result<Unit> {
@@ -829,20 +1076,44 @@ class AppRepository(
         }
     }
 
-    fun observeActiveQuota(uid: String): Flow<BiweeklyQuota?> {
+    fun observeActiveQuotas(uid: String): Flow<List<BiweeklyQuota>> = flow {
+        if (uid.isBlank()) {
+            emit(emptyList())
+            return@flow
+        }
         val path = "biweekly_quotas"
-        return db.collection(path)
-            .whereEqualTo("active", true)
-            .snapshots()
-            .map { snapshot ->
-                snapshot.toObjects(BiweeklyQuota::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                    .maxByOrNull { it.createdAt?.seconds ?: 0L }
-            }
-            .catch { error ->
-                handleFlowError(error, OperationType.LIST, path, uid)
-                throw error
-            }
+        try {
+            emitAll(
+                db.collection(path)
+                    .whereEqualTo("active", true)
+                    .snapshots()
+                    .map { snapshot ->
+                        snapshot.toObjects(BiweeklyQuota::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                            .sortedByDescending { it.updatedAt?.seconds ?: it.createdAt?.seconds ?: 0L }
+                    }
+                    .catch { error ->
+                        handleFlowError(error, OperationType.LIST, path, uid)
+                        throw error
+                    }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFlowError(e, OperationType.LIST, path, uid)
+            throw e
+        }
     }
+
+    fun observeActiveQuota(uid: String): Flow<BiweeklyQuota?> =
+        observeActiveQuotas(uid).map { quotas ->
+            val currentPeriodId = DateAndFormatters.currentBiweeklyPeriodId()
+            quotas.firstOrNull {
+                it.effectivePeriodId == currentPeriodId &&
+                    (it.branchName.isNullOrBlank() || it.branchName == BranchOptions.ALL_BRANCHES_OPTION)
+            } ?: quotas.firstOrNull {
+                it.branchName.isNullOrBlank() || it.branchName == BranchOptions.ALL_BRANCHES_OPTION
+            } ?: quotas.firstOrNull()
+        }
 
     suspend fun saveBiweeklyQuota(
         title: String,
@@ -853,51 +1124,117 @@ class AppRepository(
         targetCreditSales: Double,
         targetNewCustomers: Long,
         targetAppMaOperations: Long,
-        targetNewCustomerRequests: Long
+        targetNewCustomerRequests: Long,
+        branchName: String = BranchOptions.ALL_BRANCHES_OPTION,
+        periodId: String = DateAndFormatters.biweeklyPeriodIdForIso(startDate),
+        applyToAllIndividualBranches: Boolean = false
     ): Result<Unit> {
         val path = "biweekly_quotas"
         return try {
             val adminUid = requireUserId()
             val cleanTitle = title.trim()
+            val cleanBranch = branchName.trim().ifBlank { BranchOptions.ALL_BRANCHES_OPTION }
+            val cleanPeriodId = periodId.trim().ifBlank { DateAndFormatters.biweeklyPeriodIdForIso(startDate) }
             require(cleanTitle.length in 3..80) { "El nombre de la quincena debe tener entre 3 y 80 caracteres." }
             require(targetGlobalSales > 0.0) { "La meta de venta global debe ser mayor a 0." }
             require(totalDays in 1L..31L) { "La duración debe estar entre 1 y 31 días." }
+            require(cleanBranch == BranchOptions.ALL_BRANCHES_OPTION || cleanBranch in BranchOptions.ALL_BRANCHES) {
+                "Selecciona una sucursal válida."
+            }
 
             val existingActive = db.collection(path)
                 .whereEqualTo("active", true)
                 .get()
                 .await()
 
-            val batch = db.batch()
-            existingActive.documents.forEach { doc ->
-                batch.update(
-                    doc.reference,
-                    mapOf(
-                        "active" to false,
-                        "updatedAt" to FieldValue.serverTimestamp()
-                    )
-                )
+            data class QuotaTargetWrite(
+                val branch: String,
+                val scale: Int
+            )
+
+            val writesToApply: List<QuotaTargetWrite> = if (cleanBranch == BranchOptions.ALL_BRANCHES_OPTION && applyToAllIndividualBranches) {
+                BranchOptions.ALL_BRANCHES.map { QuotaTargetWrite(it, 1) } +
+                    QuotaTargetWrite(BranchOptions.ALL_BRANCHES_OPTION, BranchOptions.ALL_BRANCHES.size)
+            } else {
+                listOf(QuotaTargetWrite(cleanBranch, 1))
             }
 
-            val newRef = db.collection(path).document()
-            batch.set(
-                newRef,
-                mapOf(
-                    "title" to cleanTitle,
-                    "startDate" to startDate,
-                    "endDate" to endDate,
-                    "totalDays" to totalDays,
-                    "targetGlobalSales" to targetGlobalSales,
-                    "targetCreditSales" to targetCreditSales.coerceAtLeast(0.0),
-                    "targetNewCustomers" to targetNewCustomers.coerceAtLeast(0L),
-                    "targetAppMaOperations" to targetAppMaOperations.coerceAtLeast(0L),
-                    "targetNewCustomerRequests" to targetNewCustomerRequests.coerceAtLeast(0L),
-                    "active" to true,
-                    "createdBy" to adminUid,
-                    "createdAt" to FieldValue.serverTimestamp(),
-                    "updatedAt" to FieldValue.serverTimestamp()
-                )
-            )
+            val targetBranchesSet = writesToApply.map { it.branch }.toSet()
+            val targetDocIds = writesToApply.associate { it.branch to buildQuotaDocId(cleanPeriodId, it.branch) }
+
+            val batch = db.batch()
+            existingActive.documents.forEach { doc ->
+                val docBranch = doc.getString("branchName")?.takeIf { it.isNotBlank() }
+                    ?: BranchOptions.ALL_BRANCHES_OPTION
+                val docStart = doc.getString("startDate") ?: ""
+                val docPeriod = doc.getString("periodId")?.takeIf { it.isNotBlank() }
+                    ?: if (docStart.length == 10) DateAndFormatters.biweeklyPeriodIdForIso(docStart) else cleanPeriodId
+                val isTargetDoc = doc.id in targetDocIds.values
+                if (!isTargetDoc && (docPeriod != cleanPeriodId || docBranch in targetBranchesSet)) {
+                    batch.update(
+                        doc.reference,
+                        mapOf(
+                            "active" to false,
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                }
+            }
+
+            val existingById = existingActive.documents.associateBy { it.id }
+            for (target in writesToApply) {
+                val docId = targetDocIds.getValue(target.branch)
+                val docRef = db.collection(path).document(docId)
+                val existingSnap = existingById[docId] ?: docRef.get().await()
+                val scaledGlobal = (targetGlobalSales * target.scale).coerceAtMost(1_000_000_000.0)
+                val scaledCredit = (targetCreditSales.coerceAtLeast(0.0) * target.scale).coerceAtMost(1_000_000_000.0)
+                val scaledCustomers = (targetNewCustomers.coerceAtLeast(0L) * target.scale).coerceAtMost(100_000L)
+                val scaledAppMa = (targetAppMaOperations.coerceAtLeast(0L) * target.scale).coerceAtMost(100_000L)
+                val scaledRequests = (targetNewCustomerRequests.coerceAtLeast(0L) * target.scale).coerceAtMost(100_000L)
+
+                if (existingSnap.exists()) {
+                    batch.update(
+                        docRef,
+                        mapOf(
+                            "title" to cleanTitle,
+                            "startDate" to startDate,
+                            "endDate" to endDate,
+                            "totalDays" to totalDays,
+                            "periodId" to cleanPeriodId,
+                            "branchName" to target.branch,
+                            "targetGlobalSales" to scaledGlobal,
+                            "targetCreditSales" to scaledCredit,
+                            "targetNewCustomers" to scaledCustomers,
+                            "targetAppMaOperations" to scaledAppMa,
+                            "targetNewCustomerRequests" to scaledRequests,
+                            "active" to true,
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                } else {
+                    batch.set(
+                        docRef,
+                        mapOf(
+                            "title" to cleanTitle,
+                            "startDate" to startDate,
+                            "endDate" to endDate,
+                            "totalDays" to totalDays,
+                            "periodId" to cleanPeriodId,
+                            "branchName" to target.branch,
+                            "targetGlobalSales" to scaledGlobal,
+                            "targetCreditSales" to scaledCredit,
+                            "targetNewCustomers" to scaledCustomers,
+                            "targetAppMaOperations" to scaledAppMa,
+                            "targetNewCustomerRequests" to scaledRequests,
+                            "active" to true,
+                            "createdBy" to adminUid,
+                            "createdAt" to FieldValue.serverTimestamp(),
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    )
+                }
+            }
+
             batch.commit().await()
             Result.success(Unit)
         } catch (e: CancellationException) {
@@ -906,6 +1243,14 @@ class AppRepository(
             handleFirestoreError(e, OperationType.WRITE, path)
             Result.failure(e)
         }
+    }
+
+    private fun buildQuotaDocId(periodId: String, branchName: String): String {
+        val branchSlug = branchName.lowercase()
+            .replace(Regex("[^a-z0-9]+"), "_")
+            .trim('_')
+            .ifBlank { "general" }
+        return "quota_${periodId}_${branchSlug}".take(120)
     }
 
     suspend fun ensureDefaultQuotaForAdminIfMissing(): Result<Unit> {
@@ -919,13 +1264,17 @@ class AppRepository(
                 .await()
             if (activeSnap.isEmpty) {
                 val (startDate, endDate) = DateAndFormatters.defaultBiweeklyRange()
+                val periodId = DateAndFormatters.biweeklyPeriodIdForIso(startDate)
                 val days = DateAndFormatters.daysBetweenInclusive(startDate, endDate).toLong().coerceIn(1L, 31L)
-                db.collection(path).document().set(
+                val docId = buildQuotaDocId(periodId, BranchOptions.ALL_BRANCHES_OPTION)
+                db.collection(path).document(docId).set(
                     mapOf(
                         "title" to DateAndFormatters.defaultBiweeklyTitle(),
                         "startDate" to startDate,
                         "endDate" to endDate,
                         "totalDays" to days,
+                        "periodId" to periodId,
+                        "branchName" to BranchOptions.ALL_BRANCHES_OPTION,
                         "targetGlobalSales" to 250_000.0,
                         "targetCreditSales" to 150_000.0,
                         "targetNewCustomers" to 45L,
@@ -947,29 +1296,43 @@ class AppRepository(
         }
     }
 
-    fun observeSalesEntries(uid: String, isAdmin: Boolean): Flow<List<DailySalesEntry>> {
-        val path = "sales_entries"
-        val query = if (isAdmin) {
-            db.collection(path)
-        } else {
-            db.collection(path).whereEqualTo("userId", uid)
+    fun observeSalesEntries(uid: String, isAdmin: Boolean): Flow<List<DailySalesEntry>> = flow {
+        if (uid.isBlank()) {
+            emit(emptyList())
+            return@flow
         }
-        return query.snapshots()
-            .map { snapshot ->
-                snapshot
-                    .toObjects(DailySalesEntry::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
-                    .sortedByDescending { it.dateString }
+        val path = "sales_entries"
+        try {
+            val query = if (isAdmin) {
+                db.collection(path)
+            } else {
+                db.collection(path).whereEqualTo("userId", uid)
             }
-            .catch { error ->
-                handleFlowError(error, OperationType.LIST, path, uid)
-                throw error
-            }
+            emitAll(
+                query.snapshots()
+                    .map { snapshot ->
+                        snapshot
+                            .toObjects(DailySalesEntry::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                            .sortedByDescending { it.dateString }
+                    }
+                    .catch { error ->
+                        handleFlowError(error, OperationType.LIST, path, uid)
+                        throw error
+                    }
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFlowError(e, OperationType.LIST, path, uid)
+            throw e
+        }
     }
 
     suspend fun upsertDailySalesEntry(
         quotaId: String,
         dateString: String,
         userName: String,
+        branchName: String? = null,
         globalSales: Double,
         creditSales: Double,
         newCustomers: Long,
@@ -977,7 +1340,7 @@ class AppRepository(
         newCustomerRequests: Long,
         notes: String,
         attachmentDraft: ClosingAttachmentDraft = ClosingAttachmentDraft.Unchanged
-    ): Result<Unit> {
+    ): Result<DailyClosingSaveResult> {
         val uid = auth.currentUser?.uid
             ?: return Result.failure(IllegalStateException("Usuario no autenticado."))
         val docId = "${quotaId}_${dateString}_${uid}"
@@ -1002,6 +1365,7 @@ class AppRepository(
             val docRef = db.collection("sales_entries").document(docId)
             val existing = docRef.get().await()
             val cleanNotes = notes.trim().take(300)
+            val cleanBranch = branchName?.trim()?.takeIf { it in BranchOptions.ALL_BRANCHES }
 
             val existingChunksSnap = if (attachmentDraft != ClosingAttachmentDraft.Unchanged && existing.exists()) {
                 docRef.collection("attachment_chunks")
@@ -1018,6 +1382,7 @@ class AppRepository(
                 val payload = buildMap<String, Any> {
                     put("userId", uid)
                     put("userName", userName.trim().ifBlank { "Usuario" }.take(80))
+                    if (cleanBranch != null) put("branchName", cleanBranch)
                     put("quotaId", quotaId)
                     put("dateString", dateString)
                     put("globalSales", globalSales)
@@ -1044,6 +1409,7 @@ class AppRepository(
                 batch.set(docRef, payload)
             } else {
                 val updatePayload = buildMap<String, Any> {
+                    if (cleanBranch != null) put("branchName", cleanBranch)
                     put("globalSales", globalSales)
                     put("creditSales", creditSales)
                     put("newCustomers", newCustomers)
@@ -1118,7 +1484,39 @@ class AppRepository(
 
             batch.commit().await()
 
-            Result.success(Unit)
+            val saveSummary = try {
+                val (periodStartIso, periodEndIso) = DateAndFormatters.biweeklyRangeForIso(dateString)
+                val branchEntriesSnap = db.collection("sales_entries")
+                    .whereEqualTo("userId", uid)
+                    .get()
+                    .await()
+                val periodDocs = branchEntriesSnap
+                    .toObjects(DailySalesEntry::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+                    .filter { entry ->
+                        val sameBranch = cleanBranch == null ||
+                            entry.branchName == null ||
+                            entry.branchName == cleanBranch
+                        sameBranch && entry.dateString in periodStartIso..periodEndIso
+                    }
+                    .sortedWith(
+                        compareByDescending<DailySalesEntry> { it.dateString }
+                            .thenByDescending { it.updatedAt?.seconds ?: 0L }
+                    )
+                    .distinctBy { it.dateString }
+                DailyClosingSaveResult(
+                    branchAccumulatedGlobalSales = periodDocs.sumOf { it.globalSales },
+                    branchPeriodEntriesCount = periodDocs.size
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                DailyClosingSaveResult(
+                    branchAccumulatedGlobalSales = globalSales,
+                    branchPeriodEntriesCount = 1
+                )
+            }
+
+            Result.success(saveSummary)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -1170,7 +1568,8 @@ class AppRepository(
             .firstOrNull()
         if (firestoreError == null && error is CancellationException) throw error
         val exceptionToLog = firestoreError ?: (error as? Exception)
-        if (exceptionToLog != null && auth.currentUser?.uid == uid) {
+        val activeUid = runCatching { auth.currentUser?.uid }.getOrNull()
+        if (exceptionToLog != null && activeUid == uid) {
             handleFirestoreError(exceptionToLog, operationType, path)
         }
     }

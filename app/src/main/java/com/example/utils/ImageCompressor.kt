@@ -268,7 +268,6 @@ object ImageCompressor {
             quality -= 10
         } while (encoded.length > MAX_BASE64_CHARS && quality >= 25)
 
-        if (transformedBitmap !== rawBitmap) {
             transformedBitmap.recycle()
         }
 

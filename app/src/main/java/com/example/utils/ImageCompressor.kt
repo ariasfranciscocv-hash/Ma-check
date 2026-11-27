@@ -151,12 +151,12 @@ object ImageCompressor {
         val safeName = rawName.trim().ifBlank { "adjunto" }.take(120)
         val effectiveMime = inferMimeType(safeName, runCatching { resolver.getType(uri) }.getOrNull())
 
-        val treatAsImage = isLikelyImage(safeName, effectiveMime) ||
-            (effectiveMime == "application/octet-stream" && probeImageBounds(resolver, uri))
+                val treatAsImage = isLikelyImage(safeName, effectiveMime) || probeImageBounds(resolver, uri)
 
         if (treatAsImage) {
             val base64 = compressUriToBase64(context, uri).getOrThrow()
-            val imageName = if (safeName.contains(".")) safeName else "$safeName.jpg"
+            val cleanBase = safeName.substringBeforeLast('.').ifBlank { "evidencia_${System.currentTimeMillis()}" }
+            val imageName = "$cleanBase.jpg"
             val approxBytes = ((base64.length * 3) / 4).coerceAtLeast(1)
             return@runCatching EncodedAttachment(
                 fileName = imageName,
@@ -165,6 +165,7 @@ object ImageCompressor {
                 base64Chunks = listOf(base64)
             )
         }
+        
 
         val bytes = openStream(resolver, uri)?.use { input ->
             val out = ByteArrayOutputStream()

@@ -52,7 +52,8 @@ class AppRepository(
             ?: throw IllegalStateException("El usuario debe iniciar sesión con Google primero.")
 
     private fun isBootstrappedAdmin(email: String?, emailVerified: Boolean): Boolean =
-        email == BOOTSTRAPPED_ADMIN_EMAIL && emailVerified
+    email?.trim()?.equals(BOOTSTRAPPED_ADMIN_EMAIL, ignoreCase = true) == true && emailVerified
+    
 
     suspend fun syncCurrentUserProfile(
         uid: String,

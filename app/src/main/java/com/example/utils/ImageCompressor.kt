@@ -212,54 +212,51 @@ object ImageCompressor {
         }.getOrNull()
     }
 
-    fun compressUriToBase64(context: Context, uri: Uri): Result<String> = runCatching {
+        fun compressUriToBase64(context: Context, uri: Uri): Result<String> = runCatching {
         val resolver = context.contentResolver
-        val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        openStream(resolver, uri)?.use { stream ->
-            BitmapFactory.decodeStream(stream, null, boundsOptions)
-        } ?: error("No se pudo abrir la imagen seleccionada.")
-
-        val srcWidth = boundsOptions.outWidth
-        val srcHeight = boundsOptions.outHeight
-        require(srcWidth > 0 && srcHeight > 0) { "Formato de imagen no válido." }
-
-        val orientation = runCatching {
-            openStream(resolver, uri)?.use { stream ->
-                ExifInterface(stream).getAttributeInt(
-                    ExifInterface.TAG_ORIENTATION,
-                    ExifInterface.ORIENTATION_NORMAL
-                )
-            } ?: ExifInterface.ORIENTATION_NORMAL
-        }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
-
-        var sampleSize = 1
-        while (srcWidth / sampleSize > MAX_DIMENSION_PX * 2 || srcHeight / sampleSize > MAX_DIMENSION_PX * 2) {
-            sampleSize *= 2
-        }
-
-        val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-        val rawBitmap = openStream(resolver, uri)?.use { stream ->
-            BitmapFactory.decodeStream(stream, null, decodeOptions)
-        } ?: error("No se pudo decodificar la fotografía.")
-
-        val maxSide = max(rawBitmap.width, rawBitmap.height)
-        val matrix = Matrix()
-        if (maxSide > MAX_DIMENSION_PX) {
-            val scale = MAX_DIMENSION_PX.toFloat() / maxSide.toFloat()
-            matrix.postScale(scale, scale)
-        }
-        when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
-            ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
-        }
-
-        val transformedBitmap = if (!matrix.isIdentity) {
-            Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
+        val transformedBitmap: Bitmap = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            val source = android.graphics.ImageDecoder.createSource(resolver, uri)
+            android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+                val w = info.size.width
+                val h = info.size.height
+                val maxSide = max(w, h)
+                if (maxSide > MAX_DIMENSION_PX && maxSide > 0) {
+                    val scale = MAX_DIMENSION_PX.toFloat() / maxSide.toFloat()
+                    decoder.setTargetSize(
+                        (w * scale).toInt().coerceAtLeast(1),
+                        (h * scale).toInt().coerceAtLeast(1)
+                    )
+                }
+            }
         } else {
-            rawBitmap
+            val boundsOptions = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            openStream(resolver, uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream, null, boundsOptions)
+            } ?: error("No se pudo abrir la imagen seleccionada.")
+
+            val srcWidth = boundsOptions.outWidth
+            val srcHeight = boundsOptions.outHeight
+            require(srcWidth > 0 && srcHeight > 0) { "Formato de imagen no válido." }
+
+            var sampleSize = 1
+            while (srcWidth / sampleSize > MAX_DIMENSION_PX * 2 || srcHeight / sampleSize > MAX_DIMENSION_PX * 2) {
+                sampleSize *= 2
+            }
+
+            val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            val rawBitmap = openStream(resolver, uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream, null, decodeOptions)
+            } ?: error("No se pudo decodificar la fotografía.")
+
+            val maxSide = max(rawBitmap.width, rawBitmap.height)
+            if (maxSide > MAX_DIMENSION_PX) {
+                val scale = MAX_DIMENSION_PX.toFloat() / maxSide.toFloat()
+                val matrix = Matrix().apply { postScale(scale, scale) }
+                Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
+            } else {
+                rawBitmap
+            }
         }
 
         var quality = JPEG_QUALITY

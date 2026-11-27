@@ -269,10 +269,8 @@ object ImageCompressor {
             quality -= 10
         } while (encoded.length > MAX_BASE64_CHARS && quality >= 25)
 
-        if (transformedBitmap !== rawBitmap) {
-            transformedBitmap.recycle()
-        }
-        rawBitmap.recycle()
+                transformedBitmap.recycle()
+                
 
         require(encoded.isNotEmpty() && encoded.length <= MAX_BASE64_CHARS) {
             "La fotografía excede el tamaño permitido para evidencia."
